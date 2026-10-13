@@ -197,8 +197,19 @@ ad-prepare [--env FILE] [--init-env] [--domain D] [--dns IP[,IP]]
            [--rollback DIR] [--log FILE]
 ```
 
-DNS and hostname, before a join. `--init-env` writes the JSON template;
-`--check` diagnoses and changes nothing.
+DNS and hostname, before a join. `--check` diagnoses and changes nothing.
+
+`--init-env --domain <domain>` writes the environment file and fills in what it
+can work out: the domain controllers from the `_ldap._tcp` SRV records (falling
+back to `NS`, then the domain's `A` records), the realm and search domain from
+the domain, the hostname from the machine, and the role from whether a display
+manager is running. `--dns` overrides the discovery. Discovery needs a resolver
+that can already see the zone; when it finds nothing it says so and leaves the
+example value rather than writing a guess.
+
+The template's own example values are refused if applied unedited — but only
+for the fields the running script acts on, so `ad-prepare` does not object to
+CA paths it never reads.
 
 It **does not bounce the interface**: the resolver is applied with `resolvectl`,
 which takes effect immediately without dropping the SSH session running the

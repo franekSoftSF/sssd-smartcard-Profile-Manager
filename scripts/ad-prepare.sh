@@ -122,7 +122,12 @@ USAGE
   sudo $PROGRAM --rollback /var/lib/sssd-smartcard/backups/<stamp>
 
 ENVIRONMENT FILE
-  --init-env [--env F]   Write a JSON template and exit.
+  --init-env             Write the environment file and exit. With --domain it
+                         discovers the domain controllers from that domain's
+                         SRV records and uses them as the DNS servers, derives
+                         the realm, reads this host's name and works out
+                         whether it is a desktop or a server. --dns overrides
+                         the discovery. --env chooses the path.
   --env FILE             Read the domain, DNS, hostname and search domains
                          from FILE. Without it, $ENV_DEFAULT_PATH is used when
                          it exists. Command-line flags override the file.
@@ -161,6 +166,84 @@ EXAMPLES
        --realm AD.EXAMPLE.COM --join-user administrator \\
        --test-user someone@ad.example.com --yes
 EOF
+}
+
+# --- discovery for --init-env -----------------------------------------------
+# An AD domain names its own domain controllers in SRV records, and in almost
+# every deployment those are also the DNS servers. So given the domain, the
+# rest of the DNS configuration is derivable -- provided the resolver in use
+# right now can see the zone at all, which is the one thing this cannot assume.
+discover_dns_servers() {
+    local domain=$1 out ip host
+    local -a found=()
+    out="${TMPDIR:-/tmp}/$PROGRAM.disc.$$"
+
+    if have dig; then
+        # The domain controllers, then their addresses.
+        dig +short +timeout=5 SRV "_ldap._tcp.$domain" >"$out" 2>/dev/null || true
+        while read -r _ _ _ host; do
+            [[ -n "${host:-}" ]] || continue
+            host=${host%.}
+            dig +short +timeout=5 A "$host" >"$out.a" 2>/dev/null || true
+            while read -r ip; do
+                [[ $ip =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] && found+=("$ip")
+            done <"$out.a"
+            rm -f "$out.a"
+        done <"$out"
+
+        # Fall back to the zone's nameservers, then to the domain's own A
+        # records: an AD domain usually resolves to its DCs.
+        if (( ${#found[@]} == 0 )); then
+            dig +short +timeout=5 NS "$domain" >"$out" 2>/dev/null || true
+            while read -r host; do
+                [[ -n "${host:-}" ]] || continue
+                host=${host%.}
+                dig +short +timeout=5 A "$host" >"$out.a" 2>/dev/null || true
+                while read -r ip; do
+                    [[ $ip =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] && found+=("$ip")
+                done <"$out.a"
+                rm -f "$out.a"
+            done <"$out"
+        fi
+        if (( ${#found[@]} == 0 )); then
+            dig +short +timeout=5 A "$domain" >"$out" 2>/dev/null || true
+            while read -r ip; do
+                [[ $ip =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] && found+=("$ip")
+            done <"$out"
+        fi
+    fi
+    rm -f "$out" "$out.a"
+
+    # Deduplicate, keeping order.
+    local -a unique=()
+    for ip in "${found[@]:-}"; do
+        [[ -n "$ip" ]] || continue
+        local seen=0 u
+        for u in "${unique[@]:-}"; do [[ "$u" == "$ip" ]] && seen=1; done
+        (( seen )) || unique+=("$ip")
+    done
+    (( ${#unique[@]} )) || return 1
+    local IFS=','
+    printf '%s' "${unique[*]}"
+}
+
+discover_role() {
+    # A machine already running a display manager, or defaulting to the
+    # graphical target, is a desktop. Everything else is treated as a server,
+    # which is the safer default: the desktop installer refuses to run on one.
+    local target
+    target=$(systemctl get-default 2>/dev/null || true)
+    if [[ "$target" == "graphical.target" ]]; then
+        printf 'desktop'
+        return 0
+    fi
+    if systemctl is-active gdm3 >/dev/null 2>&1 ||
+       systemctl is-active gdm >/dev/null 2>&1 ||
+       systemctl is-active lightdm >/dev/null 2>&1; then
+        printf 'desktop'
+        return 0
+    fi
+    printf 'server'
 }
 
 # --- helpers ----------------------------------------------------------------
@@ -737,9 +820,51 @@ done
 say "$PROGRAM $VERSION"
 
 if (( ${ENV_INIT:-0} )); then
-    env_init "${ENV_PATH:-$(env_default_path)}" || exit 1
+    (( EUID == 0 )) || die "writing the environment file needs root"
+    ENV_TARGET="${ENV_PATH:-$(env_default_path)}"
+    declare -a INIT_ARGS=()
+
+    if [[ -n "$DOMAIN" ]]; then
+        DOMAIN=${DOMAIN,,}
+        INIT_ARGS+=("domain=$DOMAIN" "realm=${DOMAIN^^}" "search=$DOMAIN")
+        head1 "Discovering $DOMAIN"
+
+        if (( ${#DNS_SERVERS[@]} )); then
+            INIT_ARGS+=("dns=$(IFS=,; echo "${DNS_SERVERS[*]}")")
+            pass "DNS servers given on the command line: ${DNS_SERVERS[*]}"
+        elif FOUND_DNS=$(discover_dns_servers "$DOMAIN"); then
+            INIT_ARGS+=("dns=$FOUND_DNS")
+            pass "domain controllers found: ${FOUND_DNS//,/ }"
+            note "from the SRV records of $DOMAIN; in AD these are normally the"
+            note "DNS servers too. Add or replace them in the file if not."
+        else
+            warn "could not resolve any domain controller for $DOMAIN"
+            note "the resolver this machine uses now cannot see that zone, which"
+            note "is expected before it is pointed at AD. The file keeps the"
+            note "example address -- replace it with the real one."
+        fi
+
+        INIT_ARGS+=("test_user=someone@$DOMAIN")
+    else
+        note "no --domain given, so nothing can be discovered; writing the template"
+        note "re-run as: $PROGRAM --init-env --domain ad.example.com"
+    fi
+
+    SHORT_HOST=$(hostnamectl --static 2>/dev/null || hostname)
+    SHORT_HOST=${SHORT_HOST%%.*}
+    [[ -n "${NEW_HOSTNAME:-}" ]] && SHORT_HOST=${NEW_HOSTNAME%%.*}
+    INIT_ARGS+=("hostname=$SHORT_HOST")
+    pass "hostname: $SHORT_HOST"
+
+    DISCOVERED_ROLE=$(discover_role)
+    INIT_ARGS+=("role=$DISCOVERED_ROLE" "desktop=$([[ "$DISCOVERED_ROLE" == desktop ]] && echo true || echo false)")
+    pass "role: $DISCOVERED_ROLE"
+
     say ""
-    note "fill it in, then re-run without --init-env"
+    env_init "$ENV_TARGET" "${INIT_ARGS[@]}" || exit 1
+    say ""
+    note "still to fill in by hand: join_user, test_user and ca (the CA files)."
+    note "Then: $PROGRAM --check"
     exit 0
 fi
 
@@ -763,7 +888,9 @@ fi
 # A template that was never filled in would otherwise be applied verbatim:
 # DNS set to 10.0.0.10, the hostname to wks01, on a real machine.
 if [[ -n "${ENV_FILE_LOADED:-}" ]] && declare -F env_has_placeholders >/dev/null; then
-    PLACEHOLDERS=$(env_has_placeholders || true)
+    # Only the fields this script acts on. The CA paths and notes belong to
+    # the setup script and are none of its business.
+    PLACEHOLDERS=$(env_has_placeholders domain realm dns search hostname || true)
     if [[ -n "$PLACEHOLDERS" ]]; then
         fail "$ENV_FILE_LOADED still holds template values:"
         printf '%s

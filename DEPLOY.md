@@ -230,11 +230,46 @@ card command on the server goes through `sudo`.
 The domain, its DNS servers, the hostname and the CA paths go in one JSON file
 instead of being retyped on every command. Every script reads it.
 
+Give it the domain and it works out the rest:
+
 ```bash
-sudo ad-prepare --init-env
+sudo ad-prepare --init-env --domain ad.example.com
 ```
 
-That writes `/etc/sssd-smartcard/environment.json`. Fill it in:
+```
+Discovering ad.example.com
+[ OK ] domain controllers found: 10.0.0.10
+   from the SRV records of ad.example.com; in AD these are normally the
+   DNS servers too. Add or replace them in the file if not.
+[ OK ] hostname: wks-server
+[ OK ] role: server
+
+wrote /etc/sssd-smartcard/environment.json
+
+   still to fill in by hand: join_user, test_user and ca (the CA files).
+```
+
+It reads the domain controllers out of the `_ldap._tcp` SRV records, falling
+back to the zone's `NS` records and then to the domain's own `A` records; in AD
+those hosts are normally the DNS servers as well. The realm, the search domain
+and the test user's suffix follow from the domain, the hostname is read from
+the machine, and the role is decided by whether a display manager is running or
+`graphical.target` is the default.
+
+That needs a resolver which can already see the zone — true when DHCP hands out
+the AD servers, not true on an isolated network. When discovery finds nothing it
+says so and leaves the example address rather than writing a guess.
+
+`--dns` overrides the discovery, and more servers can be added to the file by
+hand afterwards:
+
+```bash
+sudo ad-prepare --init-env --domain ad.example.com --dns 10.0.0.10,10.0.0.11
+```
+
+Without `--domain` it writes the bare template, which is refused if applied
+unedited. Either way the result looks like this — fill in what it could not
+know:
 
 ```json
 {

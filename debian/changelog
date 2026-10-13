@@ -20,6 +20,20 @@ sssd-smartcard (0.2.2) unstable; urgency=medium
     fully working joined host).
   * Stop defaulting the PKCS#11 module to an RHEL-only path that does not exist
     on Debian or Ubuntu.
+  * 'ad-prepare --init-env --domain <domain>' now fills the environment file in
+    rather than writing a bare template: it reads the domain controllers from
+    the domain's _ldap._tcp SRV records, falling back to the zone's NS records
+    and then to the domain's own A records, and uses them as the DNS servers --
+    in AD those hosts are normally the DNS servers too. The realm, search
+    domain and test-user suffix follow from the domain, the hostname is read
+    from the machine, and the role is decided by whether a display manager is
+    running. --dns overrides the discovery. Discovery needs a resolver that can
+    already see the zone, so when it finds nothing it says so and leaves the
+    example address rather than writing a guess.
+  * The template-value guard is scoped to the fields the running script acts
+    on. It previously refused to let ad-prepare set DNS because the CA paths
+    were still examples -- paths ad-prepare never reads -- which made
+    --init-env followed by ad-prepare fail.
   * The desktop installer no longer marks the SSH interface unmanaged in
     NetworkManager. That setting survives a reboot, and so does the desktop
     install's switch of netplan's renderer TO NetworkManager -- together,

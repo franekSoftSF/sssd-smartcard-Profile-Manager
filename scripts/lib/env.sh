@@ -73,9 +73,31 @@ ENV_PLACEHOLDERS=(ad.example.com AD.EXAMPLE.COM 10.0.0.10 wks01
 
 # Returns 0 when any loaded value is still a template placeholder, and names
 # them on stdout.
+#
+# Takes the keys to examine. Checking every key would block a script on a field
+# it never reads -- ad-prepare refusing to set DNS because the CA paths are
+# still examples, when it has no interest in CA paths at all.
 env_has_placeholders() {
+    local -a scalars=() lists=()
+    if (( $# )); then
+        local want
+        for want in "$@"; do
+            local s
+            for s in "${ENV_SCALAR_KEYS[@]}"; do
+                [[ "$s" == "$want" ]] && scalars+=("$want")
+            done
+            for s in "${ENV_LIST_KEYS[@]}"; do
+                [[ "$s" == "$want" ]] && lists+=("$want")
+            done
+        done
+    else
+        scalars=("${ENV_SCALAR_KEYS[@]}")
+        lists=("${ENV_LIST_KEYS[@]}")
+    fi
+
     local found=0 key value item
-    for key in "${ENV_SCALAR_KEYS[@]}"; do
+    for key in "${scalars[@]:-}"; do
+        [[ -n "$key" ]] || continue
         local var="ENV_${key^^}"
         value=${!var:-}
         [[ -n "$value" ]] || continue
@@ -86,7 +108,8 @@ env_has_placeholders() {
             fi
         done
     done
-    for key in "${ENV_LIST_KEYS[@]}"; do
+    for key in "${lists[@]:-}"; do
+        [[ -n "$key" ]] || continue
         local arr="ENV_${key^^}[@]"
         for value in "${!arr:-}"; do
             [[ -n "$value" ]] || continue
@@ -103,38 +126,23 @@ env_has_placeholders() {
 
 env_init() {
     local file=$1
+    shift || true
     if [[ -e "$file" ]]; then
         printf '%s already exists; not overwriting\n' "$file" >&2
         return 1
     fi
+    local parser
+    parser="$(env_lib_dir)/env.py"
+    [[ -r "$parser" ]] || { printf 'missing %s\n' "$parser" >&2; return 1; }
+
+    local body
+    # Remaining arguments are key=value overrides for whatever the caller was
+    # able to discover; everything else keeps its example value, so the shape
+    # of what is still missing stays visible.
+    body=$(python3 "$parser" --init "$@") || return 1
+
     install -d -m 0755 "${file%/*}"
-    cat >"$file" <<'EOF'
-{
-  "domain": "ad.example.com",
-  "realm": "AD.EXAMPLE.COM",
-
-  "dns": ["10.0.0.10"],
-  "search": ["ad.example.com"],
-  "hostname": "wks01",
-
-  "join_user": "administrator",
-  "test_user": "someone@ad.example.com",
-
-  "ca": [
-    "/root/pki/root-ca.pem",
-    "/root/pki/issuing-ca.pem"
-  ],
-
-  "role": "server",
-
-  "crl": true,
-  "ocsp": false,
-  "desktop": false,
-  "smartcard_required": false,
-
-  "notes": "describe this environment so a later run is unambiguous"
-}
-EOF
+    printf '%s\n' "$body" >"$file"
     chmod 0644 "$file"
     printf 'wrote %s\n' "$file"
     return 0

@@ -26,7 +26,79 @@ import shlex
 import sys
 
 
+#: The template, with the values that cannot be discovered left obviously
+#: unset. Discovered values are substituted by ``--init key=value``.
+TEMPLATE_ORDER = [
+    "domain", "realm", "dns", "search", "hostname", "role",
+    "join_user", "test_user", "ca", "crl", "ocsp", "desktop",
+    "smartcard_required", "notes",
+]
+
+TEMPLATE_DEFAULTS: dict[str, object] = {
+    "domain": "ad.example.com",
+    "realm": "AD.EXAMPLE.COM",
+    "dns": ["10.0.0.10"],
+    "search": ["ad.example.com"],
+    "hostname": "wks01",
+    "role": "server",
+    "join_user": "administrator",
+    "test_user": "someone@ad.example.com",
+    "ca": ["/root/pki/root-ca.pem", "/root/pki/issuing-ca.pem"],
+    "crl": True,
+    "ocsp": False,
+    "desktop": False,
+    "smartcard_required": False,
+    "notes": "describe this environment so a later run is unambiguous",
+}
+
+LIST_FIELDS = {"dns", "search", "ca"}
+BOOL_FIELDS = {"crl", "ocsp", "desktop", "smartcard_required"}
+
+
+def init(pairs: list[str]) -> int:
+    """Emit the template JSON with *pairs* (``key=value``) substituted.
+
+    A list field takes a comma-separated value. Anything not given keeps the
+    example default, so an operator can see the shape of what is missing
+    rather than having to guess the key names.
+    """
+    data = dict(TEMPLATE_DEFAULTS)
+    for pair in pairs:
+        key, _, value = pair.partition("=")
+        key = key.strip()
+        if key not in TEMPLATE_DEFAULTS:
+            print(f"--init: unknown key {key!r}", file=sys.stderr)
+            return 1
+        if not value:
+            continue
+        if key in LIST_FIELDS:
+            data[key] = [v.strip() for v in value.split(",") if v.strip()]
+        elif key in BOOL_FIELDS:
+            data[key] = value.strip().lower() in ("true", "yes", "1", "on")
+        else:
+            data[key] = value
+
+    # Anything that follows from the domain should follow from it, or the file
+    # ends up half filled in: a real domain with the example realm beside it.
+    given = {pair.partition("=")[0].strip() for pair in pairs}
+    domain = str(data["domain"])
+    if "domain" in given:
+        if "realm" not in given:
+            data["realm"] = domain.upper()
+        if "search" not in given:
+            data["search"] = [domain]
+        if "test_user" not in given:
+            data["test_user"] = f"someone@{domain}"
+
+    ordered = {k: data[k] for k in TEMPLATE_ORDER if k in data}
+    print(json.dumps(ordered, indent=2, ensure_ascii=False))
+    return 0
+
+
 def main(argv: list[str]) -> int:
+    if len(argv) >= 2 and argv[1] == "--init":
+        return init(argv[2:])
+
     if len(argv) != 5:
         print(f"usage: {argv[0]} <file> <scalars> <lists> <bools>", file=sys.stderr)
         return 2
