@@ -1,0 +1,64 @@
+apiVersion: sssd-smartcard/v1
+name: AD-PIV-UPN-GPO
+description: >-
+  The AD-PIV-UPN profile plus Group Policy. Two unrelated things are called
+  "GPO support" on Linux and this profile touches both: SSSD's own evaluation of
+  the Windows logon rights (ad_gpo_access_control, no extra package), and
+  Canonical's adsys client, which applies real policy on Ubuntu and can drive
+  certificate auto-enrolment from AD CS.
+
+domain: domain-b.local
+provider: ad
+
+certificate:
+  issuer: "CN=Enterprise Issuing CA,DC=domain-a,DC=local"
+  eku:
+    - clientAuth
+    - smartCardLogon
+
+mapping:
+  type: san-upn
+  domains:
+    - domain-a.local
+  options:
+    upn_suffix: domain-a.local
+  priority: 10
+
+validation:
+  check_issuer: true
+  check_eku: true
+  check_expiration: true
+
+authentication:
+  mode: optional
+  # local_auth_policy is derived from the provider; see AD-PIV-UPN.yaml for why
+  # that line is what makes the card usable at all.
+
+ca_trust:
+  bundle_path: /etc/sssd/pki/sssd_auth_ca_db.pem
+
+revocation:
+  enabled: false
+  method: none
+  fail_mode: closed
+
+gpo:
+  # Take control of ad_gpo_access_control. sssd-ad(5) documents the default as
+  # 'enforcing', which on a freshly joined host denies login to anyone the
+  # domain's GPOs do not grant InteractiveLogonRight. Start permissive, read the
+  # syslog messages, then switch.
+  manage: true
+  access_control: permissive
+
+  # Ubuntu only. dconf policy is available to everyone; the other adsys features
+  # need an Ubuntu Pro subscription, free for up to five machines.
+  adsys: true
+
+  # Requires adsys. Pulls in certmonger and cepces, then the auto-enrolment
+  # policy is switched on in the GPO itself.
+  cert_autoenroll: true
+
+  # gdm-smartcard is already in the documented default set; this is here to show
+  # the +/- syntax that keeps the default list rather than replacing it.
+  map_interactive_add:
+    - cockpit

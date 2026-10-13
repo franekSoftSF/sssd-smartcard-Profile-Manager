@@ -1,0 +1,3 @@
+etc/sssd-smartcard/profiles
+var/lib/sssd-smartcard
+usr/share/sssd-smartcard/profiles

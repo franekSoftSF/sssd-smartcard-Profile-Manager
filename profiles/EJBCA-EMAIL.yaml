@@ -1,0 +1,34 @@
+apiVersion: sssd-smartcard/v1
+name: EJBCA-EMAIL
+description: >-
+  A PKI that issues no UPN at all -- EJBCA, an external CA, or a card personalised
+  outside AD. The user is found by the rfc822Name in the SAN. Only as strong as
+  the mail attribute in the directory, so pin the issuer and keep mail
+  administratively controlled.
+
+domain: domain-b.local
+provider: ad
+
+certificate:
+  issuer: "CN=EJBCA Issuing CA,O=Example,C=PL"
+  eku:
+    - clientAuth
+
+mapping:
+  type: san-rfc822
+  domains:
+    - domain-a.local
+  options:
+    attribute: mail
+    domain_suffix: example.com
+  priority: 50
+
+validation:
+  check_issuer: true
+  check_eku: true
+  check_expiration: true
+
+authentication:
+  mode: optional
+  # local_auth_policy is derived from the provider; see AD-PIV-UPN.yaml for why
+  # that line is what makes the card usable at all.

@@ -1,0 +1,113 @@
+# -*- mode: ruby -*-
+# vi: set ft=ruby :
+#
+# Test lab for sssd-smartcard.
+#
+#   dc      Samba Active Directory domain controller for DOMAIN-B.LOCAL.
+#           Also acts as the PKI: it issues a root CA, an issuing CA and a
+#           user certificate carrying the UPN and the AD SID extension.
+#   client  Ubuntu domain member. Its "smart card" is a SoftHSM2 PKCS#11
+#           token holding that certificate, so the whole card path can be
+#           exercised with no reader and no physical card.
+#
+# The lab proves the layers this project is responsible for: reading the card,
+# deriving a profile, rendering certmap, applying it safely, and mapping the
+# certificate to a real AD user that SSSD can resolve.
+#
+#   vagrant up
+#   vagrant ssh client -c 'sudo /vagrant/run-tests.sh'
+#
+# Override the box or the network with environment variables:
+#   LAB_BOX=bento/ubuntu-22.04 LAB_NET=192.168.57 vagrant up
+
+BOX      = ENV.fetch("LAB_BOX", "bento/ubuntu-24.04")
+NET      = ENV.fetch("LAB_NET", "192.168.56")
+DC_IP    = "#{NET}.10"
+CLIENT_IP = "#{NET}.11"
+
+REALM    = ENV.fetch("LAB_REALM", "DOMAIN-B.LOCAL")
+DOMAIN   = REALM.downcase
+NETBIOS  = ENV.fetch("LAB_NETBIOS", REALM.split(".").first)
+ADMINPASS = ENV.fetch("LAB_ADMINPASS", "Passw0rd!2026")
+USERNAME = ENV.fetch("LAB_USER", "jan.kowalski")
+USERPASS = ENV.fetch("LAB_USERPASS", "Passw0rd!2026")
+CARD_PIN = ENV.fetch("LAB_CARD_PIN", "123456")
+CARD_SO_PIN = ENV.fetch("LAB_CARD_SO_PIN", "87654321")
+
+# LAB_DESKTOP=1 installs ubuntu-desktop-minimal on the client, opens the
+# VirtualBox window and gives the VM enough memory and video RAM for GNOME.
+# Off by default: everything this project is responsible for is testable from a
+# console, and a desktop adds a GNOME layer between you and the actual fault
+# when something does not work.
+DESKTOP = %w[1 true yes on].include?(ENV.fetch("LAB_DESKTOP", "0").downcase)
+CLIENT_MEMORY = Integer(ENV.fetch("LAB_CLIENT_MEMORY", DESKTOP ? "4096" : "2048"))
+
+# How the source tree reaches the guests. rsync gives a clean one-way copy and
+# honours the excludes, but it needs an rsync binary on the host, which Windows
+# does not ship. Set LAB_SYNC=virtualbox there (guest additions are in the bento
+# boxes) and the share becomes live, so `vagrant rsync` is no longer needed.
+SYNC_TYPE = ENV.fetch("LAB_SYNC", "rsync")
+SYNC_OPTS = { type: SYNC_TYPE }
+if SYNC_TYPE == "rsync"
+  SYNC_OPTS[:rsync__exclude] = [".git/", "dist/", "**/__pycache__/", ".pytest_cache/"]
+end
+
+ENV_EXPORTS = <<~SH
+  export LAB_REALM='#{REALM}'
+  export LAB_DOMAIN='#{DOMAIN}'
+  export LAB_NETBIOS='#{NETBIOS}'
+  export LAB_ADMINPASS='#{ADMINPASS}'
+  export LAB_USER='#{USERNAME}'
+  export LAB_USERPASS='#{USERPASS}'
+  export LAB_DC_IP='#{DC_IP}'
+  export LAB_CLIENT_IP='#{CLIENT_IP}'
+  export LAB_CARD_PIN='#{CARD_PIN}'
+  export LAB_CARD_SO_PIN='#{CARD_SO_PIN}'
+  export LAB_DESKTOP='#{DESKTOP ? "1" : "0"}'
+SH
+
+Vagrant.configure("2") do |config|
+  config.vm.box = BOX
+  config.vm.synced_folder "..", "/opt/sssd-smartcard-source", SYNC_OPTS
+
+  config.vm.provider "virtualbox" do |vb|
+    vb.linked_clone = true
+  end
+
+  config.vm.define "dc", primary: false do |dc|
+    dc.vm.hostname = "dc"
+    dc.vm.network "private_network", ip: DC_IP
+    dc.vm.provider "virtualbox" do |vb|
+      vb.memory = 2048
+      vb.cpus = 2
+      vb.name = "sssd-smartcard-lab-dc"
+    end
+    dc.vm.provision "shell", inline: <<~SHELL
+      set -Eeuo pipefail
+      #{ENV_EXPORTS}
+      bash /vagrant/provision/dc.sh
+    SHELL
+  end
+
+  config.vm.define "client", primary: true do |client|
+    client.vm.hostname = "client"
+    client.vm.network "private_network", ip: CLIENT_IP
+    client.vm.provider "virtualbox" do |vb|
+      vb.memory = CLIENT_MEMORY
+      vb.cpus = 2
+      vb.name = "sssd-smartcard-lab-client"
+      # Without a window there is nothing to log into graphically.
+      vb.gui = DESKTOP
+      if DESKTOP
+        # GNOME is unusable on the default 16 MB of video RAM.
+        vb.customize ["modifyvm", :id, "--vram", "128"]
+        vb.customize ["modifyvm", :id, "--graphicscontroller", "vmsvga"]
+      end
+    end
+    client.vm.provision "shell", inline: <<~SHELL
+      set -Eeuo pipefail
+      #{ENV_EXPORTS}
+      bash /vagrant/provision/client.sh
+    SHELL
+  end
+end

@@ -1,0 +1,298 @@
+.TH SSSD-SMARTCARD-SETUP 8 "2026-10-11" "sssd-smartcard 0.2.0" "System Administration"
+.SH NAME
+sssd-smartcard-setup \- guided setup for SSSD Smart Card / PIV authentication
+.SH SYNOPSIS
+.B sssd-smartcard-setup
+.RI [ options ]
+.SH DESCRIPTION
+.B sssd-smartcard-setup
+configures the whole Smart Card integration on a domain member: packages,
+domain membership, CA trust, the certmap rule in
+.BR sssd.conf ,
+Group Policy and PAM. It must be run as root.
+.PP
+The script is built around the ways setup scripts normally fail, and its
+behaviour follows from that:
+.TP
+.B Identity resolution is a hard gate
+If
+.BI id\  user@domain
+does not work, no certmap rule can help, so the script stops and says so
+instead of writing a rule that maps to a user SSSD cannot see. Pass
+.B \-\-test\-user
+to make this check meaningful.
+.TP
+.B Every stage verifies itself
+A stage that cannot prove it worked stops the run rather than letting the next
+stage build on it.
+.TP
+.B Failure rolls back
+Every file is backed up before it is touched. A failure restores all of them
+and restarts SSSD on the previous configuration.
+.TP
+.B PAM is never edited implicitly
+It is the one file that can lock you out of the machine, so it needs
+.BR \-\-pam .
+The command printed is the correct one for this distribution:
+.B authselect
+on the Red Hat family,
+.B pam-auth-update
+on Ubuntu 23.10 and later, and an exact
+.I /etc/pam.d/common-auth
+line on older releases, which the script will not write for you.
+.TP
+.B Idempotent and resumable
+Re\-running is always safe.
+.SH STAGES
+.IP 1. 4
+.B preflight
+\(em root, distribution, the CLI, the log file.
+.IP 2. 4
+.B packages
+\(em install the per\-distribution package groups and enable
+.B pcscd
+and
+.BR sssd .
+.IP 3. 4
+.B join
+\(em check or perform the domain join.
+.B realm
+prompts for the password; the script never reads or stores it.
+.IP 4. 4
+.B identity
+\(em prove the domain, the trusts and the test user resolve. The hard gate.
+.IP 5. 4
+.B ca
+\(em review and merge the CA chain into the trust bundle.
+.IP 6. 4
+.B card
+\(em detect the card, then have SSSD's own
+.B p11_child
+read and verify it, which is the exact code path used at login.
+.IP 7. 4
+.B certmap
+\(em derive a profile from the certificate, show the diff, apply it.
+.IP 8. 4
+.B gpo
+\(em
+.BR ad_gpo_access_control ,
+and optionally
+.B adsys
+and certificate auto\-enrolment.
+.IP 9. 4
+.B pam
+\(em print, or with
+.B \-\-pam
+apply, the distribution's command.
+.PP
+A verification pass follows:
+.BR "sssctl config-check" ,
+service state, an end\-to\-end mapping test, Kerberos readiness and a full
+.B doctor
+run.
+.SH OPTIONS
+.SS Modes
+.TP
+.B \-\-dry\-run
+Print every command without running any of them.
+.TP
+.B \-\-check
+Diagnose only. Changes nothing.
+.TP
+.BR \-\-yes ", " \-y
+Do not ask for confirmation.
+.TP
+.B \-\-non\-interactive
+Never prompt; refuse anything that would need a prompt.
+.TP
+.B \-\-force
+Continue past failed gates, such as a broken trust, a missing CA or no card.
+Use this knowing what you are overriding.
+.SS Domain
+.TP
+.BI \-\-realm " REALM"
+Kerberos realm, for example
+.IR DOMAIN-B.LOCAL .
+.TP
+.B \-\-join
+Join the realm if the host is not a member yet.
+.TP
+.BI \-\-join\-user " USER"
+Account used for the join.
+.TP
+.BI \-\-sssd\-domain " DOMAIN"
+The SSSD domain that owns the
+.RI [ certmap/... ]
+section. Defaults to the first entry of
+.RI [ sssd ]\  domains .
+.TP
+.BI \-\-account\-domain " DOMAIN"
+The domain the user accounts live in, when it differs \(em the trusted domain
+in a one\-way trust.
+.TP
+.BI \-\-test\-user " USER"
+User to prove identity resolution with. Strongly recommended.
+.SS Certificates
+.TP
+.BI \-\-ca " FILE"
+CA certificate to import into the trust bundle. Repeatable; pass the whole
+chain.
+.TP
+.BI \-\-ca\-db " PATH"
+Trust bundle path. Default
+.IR /etc/sssd/pki/sssd_auth_ca_db.pem .
+.TP
+.BI \-\-cert\-file " FILE"
+Work from an exported certificate instead of a card.
+.TP
+.BI \-\-module " PATH"
+PKCS#11 module to use.
+.TP
+.BI \-\-profile " FILE"
+Use this profile instead of deriving one.
+.TP
+.BI \-\-profile\-name " NAME"
+Name for the derived profile.
+.SS Login mode
+.TP
+.B \-\-require\-smartcard
+Smart Card only. Refuses without an interactive confirmation, because a wrong
+card, reader, PIN or mapping rule then locks everybody out.
+.SS Group Policy
+.TP
+.B \-\-gpo
+Manage
+.BR ad_gpo_access_control ,
+setting it to
+.B permissive
+unless told otherwise.
+.BR sssd\-ad (5)
+documents the default as
+.BR enforcing ,
+so a freshly joined host already denies login to anyone the domain's GPOs do
+not grant InteractiveLogonRight.
+.TP
+.B \-\-gpo\-enforcing
+Set
+.BR "ad_gpo_access_control = enforcing" .
+Implies
+.BR \-\-gpo .
+Read the permissive\-mode logs first.
+.TP
+.B \-\-adsys
+Install and refresh Canonical's Group Policy client. Ubuntu only. Joining AD
+and dconf policy are available to everyone; other adsys features need an
+Ubuntu Pro subscription, free for up to five machines.
+.TP
+.B \-\-cert\-autoenroll
+Install
+.B certmonger
+and
+.B cepces
+for certificate auto\-enrolment from AD CS. Implies
+.BR \-\-adsys .
+.SS PAM
+.TP
+.B \-\-pam
+Actually apply the PAM change. Without it the correct command is only printed.
+.SS Skipping
+.TP
+.B \-\-no\-packages
+Do not install anything.
+.TP
+.B \-\-no\-ca
+Do not touch the CA bundle.
+.TP
+.B \-\-no\-certmap
+Do not touch
+.BR sssd.conf .
+.TP
+.B \-\-no\-verify
+Skip the verification stage.
+.TP
+.BI \-\-only " STAGES"
+Comma separated list of stages to run.
+.TP
+.BI \-\-skip " STAGES"
+Comma separated list of stages to skip.
+.SS Other
+.TP
+.BI \-\-config " PATH"
+.B sssd.conf
+location.
+.TP
+.BI \-\-log " FILE"
+Log file location.
+.SH EXAMPLES
+See what would happen, change nothing:
+.PP
+.RS
+.nf
+sssd\-smartcard\-setup \-\-dry\-run \\
+    \-\-test\-user jan.kowalski@domain\-a.local \\
+    \-\-ca /root/pki/root\-ca.pem \-\-ca /root/pki/issuing\-ca.pem
+.fi
+.RE
+.PP
+One\-way trust: host in DOMAIN B, accounts in DOMAIN A:
+.PP
+.RS
+.nf
+sssd\-smartcard\-setup \-\-sssd\-domain domain\-b.local \\
+    \-\-account\-domain domain\-a.local \\
+    \-\-test\-user jan.kowalski@domain\-a.local \\
+    \-\-ca /root/pki/chain.pem \-\-gpo
+.fi
+.RE
+.PP
+Full Ubuntu deployment including Group Policy and auto\-enrolment:
+.PP
+.RS
+.nf
+sssd\-smartcard\-setup \-\-realm DOMAIN\-B.LOCAL \\
+    \-\-test\-user jan.kowalski@domain\-a.local \-\-ca /root/pki/chain.pem \\
+    \-\-gpo \-\-adsys \-\-cert\-autoenroll \-\-pam \-\-yes
+.fi
+.RE
+.PP
+Diagnose an existing installation:
+.PP
+.RS
+.nf
+sssd\-smartcard\-setup \-\-check \-\-test\-user jan.kowalski@domain\-a.local
+.fi
+.RE
+.SH EXIT STATUS
+.B 0
+on success,
+.B 1
+if a stage failed or verification found problems. A stage failure rolls back
+every file the run had touched.
+.SH FILES
+.TP
+.I /var/log/sssd-smartcard-setup-<timestamp>.log
+Full log of the run, mode 0600.
+.TP
+.I /var/lib/sssd-smartcard/backups/<timestamp>/
+Backups taken before any change.
+.TP
+.I /var/lib/sssd-smartcard/setup-state
+Record of completed stages, used for resumability.
+.TP
+.I /var/lib/sssd-smartcard/generated-profile.yaml
+The profile derived from the card, unless
+.B \-\-profile
+was given.
+.SH REQUIREMENTS
+bash 4.4 or newer, and root. On an unrecognised distribution, package
+installation and PAM configuration are skipped and reported rather than
+guessed.
+.SH SEE ALSO
+.BR sssd\-smartcard (8),
+.BR sssd.conf (5),
+.BR sss\-certmap (5),
+.BR sssd\-ad (5),
+.BR realm (8),
+.BR authselect (8),
+.BR pam\-auth\-update (8),
+.BR adsysctl (1)

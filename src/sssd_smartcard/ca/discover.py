@@ -1,0 +1,455 @@
+"""Work out a PKI from one certificate, and fetch everything it needs.
+
+Given the certificate on a card, almost everything else is discoverable. The
+certificate names its issuer's certificate (AIA ``caIssuers``), where its
+revocation list lives (``crlDistributionPoints``) and whether a responder
+exists (AIA ``OCSP``). Following those gets the whole chain to the root, the
+CRLs for every CA in it, and an answer to the question that actually decides
+the configuration: *does this PKI offer working OCSP, or only CRLs?*
+
+Two things this module is careful about.
+
+**Downloading a CA certificate is not trusting it.** The chain fetched here is
+a proposal. Its fingerprints must be checked against the PKI out of band before
+it becomes a trust anchor -- anyone who can answer the AIA URL could otherwise
+install themselves as a CA that logs in. The report prints fingerprints for
+exactly that comparison and says so.
+
+**An advertised responder is not a working responder.** An AIA OCSP URL only
+says the CA put a URL in the certificate. So a real OCSP request is built,
+sent, and the response parsed. "The URL is present" and "the responder answers
+for this certificate" are different findings, and SSSD fails closed on the
+difference: with OCSP enabled and no responder reachable, nobody logs in.
+
+Sources: RFC 5280 section 4.2.2.1 (AIA) and 4.2.1.13 (CRL distribution
+points); RFC 6960 for OCSP; ``sssd.conf(5)`` for how the result is expressed.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+
+from cryptography import x509
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.x509 import ocsp
+
+from ..util import Check, http_get
+from ..x509.inspect import CertificateInfo, load_certificates
+
+#: Content type RFC 6960 specifies for an OCSP request over HTTP.
+OCSP_CONTENT_TYPE = "application/ocsp-request"
+
+#: Stop following AIA after this many hops. A loop or a hostile AIA chain
+#: should not turn discovery into an unbounded download.
+MAX_CHAIN_DEPTH = 8
+
+
+def _load_any(data: bytes, source: str) -> list[CertificateInfo]:
+    """Parse PEM, DER or PKCS#7 -- AD CS serves all three from its AIA."""
+    try:
+        return load_certificates(data, source=source)
+    except Exception:
+        pass
+    for loader in (x509.load_der_pkcs7_certificates, x509.load_pem_pkcs7_certificates):
+        try:
+            certs = loader(data)
+        except Exception:
+            continue
+        out: list[CertificateInfo] = []
+        for cert in certs:
+            out.extend(
+                load_certificates(
+                    cert.public_bytes(serialization.Encoding.PEM), source=source
+                )
+            )
+        if out:
+            return out
+    return []
+
+
+@dataclass
+class OcspProbe:
+    """What happened when a real OCSP request was sent."""
+
+    url: str = ""
+    attempted: bool = False
+    answered: bool = False
+    status: str = ""
+    error: str = ""
+
+    @property
+    def working(self) -> bool:
+        """The responder answered with a verdict about this certificate."""
+        return self.answered and self.status in ("good", "revoked")
+
+    def to_dict(self) -> dict:
+        return {
+            "url": self.url,
+            "attempted": self.attempted,
+            "answered": self.answered,
+            "working": self.working,
+            "status": self.status,
+            "error": self.error,
+        }
+
+
+def probe_ocsp(
+    cert: CertificateInfo, issuer: CertificateInfo, url: str, *, timeout: int = 20
+) -> OcspProbe:
+    """Ask the responder about *cert*, and report what it said.
+
+    The response is parsed but not cryptographically validated here: the
+    useful finding at discovery time is whether a responder answers at all,
+    and saying more than was checked would be the kind of false pass this
+    project has been bitten by.
+    """
+    probe = OcspProbe(url=url, attempted=True)
+    try:
+        builder = ocsp.OCSPRequestBuilder().add_certificate(
+            cert.cert, issuer.cert, hashes.SHA1()
+        )
+        body = builder.build().public_bytes(serialization.Encoding.DER)
+    except Exception as exc:  # pragma: no cover - malformed input
+        probe.error = f"could not build an OCSP request: {exc}"
+        return probe
+
+    # SHA-1 is what RFC 6960 specifies for the certificate ID hash, and what
+    # responders expect; it identifies the certificate, it does not secure it.
+    data, error = http_get(
+        url, timeout=timeout, post=body, content_type=OCSP_CONTENT_TYPE
+    )
+    if error:
+        probe.error = error
+        return probe
+
+    try:
+        response = ocsp.load_der_ocsp_response(data)
+    except Exception as exc:
+        probe.error = f"the reply was not a parsable OCSP response: {exc}"
+        return probe
+
+    probe.answered = True
+    if response.response_status != ocsp.OCSPResponseStatus.SUCCESSFUL:
+        probe.status = response.response_status.name.lower()
+        probe.error = f"responder returned {probe.status}"
+        return probe
+    try:
+        probe.status = response.certificate_status.name.lower()
+    except Exception:  # pragma: no cover - unusual response
+        probe.status = "unknown"
+    return probe
+
+
+@dataclass
+class DiscoveryReport:
+    """Everything derivable from one certificate, with what was fetched."""
+
+    leaf: CertificateInfo | None = None
+    chain: list[CertificateInfo] = field(default_factory=list)
+    crl_urls: list[str] = field(default_factory=list)
+    ocsp: list[OcspProbe] = field(default_factory=list)
+    errors: list[str] = field(default_factory=list)
+    notes: list[str] = field(default_factory=list)
+
+    @property
+    def complete_chain(self) -> bool:
+        """True when the chain reaches a self-signed certificate."""
+        if not self.chain:
+            return False
+        last = self.chain[-1]
+        return last.subject_dn == last.issuer_dn
+
+    @property
+    def ocsp_works(self) -> bool:
+        return any(p.working for p in self.ocsp)
+
+    @property
+    def ocsp_advertised(self) -> bool:
+        return bool(self.ocsp)
+
+    @property
+    def revocation_method(self) -> str:
+        """What this PKI can actually enforce, as a profile method value."""
+        if self.ocsp_works:
+            return "ocsp"
+        if self.crl_urls:
+            return "crl"
+        return "none"
+
+    def bundle_pem(self) -> bytes:
+        """The fetched CA certificates, root last, as one PEM."""
+        return "".join(c.pem for c in self.chain).encode("ascii")
+
+    def to_dict(self) -> dict:
+        return {
+            "leaf": self.leaf.subject_dn if self.leaf else "",
+            "chain": [
+                {
+                    "subject": c.subject_dn,
+                    "issuer": c.issuer_dn,
+                    "sha256": c.fingerprint(),
+                }
+                for c in self.chain
+            ],
+            "complete_chain": self.complete_chain,
+            "crl_urls": self.crl_urls,
+            "ocsp": [p.to_dict() for p in self.ocsp],
+            "ocsp_advertised": self.ocsp_advertised,
+            "ocsp_works": self.ocsp_works,
+            "revocation_method": self.revocation_method,
+            "errors": self.errors,
+            "notes": self.notes,
+        }
+
+
+def _candidate_urls(cert: CertificateInfo, pki_url: str | None) -> list[str]:
+    """AIA caIssuers URLs, plus guesses under an operator-supplied base."""
+    urls = [u for u in cert.ca_issuer_urls if u.lower().startswith("http")]
+    if pki_url:
+        # Some CAs publish only an LDAP AIA, or none. With a base URL the
+        # issuer's own CN is the conventional filename on an AD CS web
+        # enrolment host, so it is worth one attempt -- clearly a guess, and
+        # reported as such when it fails.
+        base = pki_url.rstrip("/")
+        cn = ""
+        for part in cert.issuer_dn.split(","):
+            name, _, value = part.strip().partition("=")
+            if name.upper() == "CN":
+                cn = value.strip()
+                break
+        if cn:
+            from urllib.parse import quote
+
+            for ext in (".crt", ".cer", ".p7b"):
+                urls.append(f"{base}/{quote(cn)}{ext}")
+    return list(dict.fromkeys(urls))
+
+
+def discover(
+    cert: CertificateInfo,
+    *,
+    pki_url: str | None = None,
+    probe_responders: bool = True,
+    timeout: int = 20,
+) -> DiscoveryReport:
+    """Follow the certificate's own pointers and fetch what they name."""
+    report = DiscoveryReport(leaf=cert)
+
+    # --- the CA chain, by following AIA caIssuers upwards ------------------
+    current = cert
+    seen: set[str] = {cert.fingerprint()}
+    for _ in range(MAX_CHAIN_DEPTH):
+        if current.subject_dn == current.issuer_dn:
+            break  # self-signed: the root is already in hand
+        urls = _candidate_urls(current, pki_url)
+        if not urls:
+            report.errors.append(
+                f"{current.subject_dn}: no HTTP caIssuers URL in the certificate, so "
+                "its issuer cannot be fetched. Supply the CA file directly, or pass "
+                "--pki-url with the base URL the CA publishes under."
+            )
+            break
+        issuer = None
+        for url in urls:
+            data, error = http_get(url, timeout=timeout)
+            if error:
+                report.errors.append(error)
+                continue
+            found = _load_any(data, url)
+            if not found:
+                report.errors.append(f"{url}: served something that is not a certificate")
+                continue
+            # Take the one that actually issued the certificate in hand.
+            for candidate in found:
+                if candidate.subject_dn == current.issuer_dn:
+                    issuer = candidate
+                    break
+            issuer = issuer or found[0]
+            report.notes.append(f"fetched {issuer.subject_dn} from {url}")
+            break
+        if issuer is None:
+            break
+        if issuer.fingerprint() in seen:
+            report.errors.append(
+                f"{issuer.subject_dn}: AIA loops back to a certificate already seen; "
+                "stopping"
+            )
+            break
+        seen.add(issuer.fingerprint())
+        report.chain.append(issuer)
+        current = issuer
+
+    if not report.complete_chain and report.chain:
+        report.notes.append(
+            "the chain does not reach a self-signed root; the topmost certificate "
+            "fetched is an intermediate, so the root has to be supplied separately"
+        )
+
+    # --- revocation: CRL distribution points -------------------------------
+    for source in [cert, *report.chain]:
+        for url in source.crl_urls:
+            if url.lower().startswith("http") and url not in report.crl_urls:
+                report.crl_urls.append(url)
+    if not report.crl_urls:
+        ldap_only = any(
+            u.lower().startswith("ldap") for s in [cert, *report.chain] for u in s.crl_urls
+        )
+        if ldap_only:
+            report.notes.append(
+                "the only CRL distribution points are LDAP URLs, which SSSD cannot "
+                "fetch; export the CRL and pass it with 'ca crl update --from-file'"
+            )
+
+    # --- revocation: is there a responder that answers? --------------------
+    if probe_responders:
+        issuer = report.chain[0] if report.chain else None
+        for url in cert.ocsp_urls:
+            if not url.lower().startswith("http"):
+                continue
+            if issuer is None:
+                probe = OcspProbe(url=url, attempted=False)
+                probe.error = (
+                    "cannot ask the responder without the issuer certificate, which "
+                    "could not be fetched"
+                )
+                report.ocsp.append(probe)
+                continue
+            report.ocsp.append(probe_ocsp(cert, issuer, url, timeout=timeout))
+    elif cert.ocsp_urls:
+        for url in cert.ocsp_urls:
+            report.ocsp.append(OcspProbe(url=url, attempted=False))
+
+    return report
+
+
+def discovery_checks(report: DiscoveryReport) -> list[Check]:
+    """The report as checks, with the trust caveat stated where it matters."""
+    checks: list[Check] = []
+
+    if report.chain:
+        checks.append(
+            Check(
+                "CA chain",
+                "PASS" if report.complete_chain else "WARN",
+                f"{len(report.chain)} certificate(s) fetched"
+                + ("" if report.complete_chain else "; no self-signed root reached"),
+                hint="" if report.complete_chain
+                else "Supply the root with --ca, or the bundle will not verify a "
+                "full chain.",
+            )
+        )
+        for entry in report.chain:
+            checks.append(
+                Check(
+                    f"  {entry.subject_dn}",
+                    "INFO",
+                    f"SHA-256 {entry.fingerprint()}",
+                )
+            )
+        checks.append(
+            Check(
+                "CA trust",
+                "WARN",
+                "these certificates were downloaded, not verified",
+                hint="Downloading a CA is not trusting it: anything in the bundle can "
+                "issue a certificate that logs in. Compare the fingerprints above "
+                "against the PKI out of band before importing them.",
+            )
+        )
+    else:
+        checks.append(
+            Check(
+                "CA chain",
+                "FAIL",
+                "no CA certificate could be fetched",
+                hint="Pass the CA files directly with --ca, or give --pki-url the "
+                "base URL the CA publishes under.",
+            )
+        )
+
+    if report.crl_urls:
+        checks.append(
+            Check("CRL distribution", "PASS", "; ".join(report.crl_urls))
+        )
+    else:
+        checks.append(
+            Check(
+                "CRL distribution",
+                "WARN",
+                "no HTTP CRL distribution point advertised",
+                hint="Without a CRL and without OCSP, a revoked certificate still "
+                "logs in.",
+            )
+        )
+
+    for probe in report.ocsp:
+        if probe.working:
+            checks.append(
+                Check(
+                    "OCSP responder",
+                    "PASS",
+                    f"{probe.url} answered: {probe.status}",
+                )
+            )
+        elif probe.answered:
+            checks.append(
+                Check(
+                    "OCSP responder",
+                    "WARN",
+                    f"{probe.url} answered but gave no verdict ({probe.status})",
+                    hint=probe.error
+                    or "A responder that returns 'unknown' for this certificate "
+                    "cannot enforce revocation for it.",
+                )
+            )
+        elif probe.attempted:
+            checks.append(
+                Check(
+                    "OCSP responder",
+                    "FAIL",
+                    f"{probe.url} did not answer",
+                    hint=(probe.error or "")
+                    + " SSSD fails closed on OCSP: enabling it with an unreachable "
+                    "responder stops every card login. Use CRLs instead, or "
+                    "revocation.fail_mode: open for soft_ocsp.",
+                )
+            )
+        else:
+            checks.append(
+                Check("OCSP responder", "INFO", f"{probe.url} (not probed)")
+            )
+    if not report.ocsp:
+        checks.append(
+            Check(
+                "OCSP responder",
+                "INFO",
+                "none advertised in the certificate",
+                hint="This is why no_ocsp belongs in certificate_verification here: "
+                "with OCSP left on and no responder, verification fails closed.",
+            )
+        )
+
+    method = report.revocation_method
+    if method == "ocsp":
+        detail = "OCSP, confirmed working against a live responder"
+    elif method == "crl":
+        # Why there is no OCSP matters: never advertised is a PKI design
+        # choice, advertised but silent is a broken responder.
+        detail = (
+            "CRL, because the advertised responder did not answer"
+            if report.ocsp_advertised
+            else "CRL, because this PKI advertises no OCSP responder"
+        )
+    else:
+        detail = "none available -- a revoked certificate would still log in"
+    checks.append(
+        Check(
+            "recommended revocation",
+            "PASS" if method != "none" else "WARN",
+            f"{method}: {detail}",
+        )
+    )
+
+    for error in report.errors:
+        checks.append(Check("discovery", "WARN", error))
+    return checks

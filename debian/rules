@@ -1,0 +1,54 @@
+#!/usr/bin/make -f
+#
+# Canonical build: dpkg-buildpackage -b -us -uc
+#
+# The Python package itself is handled by pybuild, which installs it into
+# /usr/lib/python3/dist-packages and generates /usr/bin/sssd-smartcard from the
+# [project.scripts] entry in pyproject.toml. Everything else -- the setup
+# script, the example profiles, the lab -- is placed by hand below.
+
+export PYBUILD_NAME=sssd_smartcard
+export DEB_BUILD_MAINT_OPTIONS = hardening=+all
+
+PKGDIR = debian/sssd-smartcard
+
+%:
+	dh $@ --buildsystem=pybuild
+
+# The suite must pass for the build to succeed; a package that ships a broken
+# certmap renderer is worse than no package.
+override_dh_auto_test:
+	PYTHONPATH=src python3 -m pytest -q tests
+
+override_dh_auto_install:
+	dh_auto_install
+	# The guided setup script, without its .sh extension.
+	install -D -m 0755 scripts/sssd-smartcard-setup.sh \
+		$(PKGDIR)/usr/sbin/sssd-smartcard-setup
+	# Prepares DNS and the hostname before any join is attempted.
+	install -D -m 0755 scripts/ad-prepare.sh \
+		$(PKGDIR)/usr/sbin/ad-prepare
+	# Minimal desktop, so a card login can be tested at the real greeter.
+	install -D -m 0755 scripts/install-desktop.sh \
+		$(PKGDIR)/usr/sbin/sssd-smartcard-install-desktop
+	# Removes one domain so the machine can be reused for another.
+	install -D -m 0755 scripts/ad-reset.sh $(PKGDIR)/usr/sbin/ad-reset
+	# Shared environment-file helpers.
+	install -D -m 0644 scripts/lib/env.sh \
+		$(PKGDIR)/usr/share/sssd-smartcard/lib/env.sh
+	install -D -m 0755 scripts/lib/env.py \
+		$(PKGDIR)/usr/share/sssd-smartcard/lib/env.py
+	# Example profiles live under /usr/share, never /etc, so that dpkg never
+	# has to prompt about a modified conffile on upgrade. Anything the
+	# administrator writes goes in /etc and is searched first.
+	install -d $(PKGDIR)/usr/share/sssd-smartcard/profiles
+	install -m 0644 profiles/*.yaml \
+		$(PKGDIR)/usr/share/sssd-smartcard/profiles/
+	# The test lab is documentation, not something to run from the package.
+	install -d $(PKGDIR)/usr/share/doc/sssd-smartcard/lab/provision
+	install -m 0644 lab/Vagrantfile lab/README.md \
+		$(PKGDIR)/usr/share/doc/sssd-smartcard/lab/
+	install -m 0755 lab/run-tests.sh \
+		$(PKGDIR)/usr/share/doc/sssd-smartcard/lab/
+	install -m 0755 lab/provision/dc.sh lab/provision/client.sh \
+		$(PKGDIR)/usr/share/doc/sssd-smartcard/lab/provision/

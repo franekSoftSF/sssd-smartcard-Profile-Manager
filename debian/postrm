@@ -1,0 +1,27 @@
+#!/bin/sh
+# postrm for sssd-smartcard
+set -e
+
+case "$1" in
+    purge)
+        # Deliberately conservative. These directories can hold the only copy
+        # of a working sssd.conf, so purge removes them only if they are empty.
+        rmdir /etc/sssd-smartcard/profiles 2>/dev/null || true
+        rmdir /etc/sssd-smartcard 2>/dev/null || true
+        if [ -d /var/lib/sssd-smartcard ] && [ -n "$(ls -A /var/lib/sssd-smartcard 2>/dev/null)" ]; then
+            echo "sssd-smartcard: keeping /var/lib/sssd-smartcard, it still holds configuration backups" >&2
+        else
+            rmdir /var/lib/sssd-smartcard 2>/dev/null || true
+        fi
+        ;;
+    remove|upgrade|failed-upgrade|abort-install|abort-upgrade|disappear)
+        ;;
+    *)
+        echo "postrm called with unknown argument \`$1'" >&2
+        exit 1
+        ;;
+esac
+
+#DEBHELPER#
+
+exit 0

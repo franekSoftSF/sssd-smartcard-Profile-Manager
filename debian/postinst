@@ -1,0 +1,27 @@
+#!/bin/sh
+# postinst for sssd-smartcard
+set -e
+
+case "$1" in
+    configure)
+        # Holds timestamped backups of sssd.conf, which is itself mode 0600,
+        # and generated profiles. Must not be world readable.
+        if [ -d /var/lib/sssd-smartcard ]; then
+            chmod 0700 /var/lib/sssd-smartcard
+        fi
+        # Administrator-owned profiles. Searched before the packaged examples.
+        if [ -d /etc/sssd-smartcard/profiles ]; then
+            chmod 0755 /etc/sssd-smartcard/profiles
+        fi
+        ;;
+    abort-upgrade|abort-remove|abort-deconfigure)
+        ;;
+    *)
+        echo "postinst called with unknown argument \`$1'" >&2
+        exit 1
+        ;;
+esac
+
+#DEBHELPER#
+
+exit 0

@@ -1,0 +1,33 @@
+# Build output. Releases carry the artefacts; the repository does not.
+/dist/
+/build/
+*.deb
+*.tar.gz
+*.sha256
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.venv/
+venv/
+
+# Debian build leftovers
+/debian/sssd-smartcard/
+/debian/.debhelper/
+/debian/files
+/debian/*.substvars
+/debian/*.log
+/debian/debhelper-build-stamp
+
+# Editors and OS
+.vscode/
+.idea/
+*.swp
+Thumbs.db
+.DS_Store
+
+# Holds the mapping from real lab identifiers to the example ones used in the
+# published documents. Committing it would publish exactly what it removes.
+/packaging/sanitise.py

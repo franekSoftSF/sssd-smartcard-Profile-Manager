@@ -1,0 +1,65 @@
+Source: sssd-smartcard
+Section: admin
+Priority: optional
+Maintainer: Szymon Frankiewicz <szymonfrankiewicz@gmail.com>
+Build-Depends: debhelper-compat (= 13),
+               dh-python,
+               python3-all,
+               python3-setuptools,
+               pybuild-plugin-pyproject,
+               python3-cryptography <!nocheck>,
+               python3-yaml <!nocheck>,
+               python3-pytest <!nocheck>
+Standards-Version: 4.7.0
+Rules-Requires-Root: no
+
+Package: sssd-smartcard
+Architecture: all
+Depends: ${python3:Depends},
+         ${misc:Depends},
+         python3 (>= 3.10),
+         python3-cryptography,
+         python3-yaml,
+         bash (>= 4.4)
+Recommends: sssd,
+            sssd-ad,
+            sssd-tools,
+            libpam-sss,
+            opensc,
+            opensc-pkcs11,
+            p11-kit,
+            pcscd,
+            krb5-user,
+            realmd,
+            adcli
+Suggests: adsys,
+          certmonger,
+          cepces,
+          pamtester,
+          softhsm2,
+          pcsc-tools,
+          openssl
+Description: SSSD Smart Card and PIV certificate authentication manager
+ Generates, validates and deploys the SSSD configuration needed to log in to
+ Linux with an X.509 certificate held on a Smart Card or PIV token.
+ .
+ Its central operation is to read a real certificate, work out which of the
+ certificate-to-user mapping mechanisms that certificate can actually support,
+ rank them with the reason for each score, and emit a complete profile together
+ with the sssd.conf certmap section to match. The issuing PKI is irrelevant:
+ Microsoft AD CS, EJBCA, Blinky and any other X.509 PKI all feed the same
+ mechanisms, and only the fields present in the certificate differ.
+ .
+ It is built for the case where the Linux host is a member of one Active
+ Directory domain while the user accounts live in a trusted one. It refuses to
+ configure certificate mapping until identity lookup through that trust already
+ works, because a certmap rule cannot repair a broken trust.
+ .
+ The included guided setup script is distribution aware, using authselect on the
+ Red Hat family and pam-auth-update on Ubuntu rather than printing one command
+ for everybody. It takes a backup before every change, rolls back on failure,
+ and never edits the PAM stack unless explicitly asked.
+ .
+ The private key on the card is never read and no PIN is ever stored or
+ forwarded. Every option written to sssd.conf traces to current upstream
+ documentation; see the reference under /usr/share/doc/sssd-smartcard.

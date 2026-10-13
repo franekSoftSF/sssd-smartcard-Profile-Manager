@@ -1,0 +1,32 @@
+apiVersion: sssd-smartcard/v1
+name: PKI-CERT-BINARY
+description: >-
+  SSSD's own default mapping: search for the whole DER certificate on the user
+  object. Works with any PKI because it never looks inside the certificate, but
+  the certificate must already be published in the directory, and the AD provider
+  has to be told to read it (ldap_user_certificate, which this profile emits).
+
+domain: domain-b.local
+provider: ad
+
+certificate:
+  eku:
+    - clientAuth
+
+mapping:
+  type: certificate-binary
+  domains:
+    - domain-a.local
+  options:
+    encoding: bin
+  priority: 100
+
+validation:
+  check_issuer: false
+  check_eku: true
+  check_expiration: true
+
+authentication:
+  mode: optional
+  # local_auth_policy is derived from the provider; see AD-PIV-UPN.yaml for why
+  # that line is what makes the card usable at all.

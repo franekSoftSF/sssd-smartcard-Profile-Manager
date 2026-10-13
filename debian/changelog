@@ -1,0 +1,195 @@
+sssd-smartcard (0.2.2) unstable; urgency=medium
+
+  * Never report PKINIT success on the strength of a ticket existing. Without
+    the krb5-pkinit plugin, kinit silently ignores -X X509_user_identity,
+    prompts for the account password and returns a perfectly valid TGT; the
+    previous code called that a PASS. The verdict now requires KRB5_TRACE to
+    show a pkinit preauth module returning 0/Success, and a ticket obtained by
+    PA-ENC-TIMESTAMP is reported as a failure naming what happened.
+  * Refuse to run kinit at all when pkinit.so is missing, instead of prompting
+    for a password during what is advertised as a Smart Card test.
+  * Report the reason PKINIT failed, read from KRB5_TRACE, rather than printing
+    a list of possible causes over the captured answer.
+  * Inspect the KDC's own certificate over LDAPS and name the pkinit_* options
+    it forces on the client. Microsoft's older Domain Controller template
+    carries serverAuth and a dNSName instead of the id-pkinit-KPKdc EKU and
+    id-pkinit-san that RFC 4556 specifies; Windows accepts it, MIT does not,
+    because pkinit_eku_checking defaults to kpKDC.
+  * New checks: PKINIT plugin presence, pkinit_anchors, and whether krb5.conf
+    includes SSSD's own snippet directory (three snippets were inert on a
+    fully working joined host).
+  * Stop defaulting the PKCS#11 module to an RHEL-only path that does not exist
+    on Debian or Ubuntu.
+  * The desktop installer no longer marks the SSH interface unmanaged in
+    NetworkManager. That setting survives a reboot, and so does the desktop
+    install's switch of netplan's renderer TO NetworkManager -- together,
+    nothing configured the interface and the machine came back with no address
+    at all. Observed on a real server. The guard was unnecessary as well: an
+    interface rendered by systemd-networkd is not claimed by NetworkManager.
+    It is removed, --no-protect-iface is accepted and ignored, and the script
+    deletes the file where an earlier run left it -- before the role check, so
+    a machine stranded by it is not turned away before being repaired.
+  * The desktop installer installs the desktop and openssh-server only. SSSD
+    and the Smart Card packages belong to 'sssd-smartcard-setup --only
+    packages', where they are version checked; installing them in two places
+    made this script's scope unclear. openssh-server is deliberate: a machine
+    that has just gained a graphical login but lost remote access needs a
+    console to fix. Verification now confirms the SSH server is running.
+  * Running a script standalone without its lib/ directory no longer dies with
+    "env_default_path: command not found" before printing anything; the
+    environment file is simply unavailable.
+  * New docs/COMMANDS.md: a reference for all five programs and every
+    subcommand, with the reasoning behind the non-obvious flags. The README
+    loses three overlapping how-to sections that DEPLOY.md and this now cover,
+    and gains a documentation map.
+  * Support two machines in one domain, which is how the second round of tests
+    is set up: a desktop host for greeter logins and a server host driven under
+    sudo. The environment file gains a role key, the desktop installer refuses
+    to run on a machine declared role: server, and ad-prepare warns when the
+    hostname it is about to take already resolves elsewhere -- two machines
+    joining under one name means the second takes over the first's account in
+    AD, and the first then fails Kerberos with a KVNO mismatch that looks
+    unrelated to names.
+  * New 'ca discover': works a PKI out from one certificate and fetches it.
+    Follows AIA caIssuers upwards to a self-signed root, collects the CRL
+    distribution points of the leaf and every CA, and sends a real OCSP request
+    to find out whether a responder answers -- an advertised URL only means the
+    CA put one in the certificate, and SSSD fails closed on OCSP, so enabling it
+    against a silent responder stops every card login. The recommended
+    revocation method follows what the PKI can actually enforce, and says
+    whether OCSP is absent or merely unresponsive. --pki-url supplies a base URL
+    for a certificate whose AIA is missing or LDAP-only; --install writes the
+    trust bundle and the CRLs. Handles PEM, DER and PKCS#7, since AD CS serves
+    all three. Verified against a live two-tier PKI: the fetched chain's
+    fingerprints matched a bundle previously verified against AD's NTAuth store
+    by a different route. The report states that downloaded is not trusted and
+    prints fingerprints for out-of-band comparison, because anything in the
+    bundle can issue a certificate that logs in.
+  * The domain is described once in a JSON file rather than retyped on every
+    command line: /etc/sssd-smartcard/environment.json, read by ad-prepare,
+    ad-reset and the desktop installer. 'ad-prepare --init-env' writes a
+    template. Unknown keys are refused rather than ignored, since a typo that
+    is silently dropped leaves the operator believing a setting took effect;
+    the realm is derived from the domain when absent; a flag on the command
+    line still overrides the file. Parsing is done by a small python3 helper,
+    not in shell.
+  * New scripts/ad-reset.sh, installed as /usr/sbin/ad-reset: removes every
+    trace of one AD domain so the machine can be reused for another. Reusing
+    a machine without it leaves traces in thirteen places, and the ones that
+    mislead are not the obvious ones -- the SSSD cache keeps answering for the
+    old domain's users, the keytab holds the old host principal, krb5.conf
+    still names the old realm and KDC, and the certmap rule still pins the old
+    issuer DN, so a certificate from a new PKI silently fails to match and
+    login falls through to a password. 'realm leave' runs first, while the old
+    DC is still reachable, so the machine account is deleted rather than
+    orphaned; SSSD is stopped before its caches are removed. '--check' reports
+    what remains, and the same report runs after a removal, so "it is gone"
+    is a finding and not an assumption. PAM, local accounts, SSH, sudo, DNS
+    and the hostname are deliberately left alone.
+  * New scripts/install-desktop.sh, installed as
+    /usr/sbin/sssd-smartcard-install-desktop: puts a minimal graphical
+    environment on a clean machine so a card login can be tested at the real
+    GDM greeter. The install runs detached under systemd, because losing an
+    SSH session partway through a ten-minute apt transaction leaves dpkg to
+    be untangled by hand; re-running attaches to an install in flight rather
+    than starting a second one. The interface carrying remote access is
+    marked unmanaged before NetworkManager arrives with the desktop, and the
+    address is compared afterwards, since a desktop install that moves the IP
+    is what strands a remote machine. Verification covers the desktop and
+    Smart Card packages, the default target, GDM, the gdm-smartcard PAM
+    alternative and pcscd (socket activation included).
+  * New scripts/ad-prepare.sh, installed as /usr/sbin/ad-prepare: sets the DNS
+    servers and search domain to the domain controllers and gives the host its
+    fully qualified name, before any join is attempted. It detects whether
+    netplan, NetworkManager or plain resolv.conf persists DNS on this host,
+    refuses to write /etc/resolv.conf when it is a systemd-resolved symlink,
+    and applies the resolver through resolvectl so the interface is never
+    bounced -- an interface bounce over SSH drops the session running the
+    script, usually mid-change. --apply-now opts into the bounce.
+    netplan output is validated with 'netplan generate' before the run is
+    called a success, so a file that would break networking at the next boot is
+    rolled back now rather than discovered later. Verification proves each
+    configured server actually answers for the AD zone, that the domain SRV
+    records resolve, that the DC accepts connections on 88/389/445/464, that
+    the clock is synchronised, and that the host's own FQDN resolves.
+  * CRL revocation, with the rules measured rather than assumed. SSSD checks
+    the CRL of every CA in the chain, so crl_file must hold one current CRL per
+    CA concatenated into a single PEM; one short and verification fails with
+    "unable to get certificate CRL" for every card, because crl_file fails
+    closed. soft_crl forgives an expired CRL but never a missing one, enabling
+    OCSP does not relax the requirement, and partial_chain combined with
+    crl_file breaks verification outright -- so partial_chain is now dropped,
+    with an explanation, when CRL checking is on.
+  * New 'ca crl' commands: show, update and timer. 'update' walks the chain the
+    right way round -- a certificate's crlDistributionPoints names its ISSUER's
+    CRL, so the issuing CA's CRL is advertised by the card and the root's by the
+    issuing CA's certificate -- then refuses to install an incomplete or expired
+    set rather than producing a host that rejects every card. The URL used for
+    each CA is recorded, so the systemd timer can refresh with no card inserted.
+  * doctor reports CRL freshness, chain coverage, the refresh timer and whether
+    revocation is enforced at all; it also says plainly when no_ocsp is set with
+    no crl_file, which means a revoked certificate still logs in.
+  * Add tests that build the CLI parser and parse every documented command. A
+    duplicated block had left build_parser() raising "conflicting subparser" --
+    the tool could not start, and the whole suite stayed green.
+  * Check that an authenticated user can actually get a session: whether
+    pam_mkhomedir.so or pam_oddjob_mkhomedir.so is in the session stack, and
+    whether the account's home directory exists, is owned by it and is not
+    readable by others. A Smart Card login with no home directory succeeds and
+    then shows a black screen under GNOME, and nothing in the certificate,
+    mapping or PAM checks could see it -- fallback_homedir only names the path.
+
+ -- Szymon Frankiewicz <szymonfrankiewicz@gmail.com>  Sun, 11 Oct 2026 23:55:00 +0200
+
+sssd-smartcard (0.2.1) unstable; urgency=medium
+
+  * Write local_auth_policy = enable:smartcard into the domain section for the
+    ad and ldap providers. Without it SSSD reads the card, verifies the
+    certificate, maps it to a real user through the certmap rule and then
+    declines it -- the PAM responder logs "Local auth policy allowed: smartcard
+    [False]" and pam_sss falls through to the password prompt. The option
+    defaults to match, which offers only what the backend offers, and the AD
+    and LDAP backends offer no Smart Card authentication of their own.
+    Version gated at SSSD 2.9.3; ipa is left alone because IPA authenticates
+    the card through the backend.
+  * Report local_auth_policy in doctor and pam check, so "the card is read and
+    then refused" is diagnosable without raising debug_level on a live host.
+  * Extend an existing local_auth_policy rather than overwriting it, and refuse
+    to touch an existing "only" value, reporting it instead.
+  * New profile keys authentication.local_smartcard and
+    authentication.local_auth_policy; undocumented policy values are refused
+    rather than written into sssd.conf.
+
+ -- Szymon Frankiewicz <szymonfrankiewicz@gmail.com>  Sun, 11 Oct 2026 23:30:00 +0200
+
+sssd-smartcard (0.2.0) unstable; urgency=medium
+
+  * Distribution-aware PAM handling. authselect is Red Hat only; Ubuntu 23.10
+    and later use pam-auth-update with the sss-smart-card-optional and
+    sss-smart-card-required profiles, and older releases get the exact
+    common-auth line instead of a command that does not exist.
+  * Group Policy support, keeping the two unrelated meanings apart:
+    ad_gpo_access_control in sssd.conf, and Canonical's adsys client with
+    optional certificate auto-enrolment through certmonger and cepces.
+  * Default ad_gpo_access_control to permissive when managing it, and warn when
+    it is left unmanaged: sssd-ad(5) documents the default as enforcing, which
+    on a freshly joined host denies login to anyone the domain's GPOs do not
+    grant InteractiveLogonRight.
+  * Kerberos verification: krb5 status reports the credential cache and its
+    TGT, krb5 test checks realm, KDC discovery and reachability, and with
+    --pkinit obtains a real ticket with the card into a throwaway cache.
+  * Guided setup script with a hard identity-resolution gate, per-stage
+    self-verification, backup and rollback, idempotency and a dry run.
+  * Rank mapping mechanisms that need per-user directory provisioning below
+    ones that work against an untouched directory, and show the penalty.
+
+ -- Szymon Frankiewicz <szymonfrankiewicz@gmail.com>  Sun, 11 Oct 2026 10:00:00 +0200
+
+sssd-smartcard (0.1.0) unstable; urgency=low
+
+  * Initial release: Certificate Inspector, mapping recommendation engine,
+    certmap renderer with an SSSD version compatibility layer, Mapping Tester
+    backed by sssctl cert-eval-rule, CA trust bundle management, PKCS#11
+    discovery, trusted-domain diagnostics and safe apply with rollback.
+
+ -- Szymon Frankiewicz <szymonfrankiewicz@gmail.com>  Thu, 24 Sep 2026 22:00:00 +0200

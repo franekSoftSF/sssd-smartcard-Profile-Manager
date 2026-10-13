@@ -1,0 +1,31 @@
+apiVersion: sssd-smartcard/v1
+name: AD-ISSUER-SERIAL
+description: >-
+  The X509:<I>issuer<SR>serial form of altSecurityIdentities, which Active
+  Directory counts as a strong certificate mapping. Use it when the certificate
+  carries no SID extension and no usable UPN. An AD administrator must write the
+  value onto the user object first -- `mapping test` prints the exact string.
+  Requires SSSD 2.8.2 or newer for the {serial_number} template.
+
+domain: domain-b.local
+provider: ad
+
+certificate:
+  issuer: "CN=Enterprise Issuing CA,DC=domain-a,DC=local"
+  eku:
+    - clientAuth
+
+mapping:
+  type: issuer-serial
+  domains:
+    - domain-a.local
+
+validation:
+  check_issuer: true
+  check_eku: true
+  check_expiration: true
+
+authentication:
+  mode: optional
+  # local_auth_policy is derived from the provider; see AD-PIV-UPN.yaml for why
+  # that line is what makes the card usable at all.

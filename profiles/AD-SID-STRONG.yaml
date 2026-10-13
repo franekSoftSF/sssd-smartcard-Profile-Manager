@@ -1,0 +1,43 @@
+apiVersion: sssd-smartcard/v1
+name: AD-SID-STRONG
+description: >-
+  Strongest binding available: look the user up by the SID that AD CS embeds in
+  the certificate (szOID_NTDS_CA_SECURITY_EXT, 1.3.6.1.4.1.311.25.2). This is
+  the mapping Microsoft's KB5014754 hardening is built around, and unlike the
+  altSecurityIdentities forms it needs nothing written onto the user object.
+  Requires SSSD 2.8.2 or newer for the {sid} template.
+
+domain: domain-b.local
+provider: ad
+
+certificate:
+  issuer: "CN=Enterprise Issuing CA,DC=domain-a,DC=local"
+  eku:
+    - clientAuth
+    - smartCardLogon
+
+mapping:
+  type: sid-extension
+  domains:
+    - domain-a.local
+  priority: 0
+
+validation:
+  check_issuer: true
+  check_eku: true
+  check_expiration: true
+  check_revocation: true
+
+authentication:
+  mode: optional
+  # local_auth_policy is derived from the provider; see AD-PIV-UPN.yaml for why
+  # that line is what makes the card usable at all.
+
+ca_trust:
+  bundle_path: /etc/sssd/pki/sssd_auth_ca_db.pem
+
+revocation:
+  enabled: true
+  method: ocsp
+  fail_mode: closed
+  ocsp_digest: sha256

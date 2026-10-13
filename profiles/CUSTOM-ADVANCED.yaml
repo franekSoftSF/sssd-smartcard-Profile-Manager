@@ -1,0 +1,31 @@
+apiVersion: sssd-smartcard/v1
+name: CUSTOM-ADVANCED
+description: >-
+  Escape hatch for rules the built-in mechanisms do not cover: matchrule, maprule
+  and domains are passed through verbatim. Two things to copy carefully:
+  single-quoted YAML scalars, because a matching rule contains backslashes that a
+  double-quoted scalar would eat; and components CONCATENATED with no operator,
+  because an infix ' && ' makes SSSD reject the whole rule.
+  Validate with `sssctl cert-eval-rule` on the target host before applying.
+
+domain: domain-b.local
+provider: ad
+
+mapping:
+  type: custom
+  matchrule: 'KRB5:<ISSUER>^CN=Enterprise Issuing CA,DC=domain-a,DC=local$<EKU>clientAuth,msScLogin<SAN:ntPrincipalName>.*@domain-a\.local$'
+  # Try the SID extension first and fall back to the UPN, in one rule.
+  maprule: 'LDAPU1:(|(objectSid={sid})(userPrincipalName={subject_nt_principal}))'
+  domains:
+    - domain-a.local
+  priority: 5
+
+validation:
+  check_issuer: true
+  check_eku: true
+  check_expiration: true
+
+authentication:
+  mode: optional
+  # local_auth_policy is derived from the provider; see AD-PIV-UPN.yaml for why
+  # that line is what makes the card usable at all.

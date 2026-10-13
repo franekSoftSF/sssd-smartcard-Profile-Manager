@@ -1,0 +1,67 @@
+apiVersion: sssd-smartcard/v1
+name: AD-PIV-UPN
+description: >-
+  PIV/Smart Card certificates carrying the UPN in the SAN. The Linux host is a
+  member of DOMAIN B; the accounts live in DOMAIN A, which DOMAIN B trusts.
+  The certmap section therefore belongs to domain-b.local (the joined domain)
+  while the user search is directed at domain-a.local through mapping.domains.
+
+# The SSSD domain this host is joined to -- this names the [certmap/<domain>/...]
+# section, not where the accounts live.
+domain: domain-b.local
+provider: ad
+
+certificate:
+  # Pinning the issuer is what stops any other trusted CA from minting a
+  # certificate that maps to one of your users.
+  issuer: "CN=Enterprise Issuing CA,DC=domain-a,DC=local"
+  eku:
+    - clientAuth
+    # SSSD's own keyword for Microsoft Smart Card Logon is msScLogin; the
+    # friendlier spellings smartCardLogon / smartCardLogin are accepted here and
+    # normalised on render.
+    - smartCardLogon
+
+mapping:
+  type: san-upn
+  # Where the accounts actually are. Omit this and SSSD searches only the
+  # domain the section belongs to.
+  domains:
+    - domain-a.local
+  options:
+    # Accept only UPNs from this suffix. Set any_suffix: true if your users have
+    # alternative UPN suffixes.
+    upn_suffix: domain-a.local
+  priority: 10
+
+validation:
+  check_issuer: true
+  check_eku: true
+  check_expiration: true
+  check_revocation: false
+
+authentication:
+  # optional = card or password; required = card only (enforced in PAM, not in
+  # sssd.conf -- the tool prints the authselect command but never applies it).
+  mode: optional
+  # Unset, so the tool decides from the provider: for ad and ldap it writes
+  # local_auth_policy = enable:smartcard into the domain section, and for ipa it
+  # leaves the option alone. That line matters -- the default policy 'match'
+  # only offers what the backend offers, and the AD and LDAP providers offer no
+  # Smart Card authentication of their own, so SSSD reads the card, verifies it,
+  # maps it to a user and then still asks for a password.
+  #   local_smartcard: false         # opt out; the card will be refused
+  #   local_auth_policy: "enable:smartcard, enable:passkey"
+  # Stating it here instead of leaving it unset makes it a hard requirement, so
+  # a target older than SSSD 2.9.3 is refused rather than silently degraded.
+
+ca_trust:
+  bundle_path: /etc/sssd/pki/sssd_auth_ca_db.pem
+  # sources:
+  #   - /root/pki/domain-a-root-ca.pem
+  #   - /root/pki/domain-a-issuing-ca.pem
+
+revocation:
+  enabled: false
+  method: none
+  fail_mode: closed

@@ -1,0 +1,259 @@
+.TH SSSD-SMARTCARD 8 "2026-10-11" "sssd-smartcard 0.2.0" "System Administration"
+.SH NAME
+sssd-smartcard \- generate, validate and deploy SSSD Smart Card / PIV configuration
+.SH SYNOPSIS
+.B sssd-smartcard
+.RI [ global-options ]
+.I group command
+.RI [ options ]
+.SH DESCRIPTION
+.B sssd-smartcard
+configures authentication of Linux users with X.509 certificates held on a
+Smart Card or PIV token, through SSSD.
+.PP
+Its central operation is to read a real certificate, work out which
+certificate\-to\-user mapping mechanisms that certificate can actually support,
+rank them, and emit a complete profile together with the
+.B sssd.conf
+section to go with it. The PKI that issued the certificate is irrelevant:
+Microsoft AD CS, EJBCA, Blinky and any other X.509 PKI all feed the same
+mechanisms, and only the fields present in the certificate differ.
+.PP
+The private key on the card is never read, and no PIN is ever requested,
+stored or forwarded. Every PKCS#11 call passes
+.BR \-\-type\ cert .
+.SH GLOBAL OPTIONS
+These may be given before or after the subcommand.
+.TP
+.B \-\-json
+Machine readable output.
+.TP
+.B \-\-no\-color
+Disable colour. The
+.B NO_COLOR
+environment variable has the same effect.
+.TP
+.BI \-\-sssd\-version " X.Y.Z"
+Target this SSSD version instead of the one detected on this host. Options the
+target version does not have cause a refusal rather than a silent downgrade.
+.TP
+.BI \-\-config " PATH"
+Location of
+.BR sssd.conf .
+Default
+.IR /etc/sssd/sssd.conf .
+.TP
+.B \-\-version
+Print the version and exit.
+.SH COMMANDS
+.SS cert inspect | cert autoconfig
+Show everything about a certificate that SSSD cares about \(em subject, issuer,
+serial, the full Subject Alternative Name including the Microsoft UPN and any
+PKINIT principal, extended key usage, key usage, SKI, AKI, validity, the Active
+Directory SID security extension, and the advertised CRL and OCSP endpoints
+\(em then propose a configuration.
+.PP
+The certificate comes from
+.BI \-\-file " PATH"
+(PEM or DER),
+.BI \-\-base64 " B64"
+,
+.B \-\-stdin
+, or
+.B \-\-from\-card
+.
+.TP
+.BI \-\-mapping " TYPE"
+Force a mapping mechanism instead of the highest ranked one.
+.TP
+.BI \-\-domain " DOMAIN"
+Override the account domain inferred from the certificate.
+.TP
+.BI \-\-sssd\-domain " DOMAIN"
+The domain this host is joined to, which owns the
+.RI [ certmap/... ]
+section. Read from
+.B sssd.conf
+when not given.
+.TP
+.BI \-\-save\-profile " PATH"
+Write the generated profile.
+.TP
+.B \-\-with\-revocation
+Enable revocation checking in the generated profile.
+.TP
+.B \-\-require\-smartcard
+Generate a profile that demands Smart Card only login.
+.TP
+.B \-\-no\-config
+Only inspect; do not generate a configuration.
+.SS card detect
+Enumerate PC/SC readers, PKCS#11 modules, token slots and the certificate
+objects on the card, and mark the one that looks like the authentication
+certificate.
+.SS profile list | show | validate
+List the known profiles, show one with its rendered rule, or check profiles for
+errors against the target SSSD version.
+.SS mapping types | test
+.B mapping types
+lists the available mapping mechanisms with their options and version
+requirements.
+.PP
+.B mapping test
+runs a certificate through a profile and reports, term by term, which parts of
+the matching rule passed, what the mapping rule expands to, the resulting LDAP
+filter, and whether SSSD can resolve the identity. Two engines run: a local
+one that works anywhere, and
+.BR "sssctl cert\-eval\-rule" ,
+which is libsss_certmap itself and whose verdict wins. A disagreement between
+them is reported rather than hidden.
+.SS domain test | list
+Show the primary and trusted domains, their online state, and optionally
+resolve a user with
+.BR getent ,
+.B id
+and
+.BR "sssctl user\-checks" .
+.SS krb5 status | test
+.B krb5 status
+shows the credential cache and whether it holds a
+.B krbtgt
+ticket.
+.B krb5 test
+checks the realm, KDC discovery and reachability, and the certificate's
+fitness for PKINIT. With
+.B \-\-pkinit
+it runs
+.B kinit
+with the card into a throwaway credential cache, which is the only way to
+prove that the KDC really issues a ticket. The PIN is typed into
+.B kinit
+directly.
+.SS ca show | import
+Inspect CA certificates or the trust bundle, or merge certificates into the
+bundle named by
+.BR pam_cert_db_path .
+The existing bundle is read and merged, never replaced; duplicates are skipped
+by fingerprint and a backup is taken first.
+.SS config render | diff | validate | apply
+Print the configuration fragment, diff it against what is on disk, validate it,
+or apply it.
+.B apply
+is a dry run unless
+.B \-\-yes
+is given; it backs everything up, writes
+.B sssd.conf
+atomically at mode 0600, runs
+.BR "sssctl config\-check" ,
+restarts SSSD, and rolls every touched file back on any failure.
+.SS pam check
+Report on the PAM stack read\-only. This command never writes.
+.SS doctor
+Run every diagnostic in dependency order: host, SSSD, identity and trusts, PAM,
+CA trust, Kerberos and the Smart Card stack.
+.SH EXIT STATUS
+.TP
+.B 0
+Success.
+.TP
+.B 1
+An expected error, or a check that failed.
+.TP
+.B 3
+The target SSSD version lacks a required feature.
+.TP
+.B 4
+A required external helper is not installed.
+.TP
+.B 5
+The operation only makes sense on the SSSD host itself.
+.TP
+.B 6
+Configuration could not be applied; a rollback may have happened.
+.SH FILES
+.TP
+.I /etc/sssd/sssd.conf
+Written by
+.BR "config apply" ,
+always at mode 0600.
+.TP
+.I /etc/sssd/pki/sssd_auth_ca_db.pem
+Default CA trust bundle, the documented default of
+.BR pam_cert_db_path .
+.TP
+.I /etc/sssd-smartcard/profiles/
+Profiles written by the administrator. Searched before the packaged examples.
+.TP
+.I /usr/share/sssd-smartcard/profiles/
+Example profiles shipped by the package.
+.TP
+.I /var/lib/sssd-smartcard/backups/
+Timestamped backups taken before any change.
+.SH ENVIRONMENT
+.TP
+.B SSSD_SMARTCARD_PROFILES
+Additional profile directory, searched first.
+.TP
+.B SSSD_SMARTCARD_PKCS11_MODULE
+PKCS#11 module to use when
+.B \-\-module
+is not given.
+.TP
+.B NO_COLOR
+Disable colour output.
+.SH EXAMPLES
+Read the card and propose a configuration:
+.PP
+.RS
+.nf
+sssd\-smartcard cert inspect \-\-from\-card
+.fi
+.RE
+.PP
+Derive and save a profile, then prove it against the same certificate:
+.PP
+.RS
+.nf
+sssd\-smartcard cert autoconfig \-\-from\-card \-\-save\-profile /etc/sssd\-smartcard/profiles/AD\-PIV\-UPN.yaml
+sssd\-smartcard mapping test AD\-PIV\-UPN \-\-from\-card
+.fi
+.RE
+.PP
+Review and apply:
+.PP
+.RS
+.nf
+sssd\-smartcard config diff AD\-PIV\-UPN
+sssd\-smartcard config apply AD\-PIV\-UPN \-\-yes
+.fi
+.RE
+.SH CAVEATS
+The local matching engine reads
+.B &&
+as binding tighter than
+.BR || .
+.BR sss\-certmap (5)
+documents both operators but neither precedence nor any grouping syntax, so
+confirm anything unusual with
+.BR "sssctl cert\-eval\-rule" .
+Distinguished name rendering for the
+.B !ad_x500
+family of conversions is likewise a local approximation of libsss_certmap, good
+enough to preview a rule offline.
+.PP
+SSSD reads a certificate revocation list from a local PEM file
+.RB ( crl_file= );
+it does not download CRL distribution points. Something else has to refresh
+that file.
+.SH SEE ALSO
+.BR sssd\-smartcard\-setup (8),
+.BR sssd.conf (5),
+.BR sss\-certmap (5),
+.BR sssd\-ad (5),
+.BR sssctl (8),
+.BR pam_sss (8),
+.BR kinit (1)
+.PP
+.I /usr/share/doc/sssd-smartcard/sssd-reference.md
+records every SSSD option this program emits together with the documentation it
+was taken from.
