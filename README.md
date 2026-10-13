@@ -43,7 +43,7 @@ allows SSSD to accept a card at all under the `ad` and `ldap` providers.
 
 Verified end to end on Ubuntu 24.04 + SSSD 2.9.4 against a Samba AD domain with
 a YubiKey PIV certificate — see [docs/HOW-IT-WORKS.md](docs/HOW-IT-WORKS.md) for
-the mechanism as it actually runs, and [docs/TUTORIAL.md](docs/TUTORIAL.md) for
+the mechanism as it actually runs, and [DEPLOY.md](DEPLOY.md) for
 the step-by-step walkthrough that produced it.
 
 ## Documentation
@@ -54,7 +54,6 @@ the step-by-step walkthrough that produced it.
 | [docs/COMMANDS.md](docs/COMMANDS.md) | every command and flag, with the reasoning |
 | [docs/HOW-IT-WORKS.md](docs/HOW-IT-WORKS.md) | the mechanism as it actually runs, and the failure modes met |
 | [docs/sssd-reference.md](docs/sssd-reference.md) | every emitted option with its source, and the measured findings |
-| [docs/TUTORIAL.md](docs/TUTORIAL.md) | the verified record of the first lab, against a specific domain |
 | [STATUS.md](STATUS.md) | where the work stands and what is still open |
 
 All but the tutorial ship inside the package, under
@@ -278,17 +277,6 @@ PAM was **not** modified because `--pam` was not passed.
 
 See [lab/README.md](lab/README.md), including why the lab is single-domain and
 what a real one-way trust additionally needs.
-
-## Walkthrough
-
-[docs/TUTORIAL.md](docs/TUTORIAL.md) is a step-by-step run through a real
-deployment: install, join, CA chain, inspect the card, prove the mapping, apply,
-enable PAM, then Kerberos and Group Policy. Each step says what to run, what you
-should see, and what it means if you do not — ordered so that a failure tells you
-*where* the fault is instead of leaving you guessing at a login prompt.
-
-It is written against a specific lab, so the domain and host names are literal.
-Substitute your own. It is **not** shipped inside the `.deb`.
 
 ## Commands
 

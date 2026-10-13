@@ -369,5 +369,3 @@ refused, so an unedited template cannot set your DNS to `10.0.0.10`.
   the failure modes encountered
 * [sssd-reference.md](sssd-reference.md) — every emitted option with its source,
   and the measured findings behind the non-obvious ones
-* [TUTORIAL.md](TUTORIAL.md) — the step-by-step record of the first verified
-  lab, against a specific domain

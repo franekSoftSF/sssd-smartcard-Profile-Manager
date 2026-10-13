@@ -31,3 +31,8 @@ Thumbs.db
 # Holds the mapping from real lab identifiers to the example ones used in the
 # published documents. Committing it would publish exactly what it removes.
 /packaging/sanitise.py
+
+# The record of a real lab run, with that lab's own hostnames, addresses
+# and fingerprints. Kept locally; the published guides are DEPLOY.md and
+# docs/COMMANDS.md.
+/docs/TUTORIAL.md

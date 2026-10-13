@@ -23,9 +23,14 @@ graphical login, a Kerberos TGT via PKINIT, and CRL revocation enforced.
 - `dist/sssd-smartcard-0.2.2.tar.gz` — sha256 `a746f42eca74089d9c92e381f2e37c0dca154176d8f34ee533424393d67f2010`
 
 Documentation: [docs/HOW-IT-WORKS.md](docs/HOW-IT-WORKS.md) (the mechanism as it
-runs), [docs/TUTORIAL.md](docs/TUTORIAL.md) (step-by-step, every step marked
-verified or not), [docs/sssd-reference.md](docs/sssd-reference.md) (every emitted
-option with its source, and the measured findings).
+runs), [DEPLOY.md](DEPLOY.md) (a clean machine, step by step),
+[docs/COMMANDS.md](docs/COMMANDS.md) (every command) and
+[docs/sssd-reference.md](docs/sssd-reference.md) (every emitted option with its
+source, and the measured findings).
+
+`docs/TUTORIAL.md` is the record of this lab's own run. It keeps the real
+hostnames, addresses and fingerprints, so it is deliberately **not** in the
+repository and **not** in the package.
 
 ## Lab host 10.0.0.50 — final state
 
