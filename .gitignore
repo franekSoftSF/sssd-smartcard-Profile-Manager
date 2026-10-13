@@ -36,3 +36,6 @@ Thumbs.db
 # and fingerprints. Kept locally; the published guides are DEPLOY.md and
 # docs/COMMANDS.md.
 /docs/TUTORIAL.md
+
+# Blog drafts: content for digitalworkspace.pl, not part of the tool.
+/blog/
