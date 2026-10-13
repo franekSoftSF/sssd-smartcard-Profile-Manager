@@ -321,8 +321,9 @@ sudo sssd-smartcard-setup --only packages,join,identity --yes
 ```
 
 A flag always overrides the file, and a file still holding the template's
-example values is refused rather than used — but only for the fields this
-script acts on.
+example values is refused rather than used — but only for the fields the
+**selected stages** consume. `--only packages,join,identity` therefore does not
+care that `ca` is unset; the CA files are fetched later by `ca discover`.
 
 Nine stages: `preflight, packages, join, identity, ca, card, certmap, gpo, pam`,
 then verification. `--only` and `--skip` take comma-separated stage names, so

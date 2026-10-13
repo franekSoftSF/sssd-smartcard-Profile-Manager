@@ -20,6 +20,16 @@ sssd-smartcard (0.2.2) unstable; urgency=medium
     fully working joined host).
   * Stop defaulting the PKCS#11 module to an RHEL-only path that does not exist
     on Debian or Ubuntu.
+  * The template-value guard in the setup script is scoped to the fields the
+    SELECTED stages consume, not the whole file. '--only packages,join,identity'
+    refused to run because the CA paths were still examples -- paths only the
+    ca stage uses, and that stage was excluded. The CA files are fetched later
+    by 'ca discover', after this runs.
+  * The environment template leaves 'ca' empty rather than carrying example
+    paths. 'ca discover --from-card --install' populates the trust bundle, and
+    the ca stage keeps an existing bundle when no files are named, so the
+    documented flow needs nothing there. Example paths were instead flagged as
+    unfilled and blocked the run.
   * sssd-smartcard-setup reads the environment file as well. It was the only
     one of the four scripts that did not, so the realm, the join user, the test
     user and the CA paths had to be retyped on a command line even though the

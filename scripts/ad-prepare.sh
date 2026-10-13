@@ -863,7 +863,10 @@ if (( ${ENV_INIT:-0} )); then
     say ""
     env_init "$ENV_TARGET" "${INIT_ARGS[@]}" || exit 1
     say ""
-    note "still to fill in by hand: join_user, test_user and ca (the CA files)."
+    note "still to fill in by hand: join_user and test_user."
+    note "The ca list is left empty on purpose: 'sssd-smartcard ca discover"
+    note "--from-card --install' fills the trust bundle, and the setup script"
+    note "keeps an existing bundle. Name files there only to import from disk."
     note "Then: $PROGRAM --check"
     exit 0
 fi

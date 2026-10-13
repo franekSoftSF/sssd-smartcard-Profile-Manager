@@ -43,7 +43,12 @@ TEMPLATE_DEFAULTS: dict[str, object] = {
     "role": "server",
     "join_user": "administrator",
     "test_user": "someone@ad.example.com",
-    "ca": ["/root/pki/root-ca.pem", "/root/pki/issuing-ca.pem"],
+    # Empty, not example paths. `ca discover --from-card --install` populates
+    # the trust bundle, and the ca stage keeps an existing bundle when no files
+    # are named -- so the documented flow needs nothing here. Example paths
+    # would instead be flagged as unfilled template values and block the run.
+    # Fill it in only when importing CA files from disk.
+    "ca": [],
     "crl": True,
     "ocsp": False,
     "desktop": False,

@@ -303,7 +303,7 @@ know:
 | `hostname` | Short name for this host; the FQDN becomes `<hostname>.<domain>`. |
 | `join_user` | Account used for `realm join`. |
 | `test_user` | The user every verification step resolves and tests. |
-| `ca` | CA certificate files, root first. |
+| `ca` | CA certificate files, root first. Left **empty** by default: `ca discover --install` fills the trust bundle, and the setup script keeps an existing one. Name files here only to import them from disk. |
 | `crl` / `ocsp` | Which revocation mechanism this PKI offers. |
 | `role` | `desktop` or `server`. The desktop installer refuses to run on a `server`. |
 | `desktop` | Whether this machine needs a graphical environment. |

@@ -1203,7 +1203,21 @@ if declare -F env_default_path >/dev/null; then
     # verbatim: a join against AD.EXAMPLE.COM as administrator. Only the
     # fields this script acts on are checked.
     if [[ -n "${ENV_FILE_LOADED:-}" ]] && declare -F env_has_placeholders >/dev/null; then
-        SETUP_PLACEHOLDERS=$(env_has_placeholders realm join_user test_user ca || true)
+        # Only the fields the SELECTED stages consume. Checking the whole file
+        # meant that --only packages,join,identity refused to run because the
+        # CA paths were still examples -- paths the ca stage would use, and
+        # that stage is excluded. The CA files are fetched later, by
+        # `ca discover`, which is after this runs.
+        declare -a NEEDED_KEYS=()
+        stage_enabled join     && NEEDED_KEYS+=(realm join_user)
+        stage_enabled identity && NEEDED_KEYS+=(test_user)
+        stage_enabled verify   && NEEDED_KEYS+=(test_user)
+        stage_enabled ca       && NEEDED_KEYS+=(ca)
+        if (( ${#NEEDED_KEYS[@]} )); then
+            SETUP_PLACEHOLDERS=$(env_has_placeholders "${NEEDED_KEYS[@]}" || true)
+        else
+            SETUP_PLACEHOLDERS=""
+        fi
         if [[ -n "$SETUP_PLACEHOLDERS" ]]; then
             warn "$ENV_FILE_LOADED still holds template values:"
             printf '%s\n' "$SETUP_PLACEHOLDERS" | sed -e 's/^/       /'

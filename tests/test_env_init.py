@@ -157,3 +157,37 @@ class TestLoaderAgreement:
             capture_output=True, text=True, check=False,
         )
         assert result.returncode == 0, result.stderr
+
+
+class TestCaIsEmptyByDefault:
+    """`ca discover --install` populates the bundle; the file need not.
+
+    The template used to ship example CA paths. They were then flagged as
+    unfilled template values and blocked the run -- including runs whose stage
+    selection excluded the CA stage entirely. An empty list says "nothing to
+    import", which is what the documented flow wants, and the CA stage keeps an
+    existing bundle when no files are named.
+    """
+
+    def test_the_template_names_no_ca_files(self):
+        assert init()["ca"] == []
+
+    def test_the_key_is_still_present_so_its_shape_is_visible(self):
+        assert "ca" in init()
+
+    def test_files_can_still_be_given(self):
+        data = init("ca=/root/pki/root.pem,/root/pki/sub.pem")
+        assert data["ca"] == ["/root/pki/root.pem", "/root/pki/sub.pem"]
+
+    def test_an_empty_list_loads_back_as_an_empty_array(self, tmp_path):
+        path = tmp_path / "environment.json"
+        path.write_text(json.dumps(init("domain=ad.corp.test")), encoding="utf-8")
+        result = subprocess.run(
+            [sys.executable, str(ENV_PY), str(path),
+             "domain realm hostname join_user test_user account_domain "
+             "sssd_domain desktop_package crl_file role notes",
+             "dns search ca", "desktop gpo adsys crl ocsp smartcard_required"],
+            capture_output=True, text=True, check=False,
+        )
+        assert result.returncode == 0, result.stderr
+        assert "ENV_CA=()" in result.stdout
