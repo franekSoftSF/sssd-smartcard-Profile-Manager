@@ -1,3 +1,39 @@
+sssd-smartcard (0.2.4) unstable; urgency=medium
+
+  * The apply plan now names the home-directory step. "Still to do by hand"
+    listed the Smart Card PAM profile and nothing else, so an operator working
+    from the plan alone would enable the card, log in and get a black screen --
+    fallback_homedir only names a path and nothing creates it. doctor warned
+    about it, but the plan is the document read *before* the change. The step
+    appears only when the live PAM session stack can be read and has no
+    provisioner in it, so a host that provisions homes another way (autofs, a
+    pre-created share) is never told to change anything; an unknown
+    distribution says it has no command rather than offering a wrong one.
+  * CRL enforcement measured end to end, which it had not been. A successful
+    login with a certificate that is not revoked looks the same whether the CRL
+    was consulted or ignored, so the file was removed from a working
+    configuration: the prompt changed from PIN to Password and the card was
+    refused, restoring it brought the PIN back. p11_child names the mechanism
+    -- X509_load_crl_file failed, init_verification failed -- so verification
+    does not start at all rather than passing silently. crl_file is therefore
+    load-bearing and opened on every authentication. Rejection of a specific
+    revoked serial still rests on OpenSSL once the list loads and remains the
+    one untested control.
+  * How that failure lands depends on one PAM choice, and this is now in the
+    generated note and docs/sssd-reference.md: with sss-smart-card-optional the
+    card is refused and the password prompt takes over with no error shown to
+    anyone, so a Smart Card deployment quietly stops being one; with
+    sss-smart-card-required there is no fallback and every user is locked out
+    at once. An expired CRL does the same on the CA's own schedule -- the lab's
+    issuing CA publishes a list valid for about eight days -- which is why
+    'ca crl timer --install' is part of the configuration and not an
+    optimisation.
+  * That note also told the operator the wrong command: it credited
+    'ca crl update' with installing the systemd timer. update refreshes the
+    CRL; timer --install writes and enables the units.
+
+ -- Szymon Frankiewicz <szymonfrankiewicz@gmail.com>  Wed, 14 Oct 2026 01:45:00 +0200
+
 sssd-smartcard (0.2.3) unstable; urgency=medium
 
   * Every change now gets its own version. 0.2.2 was re-uploaded to the same

@@ -421,6 +421,58 @@ set that verifies cleanly starts failing with `unable to get certificate CRL`
 the moment `partial_chain` is added. The tool drops `partial_chain` and says so
 rather than emitting a combination that rejects every card.
 
+### Measured on a live login: the file is load-bearing, and a loss degrades silently
+
+The four rules above come from `p11_child --verification`, which asks the
+question directly. The question they do *not* answer is whether a login
+actually consults the file, because a successful login with a certificate that
+is not revoked looks identical whether the CRL was checked or ignored.
+
+Measured by removing the file from a working configuration (SSSD 2.9.4,
+Ubuntu 24.04, real PIV card, `sss-smart-card-optional`):
+
+| CRL file | Prompt | Result |
+|---|---|---|
+| present | `PIN for <name>:` | authenticated by card |
+| **absent** | `Password:` | card path refused, password accepted |
+| restored | `PIN for <name>:` | authenticated by card |
+
+`p11_child.log` names the mechanism, and it is not "verified and rejected" —
+verification never starts:
+
+```
+[init_verification] X509_load_crl_file for [/etc/sssd/pki/revocation.crl.pem]
+    failed [error:80000002:system library::No such file or directory]
+[do_work] init_verification failed.
+[main] p11_child failed (5)
+```
+
+The same log confirms the generated `certificate_verification` string is parsed
+rather than merely accepted: `parse_cert_verify_opts: Found 'no_ocsp' option,
+disabling OCSP`.
+
+Note what this does and does not establish. It proves `crl_file` is
+load-bearing: the file is opened on every authentication and the card is
+refused when it cannot be read. It does **not** prove that a revoked serial is
+rejected — that rests on OpenSSL's `X509_V_FLAG_CRL_CHECK_ALL` once the list
+loads, and the only direct test is to revoke a certificate and re-run.
+
+**The operational consequence is the part worth remembering.** The failure
+lands differently depending on one PAM choice:
+
+* `sss-smart-card-optional` — the card is refused and the password prompt
+  takes over. No error reaches the user, and from the outside it looks like
+  "people are being asked for passwords again", not like a broken revocation
+  check. A Smart Card deployment quietly stops being one.
+* `sss-smart-card-required` — `pam_sss.so require_cert_auth` has no fallback,
+  so the same condition locks out **every** user at once.
+
+Since SSSD never refreshes the file itself, an expired CRL produces exactly
+this on a schedule the CA sets: the lab's issuing CA publishes a list valid for
+about eight days. `sssd-smartcard ca crl timer --install` is therefore part of
+the configuration, not an optimisation, and the unit deliberately fails loudly
+rather than replacing a working file with an incomplete set.
+
 ### "OCSP at the issuing CA, CRL at the root" is not expressible
 
 A reasonable plan where the subca has a responder and the root only publishes a

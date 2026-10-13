@@ -19,7 +19,7 @@ from dataclasses import dataclass, field
 
 from ..errors import UnsupportedFeature
 from ..model.profile import DEFAULT_CA_DB, SmartCardProfile
-from ..platform import DistroInfo, detect_distro
+from ..platform import FAMILY_DEBIAN, FAMILY_RHEL, DistroInfo, detect_distro
 from .compat import DEFAULT_VERSION, Version, feature
 from .mappings import BuiltRule, build_rule
 
@@ -416,7 +416,18 @@ class SSSD2xRenderer(CertMapRenderer):
                 notes.append(
                     "SSSD reads the CRL from this local PEM file. It does not download "
                     "CRL distribution points, so schedule a job to refresh the file: "
-                    "'sssd-smartcard ca crl update' installs the systemd timer."
+                    "'sssd-smartcard ca crl timer --install' installs the systemd "
+                    "timer. Measured on a live login: the file is opened on every "
+                    "authentication, and when it cannot be read p11_child refuses "
+                    "before verification even starts (X509_load_crl_file failed -> "
+                    "init_verification failed). How that lands depends on the PAM "
+                    "profile: with sss-smart-card-optional the card is refused and the "
+                    "password prompt takes over, with no error shown to anyone -- the "
+                    "deployment quietly stops using cards. With "
+                    "sss-smart-card-required there is no fallback and every user is "
+                    "locked out at once. An expired CRL does the same thing on the "
+                    "CA's own schedule, which is why the timer is part of the "
+                    "configuration rather than an optimisation."
                 )
                 # Measured on SSSD 2.9.4: crl_file puts OpenSSL into
                 # X509_V_FLAG_CRL_CHECK_ALL, so a CRL is required for EVERY CA
@@ -613,6 +624,52 @@ class SSSD2xRenderer(CertMapRenderer):
                 "unity, xdm) is kept and only adjusted."
             )
 
+    def _home_step(self, out, distro) -> None:
+        """Name the home-directory step when this host has nothing to create one.
+
+        ``fallback_homedir`` only *names* a path.  Without a provisioner the
+        card login succeeds and the session lands in a home that does not
+        exist -- a black screen under GNOME, measured on the first lab host.
+        An operator who works from this plan alone would not find out until
+        the login they were trying to fix fails for a different reason.
+
+        Only emitted when the live PAM session stack can be read and has no
+        provisioner, so it never guesses: a host that provisions homes another
+        way (autofs, a pre-created share) does not get told to change it.
+        """
+        from ..sssdconf.runtime import home_provisioning
+        from ..util import is_linux
+
+        if not is_linux():
+            return
+        module, _ = home_provisioning()
+        if module:
+            return
+
+        if distro.family == FAMILY_RHEL:
+            command = (
+                "authselect enable-feature with-mkhomedir && "
+                "systemctl enable --now oddjobd"
+            )
+        elif distro.family == FAMILY_DEBIAN:
+            command = "pam-auth-update --enable mkhomedir"
+        else:
+            command = ""
+
+        out.manual_steps.append(
+            ManualStep(
+                "Create home directories at first login",
+                command,
+                "Nothing in the PAM session stack creates a missing home directory. "
+                "fallback_homedir in sssd.conf only names the path, so the first "
+                "card login of every domain user succeeds and then lands in a home "
+                "that does not exist -- under GNOME that is a black screen, in a "
+                "shell a login in / with no dotfiles."
+                + ("" if command else " No command known for this distribution: add "
+                   "pam_mkhomedir.so to the session stack by hand."),
+            )
+        )
+
     def _manual_steps(self, profile: SmartCardProfile, out, distro) -> None:
         required = profile.authentication.smartcard_required
         plan = distro.pam_plan()
@@ -661,6 +718,8 @@ class SSSD2xRenderer(CertMapRenderer):
                     + f"\n{plan.detail}",
                 )
             )
+
+        self._home_step(out, distro)
 
         if profile.gpo.adsys:
             if distro.supports_adsys:
