@@ -3,22 +3,73 @@
 Copy-paste reference. Replace `sysadmin@10.0.0.50` with the target and
 `ad.example.com` / `10.0.0.10` with the domain and its DNS server.
 
-## 1. Copy the package over
+Releases, with the `.deb`, the tarball and their checksums:
+[github.com/franekSoftSF/sssd-smartcard-Profile-Manager/releases](https://github.com/franekSoftSF/sssd-smartcard-Profile-Manager/releases)
 
-From the project directory on the workstation that built it:
+## 1. Get the package onto the machine
+
+Two ways. The first needs nothing but outbound HTTPS from the target, which is
+usually the shorter path.
+
+### From the release
+
+Run this **on the machine being set up**:
+
+```bash
+VER=0.2.2
+REPO=https://github.com/franekSoftSF/sssd-smartcard-Profile-Manager/releases/download/v$VER
+curl -sSfLO "$REPO/sssd-smartcard_${VER}_all.deb"
+curl -sSfLO "$REPO/sssd-smartcard_${VER}_all.deb.sha256"
+sha256sum -c "sssd-smartcard_${VER}_all.deb.sha256"
+```
+
+```
+sssd-smartcard_0.2.2_all.deb: OK
+```
+
+That `OK` is the whole point of shipping the checksum beside the file. A
+truncated download fails later, during `dpkg`, in ways that read like a broken
+package rather than a broken transfer.
+
+The `-f` in `curl -sSfL` matters as much. Without it, a wrong URL leaves you
+with the server's error body in the file and an exit status of zero — measured
+against this release, a 9-byte file reading `Not Found`:
+
+```
+$ curl -sSLO ".../does-not-exist.deb"   # no -f
+$ ls -l does-not-exist.deb              # 9 bytes
+$ head -c 60 does-not-exist.deb         # Not Found
+
+$ curl -sSfLO ".../does-not-exist.deb"  # with -f
+curl: (22) The requested URL returned error: 404
+                                        # nothing written
+```
+
+Current checksums, if you prefer to compare them against a value you got from
+somewhere other than the same download:
+
+| File | sha256 |
+|---|---|
+| `sssd-smartcard_0.2.2_all.deb` | `c94c6913d1e81f126b3fe76a6d7407729b4093017b38f964f7225285dc18b92f` |
+| `sssd-smartcard-0.2.2.tar.gz` | `6c792427592d6134c5e9527d740d675e24ff9165a4dea9415660a4463c9bdc50` |
+
+### From the machine that built it
+
+For a target with no outbound HTTP, or when testing a build that is not
+released yet:
 
 ```bash
 scp dist/sssd-smartcard_0.2.2_all.deb sysadmin@10.0.0.50:/tmp/
 ```
 
-If `scp` refuses because the host key changed (a rebuilt VM on a reused
-address), remove the stale key rather than disabling checking:
+If `scp` refuses because the host key changed — a rebuilt VM on a reused
+address — remove the stale key rather than turning checking off:
 
 ```bash
 ssh-keygen -R 10.0.0.50
 ```
 
-Verify the file survived the copy — a truncated `.deb` fails in confusing ways:
+Then confirm the file survived the copy:
 
 ```bash
 sha256sum dist/sssd-smartcard_0.2.2_all.deb
@@ -31,6 +82,14 @@ Both must print the same hash.
 
 Prefer `apt install` over `dpkg -i`: apt pulls in the dependencies, dpkg does
 not and leaves the package unconfigured if anything is missing.
+
+On the target, from the directory the file is in:
+
+```bash
+sudo apt-get install -y ./sssd-smartcard_0.2.2_all.deb
+```
+
+Or over SSH, if it was copied to `/tmp`:
 
 ```bash
 ssh sysadmin@10.0.0.50 'sudo apt-get install -y /tmp/sssd-smartcard_0.2.2_all.deb'
@@ -63,6 +122,14 @@ sssd-smartcard-setup 0.2.2
 
 Copy, install and verify in a single command:
 
+Straight from the release, on the target:
+
+```bash
+VER=0.2.2; curl -sSfLO "https://github.com/franekSoftSF/sssd-smartcard-Profile-Manager/releases/download/v$VER/sssd-smartcard_${VER}_all.deb" && sudo apt-get install -y "./sssd-smartcard_${VER}_all.deb" >/dev/null && sssd-smartcard --version
+```
+
+Or copy-and-install from the build machine:
+
 ```bash
 scp dist/sssd-smartcard_0.2.2_all.deb sysadmin@10.0.0.50:/tmp/ && ssh sysadmin@10.0.0.50 'sudo apt-get install -y /tmp/sssd-smartcard_0.2.2_all.deb >/dev/null && sssd-smartcard --version'
 ```
@@ -70,6 +137,16 @@ scp dist/sssd-smartcard_0.2.2_all.deb sysadmin@10.0.0.50:/tmp/ && ssh sysadmin@1
 ## Without a .deb: the tarball
 
 For a machine where installing a package is not wanted, or a non-Debian host:
+
+```bash
+VER=0.2.2
+REPO=https://github.com/franekSoftSF/sssd-smartcard-Profile-Manager/releases/download/v$VER
+curl -sSfLO "$REPO/sssd-smartcard-${VER}.tar.gz"
+curl -sSfLO "$REPO/sssd-smartcard-${VER}.tar.gz.sha256"
+sha256sum -c "sssd-smartcard-${VER}.tar.gz.sha256"
+```
+
+or, from the build machine:
 
 ```bash
 scp dist/sssd-smartcard-0.2.2.tar.gz sysadmin@10.0.0.50:/tmp/
