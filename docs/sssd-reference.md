@@ -487,6 +487,93 @@ be given in PEM format, see crl(1ssl) for details"; `soft_crl`: "If a
 Certificate Revocation List (CRL) is expired ignore the expiration time of the
 CRL"). Rules 1-4 and the discovery table are measured, as above.
 
+## Alternative UPN suffixes: a UPN suffix is not a domain
+
+A certificate whose UPN suffix differs from the domain the host is joined to
+means one of two unrelated things, and they want opposite configurations.
+
+| | Trusted domain | Alternative UPN suffix |
+|---|---|---|
+| Where the accounts are | another SSSD domain | **this** domain |
+| `domains=` | names that domain | **must be absent** |
+| UPN suffix in `matchrule` | pin it | do not pin it |
+| How to tell | the suffix **is** a domain `sssctl domain-list` shows | it is not |
+
+Active Directory lets a forest publish several UPN suffixes, and aligning the
+AD UPN with the Entra ID one is the usual reason: users log in as
+`someone@example.com` while the domain is `ad.example.com`. The suffix is then
+a label on the account, not a domain — nothing resolves it, and SSSD has never
+heard of it.
+
+Two things go wrong if it is mistaken for a trusted domain:
+
+* `domains = example.com` points SSSD at a domain it does not have. Measured:
+  `sssctl domain-status example.com` answers *Unable to get online status*,
+  while `sssctl domain-list` shows only `ad.example.com`.
+* `<SAN:ntPrincipalName>.*@example\.com$` pins **one** suffix. A forest can
+  have several, so a card issued under any other silently fails to match, SSSD
+  falls back to its default mapping, and login drops to the password prompt —
+  the same symptom as a broken rule, from a working one.
+
+### What the tool emits
+
+It asks whether the suffix is a domain SSSD knows, and generates accordingly.
+For the alternative-suffix case:
+
+```ini
+[certmap/ad.example.com/EXAMPLE-UPN]
+matchrule = KRB5:<ISSUER>^CN=Example Sub CA,DC=ad,DC=example,DC=com$<EKU>clientAuth,msScLogin<SAN:ntPrincipalName>.*
+maprule = LDAP:(|(userPrincipalName={subject_nt_principal})(sAMAccountName={subject_nt_principal.short_name}))
+```
+
+No `domains=`, so the search stays in the rule's own domain, which is where the
+accounts are. No suffix anchor, so **every** suffix the CA issues for is
+accepted — one rule for all of them.
+
+Dropping the suffix anchor costs nothing that matters. The trust is carried by
+the anchored `<ISSUER>` and the required `<EKU>`: only certificates from that
+CA, issued for Smart Card logon, reach the map rule at all. And the map rule
+looks the account up **by the exact UPN on the card**, so a certificate whose
+UPN belongs to no account resolves to nobody.
+
+Listing several suffixes in one rule is not an option: components joined with
+`||` leave the literal operator in the preceding component's value — measured,
+see the matching-rule section above.
+
+### Verifying it
+
+```bash
+sudo sssd-smartcard mapping test <profile> --from-card
+```
+
+```
+MATCH
+  Decided by:            sssctl
+  LDAP filter:           (|(userPrincipalName=someone@example.com)(sAMAccountName=someone))
+[PASS] getent passwd  someone@ad.example.com:*:827801106:827800513:...
+[PASS] sssctl user-checks  user: someone@example.com
+```
+
+The filter carries the UPN from the card; the account it finds is in the joined
+domain. Those two lines being different is the whole point, and seeing them
+agree is what confirms the configuration.
+
+### Overriding it
+
+The decision needs `sssctl domain-list` to answer, so on a host that cannot
+reach its domain the tool keeps the trusted-domain reading rather than guessing
+the narrower one. To state it yourself, in the profile:
+
+```yaml
+mapping:
+  type: san-upn
+  options:
+    any_suffix: true          # accept every UPN suffix
+    # or pin exactly one:
+    # upn_suffix: example.com
+  domains: [other.example.com]   # only for a real trusted domain
+```
+
 ## PKINIT: what the KDC must present, and what MIT demands
 
 Smart Card login and a Kerberos ticket are different mechanisms. Login is local

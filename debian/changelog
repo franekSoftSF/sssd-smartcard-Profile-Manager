@@ -36,6 +36,19 @@ sssd-smartcard (0.2.2) unstable; urgency=medium
     file already held them. A flag still overrides the file, and a file holding
     the template's example values is refused rather than used -- checked only
     for the fields this script acts on.
+  * Tell an alternative UPN suffix apart from a trusted domain, and generate
+    accordingly. A certificate whose UPN suffix differs from the joined domain
+    means one of two unrelated things; the tool detected which but only warned,
+    and went on emitting the trusted-domain shape regardless. Measured on a lab
+    whose AD UPN is aligned with Entra ID: the rule came out with a domains=
+    line naming a domain sssctl domain-list does not show, and pinned the one
+    suffix of a forest that has several -- so a card issued under another
+    suffix would silently fail to match and fall back to the password prompt.
+    Now: no domains=, no suffix anchor, one rule for every suffix, with the
+    trust still on the pinned issuer and EKU and the account looked up by the
+    exact UPN on the card. Where sssctl cannot answer, the trusted-domain
+    reading is kept rather than guessing the narrower one. Documented in
+    docs/sssd-reference.md and DEPLOY.md.
   * 'ca discover --pki-url' accepts a single file as well as a directory.
     Pasting a root CA certificate's URL used to append a slash and ask for it
     as a directory, which 404'd twice and returned nothing; the file is now

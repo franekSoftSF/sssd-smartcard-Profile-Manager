@@ -348,6 +348,9 @@ def cmd_cert_inspect(args, printer: Printer) -> int:
                 require_smartcard=args.require_smartcard,
                 ca_bundle=args.ca_bundle,
                 section_domain=section_domain,
+                # So the generator can tell a trusted domain from an
+                # alternative UPN suffix, instead of assuming the first.
+                sssd_domains=known_sssd_domains(args.config),
             )
             rendered = render(profile, version=version, allow_degraded=True)
         except SmartCardError as exc:

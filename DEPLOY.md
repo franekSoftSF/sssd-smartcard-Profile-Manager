@@ -498,6 +498,44 @@ responder stops every card login. A real OCSP request is therefore sent, and
 stated: *advertises no responder* and *the advertised responder did not answer*
 are different faults.
 
+## Step 3c — check the UPN suffix before applying anything
+
+```bash
+sudo sssd-smartcard cert inspect --from-card
+```
+
+Read the `Domain:` line. When it differs from the domain the host is joined to,
+Active Directory is using an **alternative UPN suffix** — users logging in as
+`someone@example.com` while the domain is `ad.example.com`, usually to align
+the AD UPN with Entra ID. A forest can have several.
+
+```
+Subject:   CN=Someone,OU=Users,DC=ad,DC=example,DC=com
+Domain:    example.com  (taken from the SAN UPN suffix)
+```
+
+That suffix is a label on the account, not a domain: nothing resolves it, and
+`sssctl domain-list` will not show it. The tool checks that for itself and
+generates a rule with no `domains=` and no suffix anchor, so every suffix the
+CA issues for is accepted by one rule. The trust stays with the pinned issuer
+and EKU, and the account is looked up by the exact UPN on the card.
+
+Confirm it before applying:
+
+```bash
+sudo sssd-smartcard cert autoconfig --from-card --save-profile /tmp/p.yaml
+sudo sssd-smartcard mapping test /tmp/p.yaml --from-card
+```
+
+```
+MATCH
+  LDAP filter:  (|(userPrincipalName=someone@example.com)(sAMAccountName=someone))
+[PASS] getent passwd  someone@ad.example.com:*:827801106:...
+```
+
+The filter carries the card's UPN; the account found is in the joined domain.
+`docs/sssd-reference.md` has the full reasoning and how to override it.
+
 ## Step 4 — Smart Card configuration
 
 With the CA chain on the machine:

@@ -419,6 +419,7 @@ def build_profile(
     require_smartcard: bool = False,
     ca_bundle: str | None = None,
     section_domain: str | None = None,
+    sssd_domains: list[str] | None = None,
 ) -> SmartCardProfile:
     """Compose a complete profile from an inspection result.
 
@@ -447,9 +448,28 @@ def build_profile(
 
     account_domain = recommendation.domain or "example.local"
     domain = section_domain or account_domain
+    # A UPN suffix that differs from the joined domain is either a trusted
+    # domain or an alternative UPN suffix, and the two want opposite
+    # configurations. The question that separates them: is that suffix a domain
+    # SSSD actually knows?
     search_domains: list[str] = []
+    known = {d.lower() for d in (sssd_domains or [])}
     if section_domain and section_domain.lower() != account_domain.lower():
-        search_domains = [account_domain]
+        if not known or account_domain.lower() in known:
+            # A real trusted domain, or no way to tell -- direct the search
+            # there, which is what domains= is for.
+            search_domains = [account_domain]
+        else:
+            # An alternative UPN suffix: the accounts live in this domain and
+            # merely log in under another suffix. domains= would name a domain
+            # SSSD has never heard of, and pinning this one suffix would reject
+            # every card issued under any other -- a lab can have several, with
+            # the AD UPN aligned to Entra ID. Accept any suffix instead; the
+            # trust still rests on the pinned issuer and EKU, and the LDAP
+            # lookup resolves whatever UPN the card actually carries.
+            options = dict(options)
+            options.pop("upn_suffix", None)
+            options["any_suffix"] = True
 
     constraints = CertificateConstraints()
     if pin_issuer and not cert.is_self_signed:

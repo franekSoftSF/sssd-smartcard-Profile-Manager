@@ -469,6 +469,37 @@ def listing_checks(listing: PkiListing) -> list[Check]:
             )
         )
 
+    # A CA's own CRL is advertised by the certificates it signed, never by its
+    # own certificate -- so walking certificates upwards finds the parent's CRL
+    # and misses the issuing CA's. Since crl_file needs one current CRL per CA
+    # in the chain and fails closed, saying "1 CRL" without saying "for 2 CAs"
+    # would read like success.
+    if listing.certificates and len(listing.crls) < len(listing.certificates):
+        covered = {
+            re.sub(r"\s+", "", str(getattr(c, "issuer", ""))).lower()
+            for c in listing.crls
+        }
+        missing = [
+            c.subject_dn
+            for c in listing.certificates
+            if re.sub(r"\s+", "", c.subject_dn).lower() not in covered
+        ]
+        if missing:
+            checks.append(
+                Check(
+                    "CRL coverage",
+                    "WARN",
+                    f"{len(listing.crls)} CRL(s) for {len(listing.certificates)} CA(s); "
+                    "none found for " + ", ".join(missing),
+                    hint="crl_file needs one current CRL per CA in the chain and "
+                    "fails closed, so an incomplete set stops every card login. A "
+                    "CA's own CRL is advertised by the certificates it signed, not "
+                    "by its own certificate -- so the issuing CA's CRL is only "
+                    "discoverable from an end-entity certificate: "
+                    "sssd-smartcard ca crl update --from-card",
+                )
+            )
+
     for note in listing.notes:
         checks.append(Check("PKI listing", "INFO", note))
     return checks
