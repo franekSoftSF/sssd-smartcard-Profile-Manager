@@ -195,11 +195,11 @@ host driven under `sudo`).
 The short version, once the package is installed:
 
 ```bash
-sudo ad-prepare --init-env          # describe the environment once, in JSON
-sudo ad-prepare --yes               # DNS and hostname, then verify
+sudo ad-prepare --init-env --domain ad.example.com   # discovers the DNS servers
+sudo ad-prepare --yes                                # DNS and hostname, then verify
 sudo sssd-smartcard-setup --only packages,join,identity --yes
 sudo sssd-smartcard ca discover --from-card --install
-sudo sssd-smartcard-setup --yes     # the Smart Card configuration itself
+sudo sssd-smartcard-setup --yes                      # the Smart Card configuration
 sudo sssd-smartcard doctor --user someone@ad.example.com
 ```
 

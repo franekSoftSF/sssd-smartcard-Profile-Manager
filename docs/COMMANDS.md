@@ -305,12 +305,24 @@ ip -4 addr show <iface> && nmcli device status
 ## `sssd-smartcard-setup`
 
 ```
-sssd-smartcard-setup [--realm R] [--join-user U] [--test-user UPN]
+sssd-smartcard-setup [--env FILE] [--realm R] [--join-user U] [--test-user UPN]
                      [--ca FILE]... [--sssd-domain D] [--account-domain D]
                      [--gpo] [--adsys] [--cert-autoenroll] [--pam]
                      [--only STAGES] [--skip STAGES] [--no-verify]
                      [--check] [--dry-run] [--yes] [--force]
 ```
+
+Reads the environment file for the realm, join user, test user, SSSD and
+account domains, CA paths and the GPO and Smart Card switches, so with one
+written the usual invocation carries no arguments but the stage selection:
+
+```bash
+sudo sssd-smartcard-setup --only packages,join,identity --yes
+```
+
+A flag always overrides the file, and a file still holding the template's
+example values is refused rather than used — but only for the fields this
+script acts on.
 
 Nine stages: `preflight, packages, join, identity, ca, card, certmap, gpo, pam`,
 then verification. `--only` and `--skip` take comma-separated stage names, so

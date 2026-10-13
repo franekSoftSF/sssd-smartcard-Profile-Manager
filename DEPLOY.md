@@ -360,7 +360,14 @@ sudo ad-prepare --rollback /var/lib/sssd-smartcard/backups/<stamp>
 ## Step 2 — Join the domain
 
 ```bash
-sudo sssd-smartcard-setup --only packages,join,identity --realm AD.EXAMPLE.COM --join-user administrator --test-user someone@ad.example.com --yes
+sudo sssd-smartcard-setup --only packages,join,identity --yes
+```
+
+The realm, the join user and the test user come from the environment file.
+Spell them out only to override it:
+
+```bash
+sudo sssd-smartcard-setup --only packages,join,identity --yes
 ```
 
 The `identity` stage is a hard gate: it refuses to continue until the test user
@@ -486,12 +493,21 @@ are different faults.
 
 With the CA chain on the machine:
 
+With the CA paths named in the environment file, there is nothing to pass:
+
 ```bash
-sudo sssd-smartcard-setup --dry-run --test-user someone@ad.example.com --ca /root/pki/root-ca.pem --ca /root/pki/issuing-ca.pem
+sudo sssd-smartcard-setup --dry-run
 ```
 
 ```bash
-sudo sssd-smartcard-setup --test-user someone@ad.example.com --ca /root/pki/root-ca.pem --ca /root/pki/issuing-ca.pem --yes
+sudo sssd-smartcard-setup --yes
+```
+
+Or spell them out, which overrides the file:
+
+```bash
+sudo sssd-smartcard-setup --test-user someone@ad.example.com \
+     --ca /root/pki/root-ca.pem --ca /root/pki/issuing-ca.pem --yes
 ```
 
 Then enable PAM and test without logging out:

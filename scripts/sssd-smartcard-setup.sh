@@ -68,6 +68,21 @@ CA_DB="/etc/sssd/pki/sssd_auth_ca_db.pem"
 STATE_DIR="/var/lib/sssd-smartcard"
 BACKUP_ROOT="$STATE_DIR/backups"
 LOG_FILE=""
+ENV_PATH=""
+
+# --- environment file -------------------------------------------------------
+# The domain and its details are described once in JSON; a flag given on the
+# command line still wins over the file.
+for _candidate in \
+        "${BASH_SOURCE[0]%/*}/lib/env.sh" \
+        /usr/share/sssd-smartcard/lib/env.sh; do
+    if [[ -r "$_candidate" ]]; then
+        # shellcheck source=/dev/null
+        source "$_candidate"
+        break
+    fi
+done
+unset _candidate
 ONLY_STAGES=""
 SKIP_STAGES=""
 
@@ -501,8 +516,16 @@ stage_join() {
         pass "host is joined to: $(echo "$joined" | tr '\n' ' ')"
         [[ -z "$SSSD_DOMAIN" ]] && SSSD_DOMAIN="$(echo "$joined" | head -1)"
     elif (( DO_JOIN )); then
-        [[ -n "$REALM" ]] || die "--join needs --realm <REALM>"
-        [[ -n "$JOIN_USER" ]] || die "--join needs --join-user <administrator>"
+        if [[ -z "$REALM" || -z "$JOIN_USER" ]]; then
+            fail "joining needs a realm and an account to join with"
+            [[ -n "$REALM" ]] || note "realm: not set -- pass --realm, or put it in"
+            [[ -n "$REALM" ]] || note "  the environment file as \"realm\" (or let it"
+            [[ -n "$REALM" ]] || note "  be derived from \"domain\")"
+            [[ -n "$JOIN_USER" ]] || note "join user: not set -- pass --join-user, or"
+            [[ -n "$JOIN_USER" ]] || note "  put it in the environment file as \"join_user\""
+            die "cannot join without both"
+        fi
+        (( ${JOIN_IMPLIED:-0} )) && info "--only join implies joining; --dry-run still applies"
         info "joining $REALM as $JOIN_USER"
         note "realm will prompt for the password; this script never reads or stores it"
         backup_file "$SSSD_CONF"
@@ -512,7 +535,18 @@ stage_join() {
     else
         fail "this host is not joined to any domain"
         note "Smart Card logon needs a working domain membership first."
-        note "Join it yourself, or re-run with: --join --realm DOMAIN-B.LOCAL --join-user Administrator"
+        # Name the values this run is actually holding. The old text printed an
+        # example realm from the manual, which had to be edited to be usable.
+        if [[ -n "$REALM" ]]; then
+            note "to join now, add the join stage:"
+            note "    $PROGRAM --only packages,join,identity --yes"
+            note "which would join $REALM${JOIN_USER:+ as $JOIN_USER}"
+            [[ -n "$JOIN_USER" ]] || note "    (and needs --join-user, or join_user in the environment file)"
+        else
+            note "no realm is known. Either join the domain yourself, or:"
+            note "    sudo ad-prepare --init-env --domain <domain>   # writes the realm"
+            note "    $PROGRAM --only packages,join,identity --yes"
+        fi
         die "cannot continue without domain membership"
     fi
 
@@ -1010,6 +1044,12 @@ MODES
   --force                Continue past failed gates (broken trust, no CA, no card).
 
 DOMAIN
+  --env FILE             Read the realm, join user, test user, CA paths and
+                         the GPO and Smart Card switches from a JSON
+                         environment file. Without it,
+                         /etc/sssd-smartcard/environment.json is used when it
+                         exists. Flags below override the file. Write one with:
+                         ad-prepare --init-env --domain <domain>
   --realm REALM          Kerberos realm, e.g. DOMAIN-B.LOCAL
   --join                 Join the realm if the host is not a member yet.
   --join-user USER       Account used for the join (password is prompted by realm).
@@ -1084,6 +1124,7 @@ while (( $# )); do
         --yes|-y) ASSUME_YES=1 ;;
         --non-interactive) NON_INTERACTIVE=1 ;;
         --force) FORCE=1 ;;
+        --env) ENV_PATH="${2:?--env needs a path}"; shift ;;
         --realm) REALM="${2:?--realm needs a value}"; shift ;;
         --join) DO_JOIN=1 ;;
         --join-user) JOIN_USER="${2:?--join-user needs a value}"; shift ;;
@@ -1122,6 +1163,54 @@ done
 # ---------------------------------------------------------------------------
 say "${C_BOLD}$PROGRAM $VERSION${C_RESET}"
 (( DRY_RUN )) && say "${C_YELLOW}dry run: nothing will be changed${C_RESET}"
+
+# Selecting the join stage by name is a statement of intent, so it does not
+# also need --join. The flag stays for the all-stages run, where the operator
+# did not single joining out. A dry run still changes nothing either way.
+if [[ ",${ONLY_STAGES:-}," == *,join,* ]] && (( ! DO_JOIN )); then
+    DO_JOIN=1
+    JOIN_IMPLIED=1
+fi
+
+# --- the environment file ---------------------------------------------------
+# Applied only where the command line said nothing, so an explicit flag always
+# wins. Without this, the realm, join user, test user and CA paths had to be
+# retyped even though the file already holds them.
+if declare -F env_default_path >/dev/null; then
+    if [[ -n "$ENV_PATH" ]]; then
+        env_load "$ENV_PATH" || die "could not read $ENV_PATH"
+        pass "environment: $ENV_PATH"
+    elif [[ -r "$(env_default_path)" ]]; then
+        env_load "$(env_default_path)" || die "could not read $(env_default_path)"
+        pass "environment: $(env_default_path)"
+    fi
+
+    [[ -z "$REALM" ]]          && REALM=${ENV_REALM:-}
+    [[ -z "$JOIN_USER" ]]      && JOIN_USER=${ENV_JOIN_USER:-}
+    [[ -z "$TEST_USER" ]]      && TEST_USER=${ENV_TEST_USER:-}
+    [[ -z "$SSSD_DOMAIN" ]]    && SSSD_DOMAIN=${ENV_SSSD_DOMAIN:-${ENV_DOMAIN:-}}
+    [[ -z "$ACCOUNT_DOMAIN" ]] && ACCOUNT_DOMAIN=${ENV_ACCOUNT_DOMAIN:-}
+    (( ${#CA_FILES[@]} )) || CA_FILES=("${ENV_CA[@]:-}")
+    # An empty array expansion leaves one empty element behind.
+    [[ ${#CA_FILES[@]} -eq 1 && -z ${CA_FILES[0]} ]] && CA_FILES=()
+
+    (( DO_GPO ))             || DO_GPO=${ENV_GPO:-0}
+    (( DO_ADSYS ))           || DO_ADSYS=${ENV_ADSYS:-0}
+    (( DO_ADSYS ))           && DO_GPO=1
+    (( REQUIRE_SMARTCARD ))  || REQUIRE_SMARTCARD=${ENV_SMARTCARD_REQUIRED:-0}
+
+    # Values the file still carries from the template would be applied
+    # verbatim: a join against AD.EXAMPLE.COM as administrator. Only the
+    # fields this script acts on are checked.
+    if [[ -n "${ENV_FILE_LOADED:-}" ]] && declare -F env_has_placeholders >/dev/null; then
+        SETUP_PLACEHOLDERS=$(env_has_placeholders realm join_user test_user ca || true)
+        if [[ -n "$SETUP_PLACEHOLDERS" ]]; then
+            warn "$ENV_FILE_LOADED still holds template values:"
+            printf '%s\n' "$SETUP_PLACEHOLDERS" | sed -e 's/^/       /'
+            die "fill them in, or override them on the command line"
+        fi
+    fi
+fi
 
 stage_preflight
 

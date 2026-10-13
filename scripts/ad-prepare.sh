@@ -887,7 +887,11 @@ fi
 
 # A template that was never filled in would otherwise be applied verbatim:
 # DNS set to 10.0.0.10, the hostname to wks01, on a real machine.
-if [[ -n "${ENV_FILE_LOADED:-}" ]] && declare -F env_has_placeholders >/dev/null; then
+# Not for --rollback: that restores files and has no interest in the domain,
+# yet the guard refused to let it run at all when the environment file still
+# held template values.
+if [[ -z "$ROLLBACK_DIR" ]] &&
+   [[ -n "${ENV_FILE_LOADED:-}" ]] && declare -F env_has_placeholders >/dev/null; then
     # Only the fields this script acts on. The CA paths and notes belong to
     # the setup script and are none of its business.
     PLACEHOLDERS=$(env_has_placeholders domain realm dns search hostname || true)
@@ -969,9 +973,26 @@ if (( VERIFY_RC == 0 )); then
     pass "ready to join $DOMAIN"
     say ""
     say "Next:"
-    say "  sudo sssd-smartcard-setup --only packages,join,identity \\"
-    say "       --realm ${DOMAIN^^} --join-user administrator \\"
-    say "       --test-user <someone>@$DOMAIN --yes"
+    # The setup script reads the same environment file, so with one loaded the
+    # command needs nothing but the stage selection. The long form printed a
+    # literal <someone> where the test user belongs: a command that had to be
+    # edited before it could be run.
+    if [[ -n "${ENV_FILE_LOADED:-}" ]]; then
+        say "  sudo sssd-smartcard-setup --only packages,join,identity --yes"
+        note "realm, join user and test user come from $ENV_FILE_LOADED"
+        # No `local` here: this block runs at the top level of the script,
+        # where `local` is a runtime error that `bash -n` does not catch.
+        missing=""
+        [[ -n "${ENV_JOIN_USER:-}" ]] || missing="join_user"
+        [[ -n "${ENV_TEST_USER:-}" ]] || missing="${missing:+$missing, }test_user"
+        [[ -n "$missing" ]] && warn "still to fill in there: $missing"
+    else
+        say "  sudo sssd-smartcard-setup --only packages,join,identity \\"
+        say "       --realm ${DOMAIN^^} --join-user <account> \\"
+        say "       --test-user <a user in $DOMAIN> --yes"
+        note "or write the environment file once and drop the flags:"
+        note "    sudo $PROGRAM --init-env --domain $DOMAIN"
+    fi
 else
     say ""
     fail "configuration applied, but verification did not pass"

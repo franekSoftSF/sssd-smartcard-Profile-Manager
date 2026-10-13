@@ -20,6 +20,12 @@ sssd-smartcard (0.2.2) unstable; urgency=medium
     fully working joined host).
   * Stop defaulting the PKCS#11 module to an RHEL-only path that does not exist
     on Debian or Ubuntu.
+  * sssd-smartcard-setup reads the environment file as well. It was the only
+    one of the four scripts that did not, so the realm, the join user, the test
+    user and the CA paths had to be retyped on a command line even though the
+    file already held them. A flag still overrides the file, and a file holding
+    the template's example values is refused rather than used -- checked only
+    for the fields this script acts on.
   * 'ca discover --pki-url <url>' now works with no certificate at all: the
     PKI's web directory is listed and every certificate and CRL in it is
     fetched and reported -- which CAs, their fingerprints and validity, whether
