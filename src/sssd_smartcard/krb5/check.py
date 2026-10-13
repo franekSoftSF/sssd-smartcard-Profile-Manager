@@ -782,15 +782,42 @@ def report(
             )
         else:
             out.checks.append(Check("KDC discovery", "PASS", ", ".join(out.kdcs)))
+            # One unreachable KDC among several working ones is not a failure:
+            # Kerberos tries the next. A decommissioned controller still listed
+            # in SRV is the common cause, and calling that a FAIL buries the
+            # findings that do stop a login.
+            probed = 0
             for host in out.kdcs[:3]:
                 reachable, detail = probe_kdc(host)
+                probed += 1 if reachable else 0
                 out.checks.append(
                     Check(
                         f"KDC {host}",
-                        "PASS" if reachable else "FAIL",
+                        "PASS" if reachable else "WARN",
                         detail,
-                        hint="" if reachable else "Check firewall and DNS; PKINIT needs "
-                        "TCP/88 (and often UDP/88) to the KDC.",
+                        hint="" if reachable else "Kerberos will try another KDC. A "
+                        "stale SRV record for a decommissioned controller looks like "
+                        "this; if the host is meant to be live, check DNS and TCP/88.",
+                    )
+                )
+            if not probed:
+                out.checks.append(
+                    Check(
+                        "KDC reachability",
+                        "FAIL",
+                        f"none of the {min(len(out.kdcs), 3)} KDC(s) tried answered on "
+                        "TCP/88",
+                        hint="No ticket can be obtained. Check DNS, routing and the "
+                        "firewall before anything else: a Smart Card cannot help here.",
+                    )
+                )
+            elif probed < min(len(out.kdcs), 3):
+                out.checks.append(
+                    Check(
+                        "KDC reachability",
+                        "PASS",
+                        f"{probed} of {min(len(out.kdcs), 3)} KDC(s) answered, which is "
+                        "enough",
                     )
                 )
 
