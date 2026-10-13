@@ -68,9 +68,21 @@ def _load_any(data: bytes, source: str) -> list[CertificateInfo]:
     return []
 
 
-#: Paths an AD CS web host commonly publishes under, tried when the URL given
-#: has no listing of its own.
-COMMON_PKI_PATHS = ("", "PKI/", "CertEnroll/", "certdata/", "certsrv/certenroll/")
+#: Directories CA hosts commonly publish under, tried both relative to the URL
+#: given and from the host root -- a file URL deep in a tree says nothing about
+#: where the directory lives. The publishing path is a local choice, so this
+#: list is a convenience and never a requirement: an unusual layout is handled
+#: by following a certificate's own pointers instead.
+COMMON_PKI_PATHS = (
+    "",
+    "PKI/", "pki/",
+    "CertEnroll/", "certenroll/",
+    "certdata/", "CertData/",
+    "crl/", "CRL/",
+    "certs/", "ca/", "CA/", "aia/",
+    "certsrv/certenroll/",
+    "repository/",
+)
 
 #: What is worth downloading from a listing.
 CERT_SUFFIXES = (".crt", ".cer", ".pem", ".p7b", ".p7c", ".der")
@@ -85,6 +97,27 @@ _HREF_RE = re.compile(r"""href\s*=\s*["']([^"']+)["']""", re.IGNORECASE)
 def _same_dn(a: str, b: str) -> bool:
     """Compare DNs without being defeated by spacing or case."""
     return re.sub(r"\s+", "", a).lower() == re.sub(r"\s+", "", b).lower()
+
+
+def _add_crls(out: "PkiListing", crls: list) -> bool:
+    """Add CRLs not already held, keyed by issuer and thisUpdate.
+
+    The same CRL arrives by more than one route: from the directory listing and
+    again from a certificate's distribution point. Counted twice, the report
+    said three CRLs where the PKI published two.
+    """
+    added = False
+    for crl in crls:
+        def key(c):
+            return (
+                re.sub(r"\s+", "", str(getattr(c, "issuer", ""))).lower(),
+                str(getattr(c, "last_update", "")),
+            )
+
+        if key(crl) not in {key(c) for c in out.crls}:
+            out.crls.append(crl)
+            added = True
+    return added
 
 
 @dataclass
@@ -156,14 +189,64 @@ def browse_pki(base: str, *, timeout: int = 20) -> PkiListing:
 
     if not base.lower().startswith(("http://", "https://")):
         base = "http://" + base
+
+    # A URL naming a file is a file, not a directory. Appending a slash to it
+    # and asking for a listing yields a 404 and an error message about the
+    # directory that was never there.
+    direct = ""
+    path_part = base.split("?")[0]
+    if path_part.lower().endswith(CERT_SUFFIXES + CRL_SUFFIXES):
+        direct = base
+        # The siblings almost always live beside it: the rest of the chain and
+        # the CRLs. So the parent is listed as well, best effort.
+        base = base[: base.rfind("/") + 1]
+
     if not base.endswith("/"):
         base += "/"
 
     out = PkiListing(base=base)
+    # The download loop below walks out.listed, which already contains the
+    # file fetched directly -- without this it would be fetched twice.
+    already_fetched: set[str] = set()
+
+    if direct:
+        body, error = http_get(direct, timeout=timeout)
+        if error:
+            out.errors.append(error)
+        else:
+            out.listed.append(direct)
+            already_fetched.add(direct)
+            if path_part.lower().endswith(CRL_SUFFIXES):
+                try:
+                    from .crl import load_crls
+
+                    _add_crls(out, load_crls(body, source=direct))
+                except Exception as exc:
+                    out.errors.append(f"{direct}: not a usable CRL ({exc})")
+            else:
+                found = _load_any(body, direct)
+                if found:
+                    out.certificates.extend(found)
+                    out.notes.append(f"fetched {direct}")
+                else:
+                    out.errors.append(
+                        f"{direct}: not a certificate in PEM, DER or PKCS#7"
+                    )
+
+    from urllib.parse import urlparse
+
+    parts = urlparse(base)
+    host_root = f"{parts.scheme}://{parts.netloc}/"
+    candidates = [urljoin(base, s) for s in COMMON_PKI_PATHS]
+    candidates += [urljoin(host_root, s) for s in COMMON_PKI_PATHS]
+
     index = ""
     chosen = base
-    for suffix in COMMON_PKI_PATHS:
-        candidate = urljoin(base, suffix)
+    tried: set[str] = set()
+    for candidate in candidates:
+        if candidate in tried:
+            continue
+        tried.add(candidate)
         body, error = http_get(candidate, timeout=timeout)
         if error:
             out.errors.append(error)
@@ -171,15 +254,34 @@ def browse_pki(base: str, *, timeout: int = 20) -> PkiListing:
         text = body.decode("utf-8", errors="replace")
         if _HREF_RE.search(text):
             index, chosen = text, candidate
-            if suffix:
+            if candidate != base:
                 out.notes.append(f"found a listing at {candidate}")
             break
         out.errors.append(f"{candidate}: served no links")
     if not index:
+        if out.certificates or out.crls:
+            # The file asked for was fetched; only its siblings are missing.
+            out.notes.append(
+                f"{base} has no directory listing, so only the file named was "
+                "fetched. The rest of the chain and the CRLs have to come from "
+                "their own URLs, or from a certificate with --from-card."
+            )
+            out.errors = [
+                e for e in out.errors if "404" not in e and "served no links" not in e
+            ]
+            return out
         out.errors.append(
-            f"{base}: no directory listing found. Many CA hosts have listings "
-            "disabled; pass the CA files with --ca, or name the exact URL of a "
-            "certificate."
+            f"no PKI directory found at or under {base}, nor at the host root. "
+            "Publishing paths are a local choice, so the names tried (PKI, pki, "
+            "CertEnroll, certdata, crl, certs, ca, aia, repository) are only the "
+            "common ones, and many hosts disable listings entirely."
+        )
+        out.notes.append(
+            "give the exact URL instead: either the directory holding the files, "
+            "or a single certificate, whose own AIA and CRL pointers are then "
+            "followed to the rest -- "
+            "--pki-url http://host/whatever/path/  or  "
+            "--pki-url http://host/whatever/CA.crt"
         )
         return out
 
@@ -191,6 +293,8 @@ def browse_pki(base: str, *, timeout: int = 20) -> PkiListing:
         lower = url.lower().split("?")[0]
         if not lower.endswith(CERT_SUFFIXES + CRL_SUFFIXES):
             continue
+        if url in out.listed:
+            continue  # already have it from the direct fetch
         seen.add(url)
         if len(seen) > MAX_LISTED_FILES:
             out.notes.append(
@@ -201,6 +305,8 @@ def browse_pki(base: str, *, timeout: int = 20) -> PkiListing:
         out.listed.append(url)
 
     for url in out.listed:
+        if url in already_fetched:
+            continue
         body, error = http_get(url, timeout=timeout)
         if error:
             out.errors.append(error)
@@ -209,7 +315,7 @@ def browse_pki(base: str, *, timeout: int = 20) -> PkiListing:
             try:
                 from .crl import load_crls
 
-                out.crls.extend(load_crls(body, source=url))
+                _add_crls(out, load_crls(body, source=url))
             except Exception as exc:
                 out.errors.append(f"{url}: not a usable CRL ({exc})")
             continue
@@ -221,7 +327,58 @@ def browse_pki(base: str, *, timeout: int = 20) -> PkiListing:
             if all(cert.fingerprint() != c.fingerprint() for c in out.certificates):
                 out.certificates.append(cert)
 
+    # Whatever the directory layout, a certificate names its issuer and its own
+    # CRL by exact URL. This is the only method an unusual publishing path
+    # cannot defeat, so it runs regardless of what the listing turned up.
+    _follow_pointers(out, already_fetched, timeout)
     return out
+
+
+def _follow_pointers(out: "PkiListing", already_fetched: set, timeout: int) -> None:
+    """Fetch what the certificates already in hand point at.
+
+    An intermediate's AIA names its issuer's certificate; a CRL distribution
+    point names its CRL. Following those needs no knowledge of where the host
+    publishes, which is what makes it work on a layout nobody guessed.
+    """
+    from .crl import load_crls
+
+    for _ in range(MAX_CHAIN_DEPTH):
+        wanted: list[str] = []
+        for cert in list(out.certificates):
+            for url in list(cert.ca_issuer_urls) + list(cert.crl_urls):
+                if url.lower().startswith("http") and url not in already_fetched:
+                    wanted.append(url)
+        wanted = list(dict.fromkeys(wanted))
+        if not wanted:
+            return
+
+        progressed = False
+        for url in wanted:
+            already_fetched.add(url)
+            body, error = http_get(url, timeout=timeout)
+            if error:
+                out.errors.append(error)
+                continue
+            if url not in out.listed:
+                out.listed.append(url)
+            if url.lower().split("?")[0].endswith(CRL_SUFFIXES):
+                try:
+                    if _add_crls(out, load_crls(body, source=url)):
+                        out.notes.append(f"followed a CRL pointer: {url}")
+                        progressed = True
+                except Exception as exc:
+                    out.errors.append(f"{url}: not a usable CRL ({exc})")
+                continue
+            for cert in _load_any(body, url):
+                if all(
+                    cert.fingerprint() != c.fingerprint() for c in out.certificates
+                ):
+                    out.certificates.append(cert)
+                    out.notes.append(f"followed an issuer pointer: {url}")
+                    progressed = True
+        if not progressed:
+            return
 
 
 def listing_checks(listing: PkiListing) -> list[Check]:

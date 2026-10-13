@@ -87,6 +87,16 @@ up to a self-signed root, collects the CRL distribution points of the leaf and
 every CA, and sends a **real OCSP request** to find out whether a responder
 answers. Handles PEM, DER and PKCS#7, since AD CS serves all three.
 
+`--pki-url` takes either a **directory** or a **single file**. Given a
+certificate's URL it fetches that certificate, then lists the parent directory
+for the siblings; given a directory it lists it. Publishing paths are a local
+choice, so candidate names (`PKI`, `pki`, `CertEnroll`, `certdata`, `crl`,
+`certs`, `ca`, `aia`, `repository`) are tried both under the URL given and at
+the host root — and, more reliably than any of that, **the pointers inside a
+certificate are followed**: an AIA names its issuer's certificate and a
+distribution point names its CRL, by exact URL, whatever the layout. When
+nothing is found it says so and asks for the exact URL rather than guessing.
+
 **With no certificate, `--pki-url` alone lists the PKI.** The directory is
 read and every certificate and CRL in it is fetched and reported: which CAs,
 their fingerprints and validity, whether the chain closes, and whether the CRLs

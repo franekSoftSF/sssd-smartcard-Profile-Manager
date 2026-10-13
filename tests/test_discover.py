@@ -382,7 +382,10 @@ class TestBrowsing:
         )
         listing = disc.browse_pki("http://pki.example/")
         assert listing.certificates == []
-        assert any("no directory listing" in e for e in listing.errors)
+        assert any("no PKI directory found" in e for e in listing.errors)
+        # And it must say what to do instead, since the path is a local choice
+        # the tool cannot be expected to guess.
+        assert any("give the exact URL" in n for n in listing.notes)
         checks = disc.listing_checks(listing)
         assert checks[0].status == "FAIL"
 
@@ -393,3 +396,267 @@ class TestBrowsing:
         listing = disc.browse_pki("http://pki.example/PKI/")
         trust = [c for c in disc.listing_checks(listing) if c.name == "CA trust"]
         assert trust and trust[0].status == "WARN"
+
+
+class TestADirectFileUrl:
+    """--pki-url given a certificate, not a directory.
+
+    Pasting the URL of a root CA certificate is the obvious thing to do with a
+    flag called --pki-url. It used to be normalised with a trailing slash and
+    asked for as a directory, producing a 404 about a directory that never
+    existed and no certificate at all.
+    """
+
+    def _serve(self, monkeypatch, *, parent_lists=True):
+        fetched: list[str] = []
+
+        def fake_get(url, *, timeout=20, post=None, content_type=None):
+            fetched.append(url)
+            if url.endswith("/ROOTCA.crt"):
+                return b"DER", ""
+            if parent_lists and url.endswith("/"):
+                return (
+                    b'<a href="/ROOTCA.crt">root</a><a href="/SUBCA.crt">sub</a>',
+                    "",
+                )
+            return b"", f"{url}: curl: (22) 404"
+
+        monkeypatch.setattr(disc, "http_get", fake_get)
+        monkeypatch.setattr(
+            disc,
+            "_load_any",
+            lambda d, source: [root() if "ROOTCA" in source else sub()],
+        )
+        return fetched
+
+    def test_the_certificate_itself_is_fetched(self, monkeypatch):
+        self._serve(monkeypatch)
+        listing = disc.browse_pki("http://pki.example/ROOTCA.crt")
+        assert listing.certificates
+        assert any("ROOTCA.crt" in u for u in listing.listed)
+
+    def test_no_slash_is_appended_to_the_file(self, monkeypatch):
+        fetched = self._serve(monkeypatch)
+        disc.browse_pki("http://pki.example/ROOTCA.crt")
+        assert "http://pki.example/ROOTCA.crt" in fetched
+        assert not any(u.endswith("ROOTCA.crt/") for u in fetched)
+
+    def test_the_parent_directory_is_listed_for_the_siblings(self, monkeypatch):
+        self._serve(monkeypatch)
+        listing = disc.browse_pki("http://pki.example/ROOTCA.crt")
+        assert listing.base == "http://pki.example/"
+        assert any("SUBCA.crt" in u for u in listing.listed)
+
+    def test_the_file_is_not_downloaded_twice(self, monkeypatch):
+        fetched = self._serve(monkeypatch)
+        disc.browse_pki("http://pki.example/ROOTCA.crt")
+        assert fetched.count("http://pki.example/ROOTCA.crt") == 1
+
+    def test_a_parent_without_a_listing_is_not_a_failure(self, monkeypatch):
+        """The file asked for was fetched; only its siblings are missing."""
+        self._serve(monkeypatch, parent_lists=False)
+        listing = disc.browse_pki("http://pki.example/ROOTCA.crt")
+        assert listing.certificates
+        checks = disc.listing_checks(listing)
+        assert checks[0].status == "PASS"
+        assert any("no directory listing" in n for n in listing.notes)
+
+    def test_a_crl_url_is_loaded_as_a_crl(self, monkeypatch):
+        def fake_get(url, **kw):
+            return (b"CRLDER", "") if url.endswith(".crl") else (b"", "404")
+
+        monkeypatch.setattr(disc, "http_get", fake_get)
+        loaded: list[str] = []
+        monkeypatch.setattr(
+            "sssd_smartcard.ca.crl.load_crls",
+            lambda data, source: loaded.append(source) or [FakeCrlStub()],
+        )
+        listing = disc.browse_pki("http://pki.example/ROOTCA.crl")
+        assert loaded == ["http://pki.example/ROOTCA.crl"]
+        assert len(listing.crls) == 1
+
+
+class FakeCrlStub:
+    issuer = "CN=Root CA"
+    next_update = None
+    expired = False
+    revoked_count = 0
+
+    def to_dict(self):
+        return {"issuer": self.issuer}
+
+
+class TestFindingAnUnusualPath:
+    """The publishing path is a local choice; detection must not assume one."""
+
+    def test_the_host_root_is_tried_as_well_as_the_url_given(self, monkeypatch):
+        tried: list[str] = []
+
+        def fake_get(url, **kw):
+            tried.append(url)
+            # Only a path nobody would guess relative to the given URL.
+            if url == "http://pki.example/repository/":
+                return b'<a href="/repository/CA.crt">ca</a>', ""
+            if url.endswith("/repository/CA.crt"):
+                return b"DER", ""
+            return b"", "404"
+
+        monkeypatch.setattr(disc, "http_get", fake_get)
+        monkeypatch.setattr(disc, "_load_any", lambda d, s: [root()])
+        listing = disc.browse_pki("http://pki.example/deep/nested/path/")
+        assert listing.certificates, "a listing at the host root must be found"
+        assert any("found a listing at" in n for n in listing.notes)
+
+    def test_a_candidate_is_not_requested_twice(self, monkeypatch):
+        tried: list[str] = []
+        monkeypatch.setattr(
+            disc, "http_get", lambda url, **kw: (tried.append(url), (b"", "404"))[1]
+        )
+        disc.browse_pki("http://pki.example/")
+        assert len(tried) == len(set(tried))
+
+
+class TestFollowingCertificatePointers:
+    """The method an unusual layout cannot defeat.
+
+    A certificate names its issuer's certificate and its own CRL by exact URL,
+    so once any certificate is in hand the rest is reachable regardless of
+    where the host publishes.
+    """
+
+    def test_an_issuer_pointer_is_followed(self, monkeypatch):
+        leaf_cert = FakeCert(
+            subject_dn=SUB, issuer_dn=ROOT, ca_issuer_urls=[AIA_ROOT], _fp="SUB"
+        )
+
+        def fake_get(url, **kw):
+            if url == AIA_ROOT:
+                return b"DER", ""
+            if url.endswith(".crt"):
+                return b"DER", ""
+            if url.endswith("/"):
+                return b'<a href="/SUB.crt">sub</a>', ""
+            return b"", "404"
+
+        monkeypatch.setattr(disc, "http_get", fake_get)
+        monkeypatch.setattr(
+            disc,
+            "_load_any",
+            lambda d, source: [root()] if source == AIA_ROOT else [leaf_cert],
+        )
+        listing = disc.browse_pki("http://pki.example/")
+        subjects = {c.subject_dn for c in listing.certificates}
+        assert ROOT in subjects, "the issuer named by AIA must be fetched"
+        assert any("followed an issuer pointer" in n for n in listing.notes)
+
+    def test_a_crl_pointer_is_followed(self, monkeypatch):
+        with_cdp = FakeCert(
+            subject_dn=SUB, issuer_dn=ROOT, crl_urls=[CDP_SUB], _fp="SUB"
+        )
+
+        def fake_get(url, **kw):
+            if url.endswith("/"):
+                return b'<a href="/SUB.crt">sub</a>', ""
+            return b"DER", ""
+
+        monkeypatch.setattr(disc, "http_get", fake_get)
+        monkeypatch.setattr(disc, "_load_any", lambda d, s: [with_cdp])
+        monkeypatch.setattr(
+            "sssd_smartcard.ca.crl.load_crls", lambda data, source: [FakeCrlStub()]
+        )
+        listing = disc.browse_pki("http://pki.example/")
+        assert listing.crls
+        assert any("followed a CRL pointer" in n for n in listing.notes)
+
+    def test_a_pointer_is_not_fetched_twice(self, monkeypatch):
+        fetched: list[str] = []
+        with_cdp = FakeCert(
+            subject_dn=SUB, issuer_dn=ROOT, crl_urls=[CDP_SUB], _fp="SUB"
+        )
+
+        def fake_get(url, **kw):
+            fetched.append(url)
+            if url.endswith("/"):
+                return b'<a href="/SUB.crt">sub</a>', ""
+            return b"DER", ""
+
+        monkeypatch.setattr(disc, "http_get", fake_get)
+        monkeypatch.setattr(disc, "_load_any", lambda d, s: [with_cdp])
+        monkeypatch.setattr(
+            "sssd_smartcard.ca.crl.load_crls", lambda data, source: [FakeCrlStub()]
+        )
+        disc.browse_pki("http://pki.example/")
+        assert fetched.count(CDP_SUB) == 1
+
+    def test_it_terminates_when_nothing_new_appears(self, monkeypatch):
+        """A pointer loop must not run forever."""
+        looping = FakeCert(
+            subject_dn=SUB, issuer_dn=ROOT, ca_issuer_urls=[AIA_ROOT], _fp="SUB"
+        )
+
+        def fake_get(url, **kw):
+            if url.endswith("/"):
+                return b'<a href="/SUB.crt">sub</a>', ""
+            return b"DER", ""
+
+        monkeypatch.setattr(disc, "http_get", fake_get)
+        # Every fetch yields the same certificate, so the second pass adds
+        # nothing and the walk has to stop.
+        monkeypatch.setattr(disc, "_load_any", lambda d, s: [looping])
+        listing = disc.browse_pki("http://pki.example/")
+        assert len(listing.certificates) == 1
+
+
+class TestCrlsAreCountedOnce:
+    """The same CRL arrives by more than one route.
+
+    The directory listing names it, and a certificate's distribution point
+    names it again. Counted twice, the report said three CRLs where the PKI
+    published two -- observed against a real two-tier PKI.
+    """
+
+    def _crl(self, issuer="CN=Root CA", last="2026-10-29"):
+        stub = FakeCrlStub()
+        stub.issuer = issuer
+        stub.last_update = last
+        return stub
+
+    def test_the_same_crl_twice_is_held_once(self):
+        listing = disc.PkiListing()
+        assert disc._add_crls(listing, [self._crl()]) is True
+        assert disc._add_crls(listing, [self._crl()]) is False
+        assert len(listing.crls) == 1
+
+    def test_a_different_issuer_is_a_different_crl(self):
+        listing = disc.PkiListing()
+        disc._add_crls(listing, [self._crl("CN=Root CA")])
+        disc._add_crls(listing, [self._crl("CN=Issuing CA")])
+        assert len(listing.crls) == 2
+
+    def test_a_refreshed_crl_from_the_same_issuer_is_kept(self):
+        """A newer thisUpdate is a new list, not a duplicate."""
+        listing = disc.PkiListing()
+        disc._add_crls(listing, [self._crl(last="2026-10-01")])
+        disc._add_crls(listing, [self._crl(last="2026-10-19")])
+        assert len(listing.crls) == 2
+
+    def test_issuer_spacing_does_not_create_a_duplicate(self):
+        listing = disc.PkiListing()
+        disc._add_crls(listing, [self._crl("CN=Root CA")])
+        disc._add_crls(listing, [self._crl("CN=Root  CA")])
+        assert len(listing.crls) == 1
+
+    def test_a_url_is_listed_once(self, monkeypatch):
+        def fake_get(url, **kw):
+            if url.endswith("/"):
+                return b'<a href="/CA.crt">ca</a>', ""
+            return b"DER", ""
+
+        with_cdp = FakeCert(
+            subject_dn=SUB, issuer_dn=ROOT, crl_urls=["http://pki.example/CA.crt"],
+            _fp="SUB",
+        )
+        monkeypatch.setattr(disc, "http_get", fake_get)
+        monkeypatch.setattr(disc, "_load_any", lambda d, s: [with_cdp])
+        listing = disc.browse_pki("http://pki.example/")
+        assert len(listing.listed) == len(set(listing.listed))

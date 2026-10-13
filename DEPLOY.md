@@ -457,6 +457,15 @@ So you learn what the PKI is — how many tiers, which CAs, how long they are
 valid, whether the chain closes, and whether the CRLs are current — before
 touching a card. `--install` writes the certificates into the trust bundle.
 
+The URL can be a **directory or a single file**. Pasting the URL of a root CA
+certificate works: that file is fetched, and the parent directory is then
+listed for the siblings. Candidate directory names are tried both under the URL
+given and at the host root, because a publishing path is a local choice — and
+the pointers inside a certificate are followed as well, which is the one method
+an unusual layout cannot defeat: an AIA names its issuer's certificate, and a
+distribution point names its CRL, by exact URL. If none of that finds anything,
+it says so and asks for the exact URL instead of guessing.
+
 Only links on the same host are followed, and only a bounded number: an address
 someone typed is not a reason to crawl. The common AD CS paths (`PKI/`,
 `CertEnroll/`, `certdata/`) are tried when the URL given has no listing of its

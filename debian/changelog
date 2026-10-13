@@ -36,6 +36,19 @@ sssd-smartcard (0.2.2) unstable; urgency=medium
     file already held them. A flag still overrides the file, and a file holding
     the template's example values is refused rather than used -- checked only
     for the fields this script acts on.
+  * 'ca discover --pki-url' accepts a single file as well as a directory.
+    Pasting a root CA certificate's URL used to append a slash and ask for it
+    as a directory, which 404'd twice and returned nothing; the file is now
+    fetched and its parent listed for the siblings.
+  * Publishing paths are a local choice, so candidate directory names are tried
+    both under the URL given and at the host root, and the pointers inside any
+    certificate found are followed -- an AIA names its issuer's certificate and
+    a distribution point names its CRL, by exact URL, whatever the layout. That
+    is the one route an unusual path cannot defeat. When nothing is found the
+    message asks for the exact URL instead of guessing further.
+  * A CRL reached by two routes is counted once. The listing and a
+    certificate's distribution point both name it, and the report said three
+    CRLs where the PKI published two.
   * 'ca discover --pki-url <url>' now works with no certificate at all: the
     PKI's web directory is listed and every certificate and CRL in it is
     fetched and reported -- which CAs, their fingerprints and validity, whether
