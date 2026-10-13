@@ -260,15 +260,25 @@ def browse_pki(base: str, *, timeout: int = 20) -> PkiListing:
         out.errors.append(f"{candidate}: served no links")
     if not index:
         if out.certificates or out.crls:
-            # The file asked for was fetched; only its siblings are missing.
             out.notes.append(
                 f"{base} has no directory listing, so only the file named was "
-                "fetched. The rest of the chain and the CRLs have to come from "
-                "their own URLs, or from a certificate with --from-card."
+                "fetched directly."
             )
+            # This is exactly where a certificate's own pointers earn their
+            # keep: no listing to read, but an AIA and a distribution point
+            # that name exact URLs. Skipping this step here meant
+            # --pki-url <sub-ca.crt> stopped at one certificate while
+            # --from-card followed the same AIA to the root and both CRLs.
+            _follow_pointers(out, already_fetched, timeout)
             out.errors = [
                 e for e in out.errors if "404" not in e and "served no links" not in e
             ]
+            if not out.complete_chain:
+                out.notes.append(
+                    "the chain is still incomplete. Name the missing CA by its own "
+                    "URL, or run with --from-card: an end-entity certificate names "
+                    "the whole chain."
+                )
             return out
         out.errors.append(
             f"no PKI directory found at or under {base}, nor at the host root. "
@@ -345,8 +355,12 @@ def _follow_pointers(out: "PkiListing", already_fetched: set, timeout: int) -> N
 
     for _ in range(MAX_CHAIN_DEPTH):
         wanted: list[str] = []
-        for cert in list(out.certificates):
-            for url in list(cert.ca_issuer_urls) + list(cert.crl_urls):
+        # CRLs too: a CRL may carry an AIA naming the certificate of the CA
+        # that signed it, which is the only route out of a bare .crl URL.
+        for source in list(out.certificates) + list(out.crls):
+            urls = list(getattr(source, "ca_issuer_urls", []))
+            urls += list(getattr(source, "crl_urls", []))
+            for url in urls:
                 if url.lower().startswith("http") and url not in already_fetched:
                     wanted.append(url)
         wanted = list(dict.fromkeys(wanted))

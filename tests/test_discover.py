@@ -660,3 +660,106 @@ class TestCrlsAreCountedOnce:
         monkeypatch.setattr(disc, "_load_any", lambda d, s: [with_cdp])
         listing = disc.browse_pki("http://pki.example/")
         assert len(listing.listed) == len(set(listing.listed))
+
+
+class TestNoListingStillFollowsPointers:
+    """A host without a directory listing is where pointers matter most.
+
+    Observed against a real PKI: `--pki-url <sub-ca.crt>` stopped at one
+    certificate and reported the chain incomplete, while `--from-card`
+    followed the very same AIA from the very same certificate to the root and
+    both CRLs. The no-listing branch returned before the pointer walk ran.
+    """
+
+    def _serve(self, monkeypatch):
+        sub_ca = FakeCert(
+            subject_dn=SUB,
+            issuer_dn=ROOT,
+            ca_issuer_urls=[AIA_ROOT],
+            crl_urls=[CDP_SUB],
+            _fp="SUB",
+        )
+
+        def fake_get(url, **kw):
+            if url.endswith("/"):
+                return b"<html>no links here</html>", ""   # no listing
+            if url.endswith(".crt") or url.endswith(".crl"):
+                return b"DER", ""
+            return b"", "404"
+
+        monkeypatch.setattr(disc, "http_get", fake_get)
+        monkeypatch.setattr(
+            disc,
+            "_load_any",
+            lambda d, source: [root()] if "Root" in source else [sub_ca],
+        )
+        monkeypatch.setattr(
+            "sssd_smartcard.ca.crl.load_crls", lambda data, source: [FakeCrlStub()]
+        )
+
+    def test_the_issuer_is_reached_with_no_listing(self, monkeypatch):
+        self._serve(monkeypatch)
+        listing = disc.browse_pki("http://pki.example/Root%20CA.crt")
+        assert any("no directory listing" in n for n in listing.notes)
+        assert len(listing.certificates) >= 1
+
+    def test_a_sub_ca_url_reaches_the_root(self, monkeypatch):
+        self._serve(monkeypatch)
+        listing = disc.browse_pki("http://pki.example/Sub.crt")
+        subjects = {c.subject_dn for c in listing.certificates}
+        assert ROOT in subjects, "the AIA must be followed without a listing"
+        assert listing.complete_chain is True
+
+    def test_the_crl_pointer_is_followed_too(self, monkeypatch):
+        self._serve(monkeypatch)
+        listing = disc.browse_pki("http://pki.example/Sub.crt")
+        assert listing.crls
+
+    def test_an_incomplete_chain_says_what_to_do(self, monkeypatch):
+        orphan = FakeCert(subject_dn=SUB, issuer_dn=ROOT, _fp="SUB")
+
+        def fake_get(url, **kw):
+            if url.endswith(".crt"):
+                return b"DER", ""
+            return b"", "404"
+
+        monkeypatch.setattr(disc, "http_get", fake_get)
+        monkeypatch.setattr(disc, "_load_any", lambda d, s: [orphan])
+        listing = disc.browse_pki("http://pki.example/Sub.crt")
+        assert listing.complete_chain is False
+        assert any("--from-card" in n for n in listing.notes)
+
+
+class TestCrlPointers:
+    """A CRL may name the certificate of the CA that signed it."""
+
+    def test_a_crl_aia_is_followed(self, monkeypatch):
+        class CrlWithAia(FakeCrlStub):
+            ca_issuer_urls = ["http://pki.example/Sub.crt"]
+            crl_urls: list = []
+
+        def fake_get(url, **kw):
+            if url.endswith(".crt") or url.endswith(".crl"):
+                return b"DER", ""
+            return b"", "404"
+
+        monkeypatch.setattr(disc, "http_get", fake_get)
+        monkeypatch.setattr(disc, "_load_any", lambda d, s: [sub()])
+        monkeypatch.setattr(
+            "sssd_smartcard.ca.crl.load_crls", lambda data, source: [CrlWithAia()]
+        )
+        listing = disc.browse_pki("http://pki.example/Sub.crl")
+        assert listing.certificates, "the CA named by the CRL's AIA must be fetched"
+        assert any("followed an issuer pointer" in n for n in listing.notes)
+
+    def test_a_crl_without_an_aia_is_not_an_error(self, monkeypatch):
+        def fake_get(url, **kw):
+            return (b"DER", "") if url.endswith(".crl") else (b"", "404")
+
+        monkeypatch.setattr(disc, "http_get", fake_get)
+        monkeypatch.setattr(
+            "sssd_smartcard.ca.crl.load_crls", lambda data, source: [FakeCrlStub()]
+        )
+        listing = disc.browse_pki("http://pki.example/Sub.crl")
+        assert listing.crls
+        assert listing.certificates == []

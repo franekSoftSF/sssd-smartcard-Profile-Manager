@@ -100,6 +100,37 @@ class CrlInfo:
         return _aware(value) if value else None
 
     @property
+    def ca_issuer_urls(self) -> list[str]:
+        """AIA ``caIssuers`` URLs, which RFC 5280 permits on a CRL.
+
+        AD CS commonly includes them, and they are the route from a bare
+        ``.crl`` URL to the certificate of the CA that signed it.
+        """
+        from cryptography.x509 import AuthorityInformationAccess
+        from cryptography.x509.oid import AuthorityInformationAccessOID
+
+        try:
+            ext = self.crl.extensions.get_extension_for_class(
+                AuthorityInformationAccess
+            ).value
+        except Exception:
+            return []
+        return [
+            str(d.access_location.value)
+            for d in ext
+            if d.access_method == AuthorityInformationAccessOID.CA_ISSUERS
+        ]
+
+    @property
+    def crl_urls(self) -> list[str]:
+        """Nothing: a CRL does not point at another CRL.
+
+        Defined so that the pointer-following code can treat certificates and
+        CRLs the same way.
+        """
+        return []
+
+    @property
     def revoked_count(self) -> int:
         try:
             return len(self.crl)
