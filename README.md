@@ -439,6 +439,21 @@ libsss_certmap, good enough to preview a rule offline. Base64 matching keywords
 (`<SAN:otherName>`, `<SAN:x400Address>`, `<SAN:ediPartyName>`) are left entirely
 to `sssctl`, and the local engine says so rather than guessing.
 
+## Releasing
+
+The version is declared in six places plus the Debian changelog, and the build
+refuses to package a mismatch. One command keeps them together:
+
+```bash
+python packaging/bump-version.py --check     # report the current version, or drift
+python packaging/bump-version.py 0.2.4       # set it everywhere
+```
+
+Then add a changelog entry, build, tag and publish — `bump-version.py` prints
+the exact sequence. Every change gets its own version, because `apt-get
+install` stops at *already the newest version* without unpacking anything, so
+re-releasing under one number leaves the old code installed.
+
 ## Development
 
 ```bash

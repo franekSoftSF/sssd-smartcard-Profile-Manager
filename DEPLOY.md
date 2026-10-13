@@ -104,6 +104,10 @@ The leading path matters: `apt-get install sssd-smartcard` would look in the
 archives and fail. A path starting with `/` or `./` tells apt it is a local
 file.
 
+**Each release carries its own version**, so `apt` sees a newer package and
+upgrades it without being told twice. If you are testing a build that reuses a
+version number, the paragraph below applies.
+
 **Reinstalling the same version does nothing.** `apt-get install` compares
 versions and stops at *already the newest version (0.2.2)* without unpacking
 anything, so iterating on a build that keeps the same version number leaves the

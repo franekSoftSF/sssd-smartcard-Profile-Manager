@@ -1,3 +1,39 @@
+sssd-smartcard (0.2.3) unstable; urgency=medium
+
+  * Every change now gets its own version. 0.2.2 was re-uploaded to the same
+    release several times, which hid a real problem: apt-get install compares
+    versions and stops at "already the newest version" without unpacking
+    anything, so a machine kept running the previous code and the tests after
+    it were meaningless. A new number makes apt do the work and makes
+    --version answer which build is installed. packaging/bump-version.py sets
+    the version in all six declarations at once and --check reports drift; the
+    setup script once said 0.2.0 while the package said 0.2.2.
+  * Tell an alternative UPN suffix apart from a trusted domain. A certificate
+    whose UPN suffix differs from the joined domain means one of two unrelated
+    things, and the tool detected which but only warned, then generated the
+    trusted-domain shape regardless. Measured on a forest whose AD UPN is
+    aligned with Entra ID: the rule came out with a domains= line naming a
+    domain sssctl domain-list does not show, and pinned one suffix of several
+    in use, so a card issued under another would silently fail to match and
+    fall back to the password prompt. Now: no domains=, no suffix anchor, one
+    rule for every suffix, trust still on the pinned issuer and EKU, and the
+    account looked up by the exact UPN on the card. Documented in
+    docs/sssd-reference.md and as a step in DEPLOY.md.
+  * Two messages that outlived that behaviour are fixed. They claimed the rule
+    was "directed through domains=" and told the operator to re-run with
+    --domain, printed directly above a profile with no domains= in it.
+  * 'ca discover --pki-url' accepts a single file as well as a directory, and
+    follows a certificate's own AIA and CRL pointers even when the host has no
+    directory listing -- which is the case where those pointers are the only
+    route. Candidate directory names are tried under the URL given and at the
+    host root. A CRL reached by two routes is counted once. Reports when the
+    CRL set covers fewer CAs than the chain, since crl_file fails closed.
+  * One unreachable KDC among several is a warning rather than a failure:
+    Kerberos tries the next, and a FAIL there buried the findings that do stop
+    a login. An aggregate failure only when none of them answer.
+
+ -- Szymon Frankiewicz <szymonfrankiewicz@gmail.com>  Tue, 14 Oct 2026 01:20:00 +0200
+
 sssd-smartcard (0.2.2) unstable; urgency=medium
 
   * Never report PKINIT success on the strength of a ticket existing. Without
