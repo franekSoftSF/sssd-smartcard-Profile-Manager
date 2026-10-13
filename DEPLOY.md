@@ -45,13 +45,18 @@ curl: (22) The requested URL returned error: 404
                                         # nothing written
 ```
 
-Current checksums, if you prefer to compare them against a value you got from
-somewhere other than the same download:
+A note on why there is no table of hashes here: this document ships *inside*
+the package, so any checksum printed in it would be the checksum of a different
+build than the one carrying it. The authoritative value is the `.sha256` file
+published beside each asset, which is what `sha256sum -c` above checks. To
+verify out of band, compare against the release page rather than against a
+document the package contains.
 
-| File | sha256 |
-|---|---|
-| `sssd-smartcard_0.2.2_all.deb` | `c94c6913d1e81f126b3fe76a6d7407729b4093017b38f964f7225285dc18b92f` |
-| `sssd-smartcard-0.2.2.tar.gz` | `6c792427592d6134c5e9527d740d675e24ff9165a4dea9415660a4463c9bdc50` |
+There is a second reason. The build is not currently reproducible: two builds
+of identical source produce different `.deb` checksums, because `dpkg-deb`
+records file modification times. So a checksum identifies one published
+artefact, not the source it was built from — which is exactly what you want
+when checking a download, and useless for checking that two builds agree.
 
 ### From the machine that built it
 
