@@ -20,7 +20,15 @@ sssd-smartcard (0.2.2) unstable; urgency=medium
     fully working joined host).
   * Stop defaulting the PKCS#11 module to an RHEL-only path that does not exist
     on Debian or Ubuntu.
-  * 'ad-prepare --init-env --domain <domain>' now fills the environment file in
+  * 'ca discover --pki-url <url>' now works with no certificate at all: the
+    PKI's web directory is listed and every certificate and CRL in it is
+    fetched and reported -- which CAs, their fingerprints and validity, whether
+    the chain closes, and whether the CRLs are current. That answers what a PKI
+    is before anyone has a card from it. Parses PEM, DER and PKCS#7, follows
+    only same-host links and only a bounded number, and tries the common AD CS
+    paths when the URL given has no listing of its own. A host with listings
+    disabled is reported as such rather than having its filenames guessed.
+  * ad-prepare --init-env --domain <domain> now fills the environment file in
     rather than writing a bare template: it reads the domain controllers from
     the domain's _ldap._tcp SRV records, falling back to the zone's NS records
     and then to the domain's own A records, and uses them as the DNS servers --

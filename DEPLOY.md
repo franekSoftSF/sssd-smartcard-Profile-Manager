@@ -104,6 +104,16 @@ The leading path matters: `apt-get install sssd-smartcard` would look in the
 archives and fail. A path starting with `/` or `./` tells apt it is a local
 file.
 
+**Reinstalling the same version does nothing.** `apt-get install` compares
+versions and stops at *already the newest version (0.2.2)* without unpacking
+anything, so iterating on a build that keeps the same version number leaves the
+old code in place and every test afterwards runs against it. Found the hard
+way. When the version has not changed:
+
+```bash
+sudo apt-get install -y --reinstall ./sssd-smartcard_0.2.2_all.deb
+```
+
 If apt is unavailable, `dpkg` plus a dependency fix:
 
 ```bash
@@ -411,8 +421,46 @@ To write it — the trust bundle and the CRLs:
 sudo sssd-smartcard ca discover --from-card --install
 ```
 
-If the certificate's AIA is missing or LDAP-only, give the base URL the CA
-publishes under and the issuer's CN is tried as a filename there:
+### Just the PKI address, with no card
+
+For a PKI nobody has a certificate from yet, the address alone is enough. The
+directory is listed, and everything it publishes is fetched and reported:
+
+```bash
+sudo sssd-smartcard ca discover --pki-url http://pki.example.com/PKI/
+```
+
+```
+PKI at http://pki.example.com/PKI/
+  http://pki.example.com/PKI/Example%20Issuing%20CA.crt
+  http://pki.example.com/PKI/Example%20Issuing%20CA.crl
+  ...
+
+[PASS] PKI listing  2 certificate(s) and 2 CRL(s)
+[INFO]   intermediate  CN=Example Issuing CA,DC=ad,DC=example,DC=com
+[INFO]     SHA-256  11:11:...
+[INFO]     valid until  2035-10-29 19:55:51+00:00
+[INFO]   root  CN=Example Root CA
+[PASS] chain  every intermediate's issuer is published here
+[WARN] CA trust  these certificates were downloaded, not verified
+[INFO]   CRL CN=Example Issuing CA...  next update 2026-10-19, 5 revoked
+```
+
+So you learn what the PKI is — how many tiers, which CAs, how long they are
+valid, whether the chain closes, and whether the CRLs are current — before
+touching a card. `--install` writes the certificates into the trust bundle.
+
+Only links on the same host are followed, and only a bounded number: an address
+someone typed is not a reason to crawl. The common AD CS paths (`PKI/`,
+`CertEnroll/`, `certdata/`) are tried when the URL given has no listing of its
+own, and a host with listings disabled is reported as such rather than having
+its filenames guessed.
+
+CRLs for the trust bundle still want a certificate, because a CA's own CRL URL
+is advertised by the certificates it signed — Step 5.
+
+With a certificate, `--pki-url` is instead a fallback for an AIA that is
+missing or LDAP-only:
 
 ```bash
 sudo sssd-smartcard ca discover --from-card --pki-url http://pki.example.com/PKI/

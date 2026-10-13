@@ -297,3 +297,99 @@ class TestBundle:
 
     def test_an_empty_chain_yields_an_empty_bundle(self):
         assert disc.DiscoveryReport().bundle_pem() == b""
+
+
+# --- browsing a PKI by address, with no certificate -------------------------
+#
+# The live run caught a NameError in PkiListing.complete_chain that the whole
+# suite had missed, because nothing exercised it. These cover that path.
+
+INDEX_HTML = """<html><head><title>pki.example - /PKI/</title></head><body>
+<pre><A HREF="/">[To Parent Directory]</A><br>
+<A HREF="/PKI/Example%20Issuing%20CA.crl">Example Issuing CA.crl</A><br>
+<A HREF="/PKI/Example%20Issuing%20CA.crt">Example Issuing CA.crt</A><br>
+<A HREF="/PKI/Example%20Root%20CA.crt">Example Root CA.crt</A><br>
+<A HREF="/PKI/web.config">web.config</A><br>
+<A HREF="http://elsewhere.example/evil.crt">offsite</A><br>
+</pre></body></html>"""
+
+
+class TestPkiListingChain:
+    def test_a_published_root_and_intermediate_is_a_complete_chain(self):
+        listing = disc.PkiListing(certificates=[sub(), root()])
+        assert listing.complete_chain is True
+
+    def test_an_intermediate_without_its_issuer_is_not(self):
+        listing = disc.PkiListing(certificates=[sub()])
+        assert listing.complete_chain is False
+
+    def test_a_root_alone_counts_as_complete(self):
+        """Nothing is dangling: there are no intermediates to resolve."""
+        assert disc.PkiListing(certificates=[root()]).complete_chain is True
+
+    def test_an_empty_listing_is_not_complete(self):
+        assert disc.PkiListing().complete_chain is False
+
+    def test_dn_comparison_tolerates_spacing_and_case(self):
+        spaced = FakeCert(subject_dn=SUB, issuer_dn="cn=root ca", _fp="SUB")
+        listing = disc.PkiListing(certificates=[spaced, root()])
+        assert listing.complete_chain is True
+
+    def test_roots_and_intermediates_are_separated(self):
+        listing = disc.PkiListing(certificates=[sub(), root()])
+        assert [c.subject_dn for c in listing.roots] == [ROOT]
+        assert [c.subject_dn for c in listing.intermediates] == [SUB]
+
+
+class TestBrowsing:
+    def _serve(self, monkeypatch, index=INDEX_HTML):
+        calls: list[str] = []
+
+        def fake_get(url, *, timeout=20, post=None, content_type=None):
+            calls.append(url)
+            if url.rstrip("/").endswith("PKI") or url.endswith("/PKI/"):
+                return index.encode(), ""
+            if url.endswith(".crt"):
+                return b"DER", ""
+            if url.endswith(".crl"):
+                return b"CRLDER", ""
+            return b"", f"{url}: 404"
+
+        monkeypatch.setattr(disc, "http_get", fake_get)
+        monkeypatch.setattr(disc, "_load_any", lambda d, source: [root()])
+        return calls
+
+    def test_only_certificates_and_crls_are_fetched(self, monkeypatch):
+        self._serve(monkeypatch)
+        listing = disc.browse_pki("http://pki.example/PKI/")
+        assert any(u.endswith(".crt") for u in listing.listed)
+        assert not any("web.config" in u for u in listing.listed)
+
+    def test_offsite_links_are_not_followed(self, monkeypatch):
+        """A URL someone typed is not a licence to crawl."""
+        self._serve(monkeypatch)
+        listing = disc.browse_pki("http://pki.example/PKI/")
+        assert not any("elsewhere.example" in u for u in listing.listed)
+
+    def test_a_bare_hostname_is_accepted(self, monkeypatch):
+        calls = self._serve(monkeypatch)
+        disc.browse_pki("pki.example/PKI")
+        assert calls[0].startswith("http://pki.example/PKI/")
+
+    def test_no_listing_is_reported_rather_than_guessed(self, monkeypatch):
+        monkeypatch.setattr(
+            disc, "http_get", lambda url, **kw: (b"<html>nothing</html>", "")
+        )
+        listing = disc.browse_pki("http://pki.example/")
+        assert listing.certificates == []
+        assert any("no directory listing" in e for e in listing.errors)
+        checks = disc.listing_checks(listing)
+        assert checks[0].status == "FAIL"
+
+    def test_the_trust_caveat_is_present_when_certificates_were_fetched(
+        self, monkeypatch
+    ):
+        self._serve(monkeypatch)
+        listing = disc.browse_pki("http://pki.example/PKI/")
+        trust = [c for c in disc.listing_checks(listing) if c.name == "CA trust"]
+        assert trust and trust[0].status == "WARN"

@@ -27,6 +27,7 @@ points); RFC 6960 for OCSP; ``sssd.conf(5)`` for how the result is expressed.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 
 from cryptography import x509
@@ -65,6 +66,241 @@ def _load_any(data: bytes, source: str) -> list[CertificateInfo]:
         if out:
             return out
     return []
+
+
+#: Paths an AD CS web host commonly publishes under, tried when the URL given
+#: has no listing of its own.
+COMMON_PKI_PATHS = ("", "PKI/", "CertEnroll/", "certdata/", "certsrv/certenroll/")
+
+#: What is worth downloading from a listing.
+CERT_SUFFIXES = (".crt", ".cer", ".pem", ".p7b", ".p7c", ".der")
+CRL_SUFFIXES = (".crl",)
+
+#: A listing should not turn into an unbounded download.
+MAX_LISTED_FILES = 40
+
+_HREF_RE = re.compile(r"""href\s*=\s*["']([^"']+)["']""", re.IGNORECASE)
+
+
+def _same_dn(a: str, b: str) -> bool:
+    """Compare DNs without being defeated by spacing or case."""
+    return re.sub(r"\s+", "", a).lower() == re.sub(r"\s+", "", b).lower()
+
+
+@dataclass
+class PkiListing:
+    """What a PKI's web directory turned out to be publishing."""
+
+    base: str = ""
+    listed: list[str] = field(default_factory=list)
+    certificates: list[CertificateInfo] = field(default_factory=list)
+    crls: list[object] = field(default_factory=list)
+    errors: list[str] = field(default_factory=list)
+    notes: list[str] = field(default_factory=list)
+
+    @property
+    def roots(self) -> list[CertificateInfo]:
+        return [c for c in self.certificates if c.subject_dn == c.issuer_dn]
+
+    @property
+    def intermediates(self) -> list[CertificateInfo]:
+        return [c for c in self.certificates if c.subject_dn != c.issuer_dn]
+
+    @property
+    def complete_chain(self) -> bool:
+        """Every intermediate's issuer is also published here."""
+        return bool(self.certificates) and all(
+            any(_same_dn(c.issuer_dn, s.subject_dn) for s in self.certificates)
+            for c in self.intermediates
+        )
+
+    def to_dict(self) -> dict:
+        return {
+            "base": self.base,
+            "listed": self.listed,
+            "certificates": [
+                {
+                    "subject": c.subject_dn,
+                    "issuer": c.issuer_dn,
+                    "sha256": c.fingerprint(),
+                    "self_signed": c.subject_dn == c.issuer_dn,
+                }
+                for c in self.certificates
+            ],
+            "crls": [c.to_dict() for c in self.crls],
+            "complete_chain": self.complete_chain,
+            "errors": self.errors,
+            "notes": self.notes,
+        }
+
+
+def _same_host(base: str, url: str) -> bool:
+    from urllib.parse import urlparse
+
+    a, b = urlparse(base), urlparse(url)
+    return (b.scheme in ("http", "https")) and a.netloc.lower() == b.netloc.lower()
+
+
+def browse_pki(base: str, *, timeout: int = 20) -> PkiListing:
+    """Read a PKI's web directory and fetch the certificates and CRLs in it.
+
+    Most AD CS deployments publish the CA certificates and CRLs over plain HTTP
+    in one directory with a listing. Given that address, the whole PKI is
+    visible without a card and without knowing any filenames -- which is the
+    situation when setting up against a PKI for the first time.
+
+    Only links on the same host are followed, and only a bounded number: a
+    listing is a URL a person typed, not a reason to crawl.
+    """
+    from urllib.parse import urljoin
+
+    if not base.lower().startswith(("http://", "https://")):
+        base = "http://" + base
+    if not base.endswith("/"):
+        base += "/"
+
+    out = PkiListing(base=base)
+    index = ""
+    chosen = base
+    for suffix in COMMON_PKI_PATHS:
+        candidate = urljoin(base, suffix)
+        body, error = http_get(candidate, timeout=timeout)
+        if error:
+            out.errors.append(error)
+            continue
+        text = body.decode("utf-8", errors="replace")
+        if _HREF_RE.search(text):
+            index, chosen = text, candidate
+            if suffix:
+                out.notes.append(f"found a listing at {candidate}")
+            break
+        out.errors.append(f"{candidate}: served no links")
+    if not index:
+        out.errors.append(
+            f"{base}: no directory listing found. Many CA hosts have listings "
+            "disabled; pass the CA files with --ca, or name the exact URL of a "
+            "certificate."
+        )
+        return out
+
+    seen: set[str] = set()
+    for href in _HREF_RE.findall(index):
+        url = urljoin(chosen, href)
+        if url in seen or not _same_host(base, url):
+            continue
+        lower = url.lower().split("?")[0]
+        if not lower.endswith(CERT_SUFFIXES + CRL_SUFFIXES):
+            continue
+        seen.add(url)
+        if len(seen) > MAX_LISTED_FILES:
+            out.notes.append(
+                f"stopped after {MAX_LISTED_FILES} files; narrow the URL if more "
+                "are expected"
+            )
+            break
+        out.listed.append(url)
+
+    for url in out.listed:
+        body, error = http_get(url, timeout=timeout)
+        if error:
+            out.errors.append(error)
+            continue
+        if url.lower().split("?")[0].endswith(CRL_SUFFIXES):
+            try:
+                from .crl import load_crls
+
+                out.crls.extend(load_crls(body, source=url))
+            except Exception as exc:
+                out.errors.append(f"{url}: not a usable CRL ({exc})")
+            continue
+        found = _load_any(body, url)
+        if not found:
+            out.errors.append(f"{url}: not a certificate in PEM, DER or PKCS#7")
+            continue
+        for cert in found:
+            if all(cert.fingerprint() != c.fingerprint() for c in out.certificates):
+                out.certificates.append(cert)
+
+    return out
+
+
+def listing_checks(listing: PkiListing) -> list[Check]:
+    """The listing as checks, with the trust caveat where it belongs."""
+    checks: list[Check] = []
+
+    if not listing.certificates and not listing.crls:
+        checks.append(
+            Check(
+                "PKI listing",
+                "FAIL",
+                f"nothing usable at {listing.base}",
+                hint="; ".join(listing.errors[:2])
+                or "Check the address, or pass the CA files with --ca.",
+            )
+        )
+        return checks
+
+    checks.append(
+        Check(
+            "PKI listing",
+            "PASS",
+            f"{len(listing.certificates)} certificate(s) and "
+            f"{len(listing.crls)} CRL(s) at {listing.base}",
+        )
+    )
+
+    for cert in listing.certificates:
+        role = "root" if cert.subject_dn == cert.issuer_dn else "intermediate"
+        checks.append(
+            Check(f"  {role}", "INFO", f"{cert.subject_dn}")
+        )
+        checks.append(
+            Check("    SHA-256", "INFO", cert.fingerprint())
+        )
+        checks.append(
+            Check("    valid until", "INFO", str(getattr(cert, "not_after", "unknown")))
+        )
+
+    if listing.certificates:
+        checks.append(
+            Check(
+                "chain",
+                "PASS" if listing.complete_chain else "WARN",
+                "every intermediate's issuer is published here"
+                if listing.complete_chain
+                else "an intermediate's issuer is not published here",
+                hint="" if listing.complete_chain
+                else "The missing CA has to come from somewhere else, or the bundle "
+                "will not verify a full chain.",
+            )
+        )
+        checks.append(
+            Check(
+                "CA trust",
+                "WARN",
+                "these certificates were downloaded, not verified",
+                hint="Downloading a CA is not trusting it: anything in the bundle "
+                "can issue a certificate that logs in. Compare the fingerprints "
+                "above against the PKI out of band before importing them.",
+            )
+        )
+
+    for crl in listing.crls:
+        expired = getattr(crl, "expired", False)
+        nxt = getattr(crl, "next_update", None)
+        checks.append(
+            Check(
+                f"  CRL {getattr(crl, 'issuer', '?')}",
+                "FAIL" if expired else "INFO",
+                ("EXPIRED " if expired else "next update ")
+                + (f"{nxt:%Y-%m-%d}" if nxt else "not set")
+                + f", {getattr(crl, 'revoked_count', 0)} revoked",
+            )
+        )
+
+    for note in listing.notes:
+        checks.append(Check("PKI listing", "INFO", note))
+    return checks
 
 
 @dataclass

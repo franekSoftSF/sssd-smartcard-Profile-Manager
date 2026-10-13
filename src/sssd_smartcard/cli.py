@@ -1073,6 +1073,73 @@ def cmd_ca_discover(args, printer: Printer) -> int:
     from .backup import new_backup_set, write_atomic
     from .ca.discover import discover, discovery_checks
 
+    # With only a PKI address and no certificate, read the directory and report
+    # what it publishes. This is the first-contact case: a PKI nobody has a
+    # card from yet.
+    have_cert = bool(
+        args.file or args.base64 or args.from_card or args.stdin or args.cert_id
+    )
+    if args.pki_url and not have_cert:
+        from .ca.discover import browse_pki, listing_checks
+
+        listing = browse_pki(args.pki_url, timeout=args.timeout)
+        checks = listing_checks(listing)
+        if args.json:
+            data = listing.to_dict()
+            data["checks"] = [
+                {"name": c.name, "status": c.status, "detail": c.detail, "hint": c.hint}
+                for c in checks
+            ]
+            return emit_json(data)
+
+        printer.heading(f"PKI at {listing.base}")
+        for url in listing.listed:
+            printer.write(printer.dim(f"  {url}"))
+        printer.heading("Checks")
+        for check in checks:
+            printer.status(check)
+
+        if not args.install:
+            printer.write()
+            if listing.certificates:
+                printer.write(printer.dim(
+                    "Re-run with --install to import these CA certificates, or "
+                    "with a certificate (--from-card) to have the chain and the "
+                    "revocation configuration derived from it."
+                ))
+            return 1 if any(c.failed for c in checks) else 0
+
+        if not listing.certificates:
+            printer.verdict(False, "", "nothing to install")
+            return 1
+        printer.heading("Importing")
+        for entry in listing.certificates:
+            printer.write(f"  + {entry.subject_dn}")
+            printer.write(printer.dim(f"        SHA-256 {entry.fingerprint()}"))
+        printer.warn(
+            "anything in this bundle can issue a certificate that logs in -- "
+            "compare these fingerprints against the PKI before relying on them"
+        )
+        backups = new_backup_set(args.backup_dir)
+        backups.add(args.bundle)
+        write_atomic(
+            args.bundle,
+            "".join(c.pem for c in listing.certificates),
+            mode=0o644,
+        )
+        printer.write()
+        printer.write(
+            f"Wrote {args.bundle} ({len(listing.certificates)} certificates, mode 0644)"
+        )
+        for entry in backups.entries:
+            if entry.existed:
+                printer.write(printer.dim(f"Backup: {entry.saved}"))
+        printer.write(printer.dim(
+            "CRLs still need a certificate to discover the issuing CA's own CRL "
+            "URL: sssd-smartcard ca crl update --from-card"
+        ))
+        return 0
+
     cert = resolve_certificate(args, printer)
     report = discover(
         cert,
@@ -1720,8 +1787,10 @@ def build_parser() -> argparse.ArgumentParser:
     ca_discover.add_argument(
         "--pki-url",
         dest="pki_url",
-        help="base HTTP URL the CA publishes under, for a certificate whose AIA is "
-        "missing or LDAP-only",
+        help="base HTTP URL the CA publishes under. On its own, with no "
+        "certificate, the directory is listed and whatever it publishes is "
+        "fetched and reported; with a certificate it is a fallback for an AIA "
+        "that is missing or LDAP-only",
     )
     ca_discover.add_argument(
         "--bundle",
@@ -1742,7 +1811,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--timeout", type=int, default=20, help="per-request timeout in seconds"
     )
     ca_discover.add_argument("--backup-dir", help="where to keep backups")
-    add_cert_source(ca_discover)
+    # Not required: with --pki-url alone the PKI's own directory is read.
+    add_cert_source(ca_discover, required=False)
     ca_discover.set_defaults(func=cmd_ca_discover)
 
     # -- config ----------------------------------------------------------

@@ -87,10 +87,18 @@ up to a self-signed root, collects the CRL distribution points of the leaf and
 every CA, and sends a **real OCSP request** to find out whether a responder
 answers. Handles PEM, DER and PKCS#7, since AD CS serves all three.
 
-`--pki-url` gives a base URL for a certificate whose AIA is missing or
+**With no certificate, `--pki-url` alone lists the PKI.** The directory is
+read and every certificate and CRL in it is fetched and reported: which CAs,
+their fingerprints and validity, whether the chain closes, and whether the CRLs
+are current. That answers "what is this PKI" before anyone has a card from it.
+Only same-host links are followed, and only a bounded number; the common AD CS
+paths (`PKI/`, `CertEnroll/`, `certdata/`) are tried when the URL given has no
+listing, and a host with listings disabled is reported rather than guessed at.
+
+With a certificate, `--pki-url` is a fallback for an AIA that is missing or
 LDAP-only; the issuer's CN is then tried as a filename under it. `--install`
-writes the trust bundle and the CRLs. `--no-probe` reports the advertised OCSP
-URL without contacting it.
+writes the trust bundle and, in certificate mode, the CRLs. `--no-probe`
+reports the advertised OCSP URL without contacting it.
 
 Two distinctions it keeps, because each decides the configuration:
 
