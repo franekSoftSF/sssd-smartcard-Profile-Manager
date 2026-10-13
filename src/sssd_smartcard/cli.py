@@ -295,13 +295,14 @@ def check_account_domain(
     if not known or account_domain.lower() in known:
         return None
     return (
-        f"the certificate points at {account_domain}, but SSSD only knows "
+        f"{account_domain} is not a domain SSSD knows (it has "
         + ", ".join(sorted(known))
-        + f". If {account_domain} is an alternative UPN suffix of "
-        f"{section_domain} rather than a separate trusted domain, re-run with "
-        f"--domain {section_domain}: otherwise the generated rule gets a "
-        f"domains={account_domain} line pointing at a domain SSSD cannot search, "
-        "and every lookup will fail."
+        + f"), so it is being treated as an alternative UPN suffix of "
+        f"{section_domain} rather than a trusted domain: no domains= line, and "
+        "any UPN suffix accepted. A domains= line would name a domain SSSD "
+        "cannot search, and pinning this one suffix would reject cards issued "
+        f"under any other. If {account_domain} really is a separate trusted "
+        "domain, set mapping.domains in the profile."
     )
 
 
@@ -314,15 +315,21 @@ def cmd_cert_inspect(args, printer: Printer) -> int:
 
     section_domain = args.sssd_domain or detect_joined_domain(args.config)
     trust_note = None
-    if section_domain and rec.domain and section_domain.lower() != rec.domain.lower():
-        trust_note = (
-            f"this host is joined to {section_domain} while the certificate points at "
-            f"{rec.domain}: the rule is attached to {section_domain} and directed at "
-            f"{rec.domain} through domains=."
-        )
     unknown_domain_warning = check_account_domain(
         rec.domain, section_domain, args.config
     )
+    if section_domain and rec.domain and section_domain.lower() != rec.domain.lower():
+        # Only claim domains= when domains= is what gets generated. The
+        # alternative-suffix case has its own message from
+        # check_account_domain, and two explanations of one decision is one
+        # too many.
+        if not unknown_domain_warning:
+            trust_note = (
+                f"this host is joined to {section_domain} while the certificate "
+                f"points at {rec.domain}, which SSSD knows as a domain: the rule "
+                f"is attached to {section_domain} and directed at {rec.domain} "
+                "through domains=."
+            )
 
     # The name inside the profile becomes the [certmap/<domain>/<name>] section,
     # while the file name is what `profile show` and `mapping test` are given. If
