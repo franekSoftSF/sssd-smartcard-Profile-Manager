@@ -1,3 +1,45 @@
+sssd-smartcard (0.2.5) unstable; urgency=medium
+
+  * Warn when access_provider = ad has no ad_gpo_access_control. Measured: a
+    card login whose auth phase succeeded was refused in the *account* phase,
+    because ad_gpo_access_control defaults to enforcing and one unreadable
+    Group Policy Container stopped the GPO list from being built ("Unable to
+    get GPO list ... [14](Bad address)"). The greeter reported it as "smart
+    card authentication didn't work", which sends the operator to the card.
+    realm join writes access_provider = ad, so this is the default state of a
+    freshly joined host and nothing in a Smart Card profile touches it. The
+    profile model had carried a docstring warning about this default since it
+    was written; it never reached an operator, because gpo.manage defaults to
+    false and nothing said anything. The check reads the configuration as it
+    will be after applying, so a profile that sets the option is not warned at.
+  * Check SSH, which is a separate mechanism and not a consequence of the
+    console login working. The token is on the client, so the server never sees
+    a PIN and pam_cert_auth and local_auth_policy take no part; SSSD instead
+    derives an SSH public key from the certificate in the directory entry and
+    sshd asks for it through AuthorizedKeysCommand, which was unset on a host
+    where card login worked. What does carry over is the part this tool
+    configures: sss_ssh_authorizedkeys validates with ca_db and
+    certificate_verification and filters through the certmap rules, so the same
+    bundle, CRL and rule apply and revocation covers SSH too. doctor now
+    reports the directive and how many keys come back for the user.
+  * 'config apply', 'config diff' and 'config validate' print the renderer's
+    notes. They printed its warnings and dropped its notes, so everything the
+    renderer knows about an option it just wrote -- that SSSD never refreshes
+    crl_file and needs the timer, that enabling OCSP does not relax the per-CA
+    CRL requirement -- was visible in 'config render' and 'cert autoconfig' and
+    invisible in the three commands that inspect or change a running system.
+    tests/test_output_surfaces.py checks the shape rather than one message: a
+    command that reaches for a rendered config's warnings and never for its
+    notes has dropped them. That is what found config diff and config validate,
+    which were not the command being fixed.
+  * Both findings are documented with the measured evidence in
+    docs/sssd-reference.md, and as steps 6 and 7 in DEPLOY.md -- including that
+    'pamtester <service> <user> authenticate' tests only the auth phase and
+    passed on the host where every real login was refused. The documented test
+    is now 'authenticate acct_mgmt'.
+
+ -- Szymon Frankiewicz <szymonfrankiewicz@gmail.com>  Wed, 14 Oct 2026 02:40:00 +0200
+
 sssd-smartcard (0.2.4) unstable; urgency=medium
 
   * The apply plan now names the home-directory step. "Still to do by hand"

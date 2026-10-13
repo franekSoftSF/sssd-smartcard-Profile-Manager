@@ -1319,6 +1319,10 @@ def cmd_config_diff(args, printer: Printer) -> int:
         printer.status(check)
     for warning in plan.warnings + plan.rendered.warnings:
         printer.warn(warning)
+    if plan.rendered.notes:
+        printer.heading("Notes")
+        for note in plan.rendered.notes:
+            printer.note(note)
     if not plan.changed:
         printer.write()
         printer.write("Nothing to change: the configuration already matches the profile.")
@@ -1345,6 +1349,10 @@ def cmd_config_validate(args, printer: Printer) -> int:
         printer.status(check)
     for warning in plan.warnings + plan.rendered.warnings:
         printer.warn(warning)
+    if plan.rendered.notes:
+        printer.heading("Notes")
+        for note in plan.rendered.notes:
+            printer.note(note)
     printer.heading("sssctl config-check (current configuration on disk)")
     if not result.found:
         printer.status(Check("sssctl", "SKIP", "not installed"))
@@ -1373,6 +1381,15 @@ def cmd_config_apply(args, printer: Printer) -> int:
             printer.status(check)
         for warning in plan.warnings + plan.rendered.warnings:
             printer.warn(warning)
+        # The renderer's notes were reaching 'config render' and 'cert
+        # autoconfig' but not this command -- the one an operator runs to change
+        # the system.  Everything the renderer knows about an option it just
+        # wrote (that SSSD never refreshes crl_file, that OCSP does not relax the
+        # per-CA CRL rule) was therefore invisible exactly where it is acted on.
+        if plan.rendered.notes:
+            printer.heading("Notes")
+            for note in plan.rendered.notes:
+                printer.note(note)
 
     result = apply_plan(
         plan,

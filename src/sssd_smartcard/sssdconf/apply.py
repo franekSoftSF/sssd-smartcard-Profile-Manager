@@ -195,6 +195,38 @@ def build_plan(
     elif configured:
         checks.append(Check("domain", "PASS", f"{profile.domain} is a configured domain"))
 
+    # access_provider = ad brings GPO-based access control with it, and
+    # ad_gpo_access_control defaults to enforcing.  Measured: a card login whose
+    # auth phase succeeded was refused in the *account* phase because one Group
+    # Policy Container was unreadable, so the GPO list could not be built --
+    # "Unable to get GPO list ... [14](Bad address)", and enforcing turns that
+    # into a denial.  GDM reports the whole thing as "smart card authentication
+    # didn't work", which sends the operator looking at the card.  realm join
+    # writes access_provider = ad, so this is the default state of a freshly
+    # joined host, and nothing in a Smart Card profile touches it.
+    domain_section = f"domain/{profile.domain}"
+    if (
+        working.get(domain_section, "access_provider") == "ad"
+        and not working.get(domain_section, "ad_gpo_access_control")
+    ):
+        checks.append(
+            Check(
+                "GPO access control",
+                "WARN",
+                f"[{domain_section}] has access_provider = ad and no "
+                "ad_gpo_access_control, so it defaults to enforcing",
+                hint="SSSD will evaluate the Windows logon rights through GPO after "
+                "the card has already authenticated. If the GPO list cannot be "
+                "built -- an unreadable Group Policy Container is enough -- the "
+                "login is denied in the account phase, and the greeter blames the "
+                "card. Set gpo.manage with gpo.access_control: permissive in the "
+                "profile to see what it would decide without being denied, then "
+                "move to enforcing once the GPOs are readable (gpo.ignore_unreadable "
+                "skips one that is not). Verify both phases: "
+                "pamtester login <user> authenticate acct_mgmt",
+            )
+        )
+
     # A pre-existing section with the same name is overwritten key by key.
     if config.has_section(profile.section):
         existing = config.items(profile.section)

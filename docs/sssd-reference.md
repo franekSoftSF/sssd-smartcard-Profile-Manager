@@ -384,6 +384,137 @@ Sources: [ADSys documentation](https://documentation.ubuntu.com/adsys/),
 [Feature availability](https://ubuntu.com/docs/adsys/stable/reference/features/),
 [Certificate auto-enrolment](https://documentation.ubuntu.com/adsys/latest/how-to/certificates-auto-enrollment/)
 
+## The account phase: a card that authenticates can still be refused
+
+Authentication and authorisation are separate PAM phases, and only the first
+one involves the card. Measured on a joined Ubuntu 24.04 host where card login
+had just been made to work:
+
+```
+pam_sss(gdm-smartcard:auth):    authentication success; user=someone@example.com
+pam_sss(gdm-smartcard:account): Access denied for user someone@example.com: 4 (System error)
+```
+
+The greeter showed *"Sorry, smart card authentication didn't work."* The card
+had worked. What failed was `access_provider = ad`, which `realm join` writes
+and which makes SSSD evaluate the Windows logon rights through Group Policy:
+
+```
+ad_gpo_process_gpo_done: Unable to get GPO list from server ...: [14](Bad address)
+ad_gpo_access_done:      GPO-based access control failed.
+```
+
+**`ad_gpo_access_control` defaults to `enforcing`**, so a GPO list that cannot
+be built is a denial. On that host a single Group Policy Container was
+unreadable by the machine account, which aborted the whole list:
+
+```
+ad_gpo_missing_or_unreadable_attr: Group Policy Container with DN
+  [cn={...},cn=policies,cn=system,DC=...] is unreadable or has unreadable or
+  missing attributes ... nTSecurityDescriptor, cn, gPCFileSysPath,
+  gPCMachineExtensionNames, gPCFunctionalityVersion, flags
+```
+
+### Diagnosing it, and why the obvious test misses it
+
+`pamtester <service> <user> authenticate` runs the **auth phase only**. It
+passed on this host while every real login failed. Test both:
+
+```bash
+pamtester -v login someone@ad.example.com authenticate acct_mgmt
+```
+
+### Settling it
+
+```yaml
+gpo:
+  manage: true
+  access_control: permissive     # evaluate and log, never deny
+```
+
+`permissive` is the safe first move: it shows in the log what it *would* decide
+without refusing anyone. It is not a destination — while it is set, the AD
+logon rights are not enforced at all. Once the GPO list can be built, move to
+`enforcing`. Where one container stays unreadable and its policy is not needed:
+
+```yaml
+gpo:
+  manage: true
+  access_control: enforcing
+  ignore_unreadable: true        # ad_gpo_ignore_unreadable
+```
+
+with the cost stated plainly: a skipped GPO's settings are not applied, so if
+that is the GPO carrying the logon right, the decision changes. Granting the
+machine account read access on the object in AD is the clean fix.
+
+This is checked, because the tool configures the layer above it and the
+failure is attributed to the card by every greeter that reports it.
+
+## SSH with a Smart Card: a different mechanism
+
+A working local card login says nothing about SSH, because almost nothing is
+shared. The token is on the **client**, so the server never sees a PIN and
+`pam_cert_auth`, `local_auth_policy` and the PAM auth phase take no part at
+all. Measured on a host where card login worked locally: `sshd -T` reported
+`authorizedkeyscommand none`, and SSH with the card did not work.
+
+What happens instead: SSSD derives an SSH public key from the X.509 certificate
+in the user's directory entry, and sshd asks for it.
+
+```bash
+$ sss_ssh_authorizedkeys someone@ad.example.com
+ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQDeKtB6x5...
+```
+
+Verified that the first key really is the card's, by decoding both sides rather
+than trusting the order: the RSA modulus `de2ad07ac79fc2c32912df2b4a441ae0`
+appears in the certificate read from the card.
+
+### What carries over
+
+More than it looks. `sss_ssh_authorizedkeys(1)` validates those certificates
+with `ca_db` and `certificate_verification` and filters them through the
+certmap rules — the same bundle, the same CRL and the same rule the local login
+uses. **Revoking a certificate therefore removes SSH access too**, with no
+separate configuration. On the measured host, 9 keys came back out of a larger
+set; the rest were dropped by verification or by the rules.
+
+The **account** phase runs as well, since sshd has `UsePAM yes` — so the GPO
+section above applies to SSH exactly as it does to the console.
+
+### What is missing by default
+
+Only the sshd directive:
+
+```
+# /etc/ssh/sshd_config.d/60-sssd-smartcard.conf
+AuthorizedKeysCommand /usr/bin/sss_ssh_authorizedkeys
+AuthorizedKeysCommandUser nobody
+```
+
+```bash
+sudo sshd -t && sudo systemctl reload ssh
+```
+
+`sshd -t` before the reload, for the same reason `sssctl config-check` runs
+before SSSD is restarted: never leave a service with a file it cannot parse.
+
+The SSH responder does **not** need adding to `services =` on Ubuntu 24.04 —
+`sssd-ssh.socket` is socket-activated, and was already running on a host whose
+`services` line read `nss, pam`.
+
+### Client side
+
+```
+Host server.example.com
+    PKCS11Provider /usr/lib/x86_64-linux-gnu/pkcs11/opensc-pkcs11.so
+    User someone@ad.example.com
+```
+
+The PIN is requested locally by the client to use the private key; it is never
+sent to the server, and the key never leaves the token.
+
 ## CRL revocation: four measured rules
 
 Where there is no OCSP responder, CRLs are the only revocation mechanism. SSSD

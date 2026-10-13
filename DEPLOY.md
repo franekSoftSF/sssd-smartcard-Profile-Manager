@@ -589,6 +589,81 @@ Run it once with the card inserted: the issuing CA's CRL URL is only advertised
 by end-entity certificates, and the URL is then remembered so the timer can
 refresh with no card present.
 
+## Step 6 — the account phase, which refuses cards that authenticated
+
+Test **both** PAM phases. `authenticate` alone passes on a host where every
+real login is refused:
+
+```bash
+pamtester -v login someone@ad.example.com authenticate acct_mgmt
+```
+
+A `PIN for ...` prompt followed by `successfully authenticated` means the card
+worked. If the greeter still says *"smart card authentication didn't work"*,
+read the journal before touching anything to do with the card:
+
+```
+pam_sss(gdm-smartcard:auth):    authentication success
+pam_sss(gdm-smartcard:account): Access denied for user ...: 4 (System error)
+```
+
+`auth` succeeded. The refusal is authorisation. `realm join` writes
+`access_provider = ad`, and `ad_gpo_access_control` defaults to **enforcing**,
+so SSSD denies the login when it cannot build the GPO list — one unreadable
+Group Policy Container is enough. `doctor` and the apply plan both warn about
+this now; the fix goes in the profile:
+
+```yaml
+gpo:
+  manage: true
+  access_control: permissive
+```
+
+`permissive` evaluates and logs without denying, so you can see what it would
+decide. While it is set the AD logon rights are not enforced at all — treat it
+as a diagnostic, not a destination. `docs/sssd-reference.md` has the route back
+to `enforcing`.
+
+## Step 7 — SSH with the card, which is a separate mechanism
+
+A working console login does not give you SSH. The token is on the client, so
+the server never sees a PIN and the PAM auth phase takes no part. SSSD instead
+derives an SSH public key from the certificate:
+
+```bash
+sss_ssh_authorizedkeys someone@ad.example.com
+```
+
+Keys in the output mean the directory entry holds a certificate that passed
+`certificate_verification` and the certmap rules — the same CA bundle, CRL and
+rule as the console login, so **revocation covers SSH too**. Nothing comes back
+if there is no certificate or all of them were rejected.
+
+Only sshd is missing:
+
+```bash
+sudo tee /etc/ssh/sshd_config.d/60-sssd-smartcard.conf <<'EOF'
+AuthorizedKeysCommand /usr/bin/sss_ssh_authorizedkeys
+AuthorizedKeysCommandUser nobody
+EOF
+```
+
+```bash
+sudo sshd -t && sudo systemctl reload ssh
+```
+
+Validate before reloading, as with `sssctl config-check` — never leave a
+service holding a file it cannot parse. The SSH responder itself needs no
+`services =` change on Ubuntu 24.04; `sssd-ssh.socket` is socket-activated.
+
+On the client:
+
+```
+Host server.example.com
+    PKCS11Provider /usr/lib/x86_64-linux-gnu/pkcs11/opensc-pkcs11.so
+    User someone@ad.example.com
+```
+
 ## Checking the result, at any point
 
 ```bash
@@ -596,7 +671,8 @@ sudo sssd-smartcard doctor --user someone@ad.example.com
 ```
 
 One command covering every layer: SSSD, the certificate, the mapping, the CA
-bundle, PAM, `local_auth_policy`, the home directory, Kerberos and the CRL.
+bundle, PAM, `local_auth_policy`, GPO access control, the home directory,
+Kerberos, the CRL and SSH.
 
 ---
 

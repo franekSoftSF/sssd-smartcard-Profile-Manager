@@ -300,6 +300,140 @@ def lookup_user(name: str) -> UserLookup:
     return out
 
 
+
+# ---------------------------------------------------------------------------
+# SSH: the card is on the client, so this is a different mechanism entirely
+
+#: What sshd must call to get a user's keys from SSSD.
+SSH_KEYS_COMMAND = "sss_ssh_authorizedkeys"
+
+
+def sshd_effective_config() -> dict[str, str]:
+    """``sshd -T`` as a dict, or ``{}`` when it cannot be read.
+
+    Parsed from sshd itself rather than from sshd_config, because Ubuntu splits
+    the configuration across sshd_config.d/ and the last matching Include wins;
+    reading one file would report a setting another file overrides.
+    """
+    result = run(["sshd", "-T"])
+    if not result.ok:
+        # Ubuntu does not put sbin on a non-root PATH.
+        result = run(["/usr/sbin/sshd", "-T"])
+    if not result.ok:
+        return {}
+    out: dict[str, str] = {}
+    for line in result.stdout.splitlines():
+        key, _, value = line.partition(" ")
+        if key:
+            out[key.strip().lower()] = value.strip()
+    return out
+
+
+def ssh_certificate_checks(user: str = "") -> list[Check]:
+    """Whether a Smart Card can be used for SSH, which it cannot by default.
+
+    SSH is not the local login path and reusing its conclusions is wrong: the
+    token is on the *client*, so the server never sees a PIN and
+    ``pam_cert_auth`` and ``local_auth_policy`` play no part.  What happens
+    instead is that SSSD derives an SSH public key from the X.509 certificate
+    in the user's directory entry, and sshd asks for it through
+    ``AuthorizedKeysCommand``.
+
+    The useful part for this tool: ``sss_ssh_authorizedkeys(1)`` validates those
+    certificates with ``ca_db`` and ``certificate_verification`` and filters
+    them through the certmap rules -- the same bundle, the same CRL and the same
+    rule this tool already configures.  So revocation covers SSH as well, and
+    the only piece missing on a configured host is the sshd directive.
+    """
+    checks: list[Check] = []
+    if not is_linux():
+        return checks
+
+    helper = which(SSH_KEYS_COMMAND)
+    if helper is None:
+        checks.append(
+            Check(
+                "ssh key helper",
+                "SKIP",
+                f"{SSH_KEYS_COMMAND} is not installed",
+                hint="It ships with sssd; without it sshd cannot obtain keys from "
+                "SSSD and Smart Card SSH is not available.",
+            )
+        )
+        return checks
+
+    config = sshd_effective_config()
+    if not config:
+        checks.append(
+            Check(
+                "sshd AuthorizedKeysCommand",
+                "SKIP",
+                "cannot read the effective sshd configuration (needs root)",
+            )
+        )
+    else:
+        command = config.get("authorizedkeyscommand", "none")
+        if SSH_KEYS_COMMAND in command:
+            checks.append(
+                Check(
+                    "sshd AuthorizedKeysCommand",
+                    "PASS",
+                    command,
+                )
+            )
+        else:
+            checks.append(
+                Check(
+                    "sshd AuthorizedKeysCommand",
+                    "WARN",
+                    "not set to " + SSH_KEYS_COMMAND
+                    + ("" if command in ("", "none") else f" (currently {command})"),
+                    hint="Smart Card login works locally without this; SSH does not "
+                    "use that path at all. Add to /etc/ssh/sshd_config.d/: "
+                    f"AuthorizedKeysCommand {helper} / AuthorizedKeysCommandUser "
+                    "nobody, then 'sshd -t' before reloading. The CA bundle, CRL "
+                    "and certmap rule are already what validates those keys.",
+                )
+            )
+
+    if not user:
+        return checks
+
+    result = run([helper, user])
+    if not result.ok:
+        checks.append(
+            Check(
+                "ssh keys from certificate",
+                "WARN",
+                f"{SSH_KEYS_COMMAND} failed: {result.output.strip()[:160]}",
+            )
+        )
+        return checks
+
+    keys = [ln for ln in result.stdout.splitlines() if ln.startswith(("ssh-", "ecdsa-"))]
+    if keys:
+        checks.append(
+            Check(
+                "ssh keys from certificate",
+                "PASS",
+                f"{len(keys)} key(s) derived for {user}",
+            )
+        )
+    else:
+        checks.append(
+            Check(
+                "ssh keys from certificate",
+                "WARN",
+                f"no keys derived for {user}",
+                hint="Either the directory entry holds no certificate "
+                "(ldap_user_certificate, userCertificate;binary on AD), or every "
+                "one of them was rejected by certificate_verification or by the "
+                "certmap rules. A revoked or expired certificate is dropped here "
+                "exactly as it is at the login prompt.",
+            )
+        )
+    return checks
+
 def home_provisioning() -> tuple[str, str]:
     """``(module, file)`` that creates missing home directories, or ``("", "")``.
 

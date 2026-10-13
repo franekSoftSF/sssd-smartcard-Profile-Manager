@@ -470,6 +470,16 @@ def run_doctor(
 
         report.add(*home_directory_checks(UserLookup(user="")))
 
+    # SSH is a separate mechanism, not a consequence of the local login
+    # working: the token is on the client, so pam_cert_auth and
+    # local_auth_policy take no part, and sshd needs its own directive. Worth
+    # reporting on a host that is otherwise configured for cards, because the
+    # CA bundle, CRL and certmap rule already do the validation.
+    if pam.cert_auth_enabled:
+        from .sssdconf.runtime import ssh_certificate_checks
+
+        report.add(*ssh_certificate_checks(user))
+
     if check_domains:
         trust = trust_report(config_path)
         report.add(*trust.checks)
