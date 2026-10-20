@@ -1,3 +1,35 @@
+sssd-smartcard (0.2.6) unstable; urgency=medium
+
+  * Check that sudo would actually consult SSSD. Two halves have to agree and
+    neither complains when the other is missing: the 'sudoers: ... sss' line in
+    nsswitch.conf, and the libsss-sudo package that implements that source.
+    With the line alone sudo quietly falls back to the local file and every
+    rule in the directory is ignored; with the package alone sudo never asks
+    SSSD. Measured on the lab host, which had the package absent. A host using
+    only local sudoers is reported as such rather than nagged, since that is a
+    legitimate choice.
+  * Check that sshd will accept a signature for the key types SSSD hands it. A
+    client offering the right RSA key as x509v3-ssh-rsa was refused with
+    'unsupported public key algorithm', and the client reported only "Server
+    refused our key" -- the same words it prints when the key is not authorised
+    at all. The server half is checkable: if none of a key type's signature
+    algorithm names appear in PubkeyAcceptedAlgorithms, no client can ever
+    authenticate with it. An RSA key passes when rsa-sha2-256 or rsa-sha2-512
+    is accepted, since OpenSSH 8.8 dropped plain ssh-rsa from the defaults
+    without dropping the key.
+  * The GPO access control check moved into a function shared by doctor and the
+    apply plan. DEPLOY.md claimed both warned about it; only the plan did.
+  * DEPLOY.md documents connecting from Windows, which cost an evening:
+    System32 ssh.exe accepts -I and silently ignores it (PKCS#11 compiled out,
+    and -vvv shows it never even tries to load the library); PuTTY-CAC offers
+    an RFC 6187 x509v3 certificate until -x509off is set, globally; and the
+    certificate thumbprint must be read from the card, not from the Windows
+    store, where an entry whose key container no longer exists produces
+    "the smart card cannot perform the requested operation or the operation
+    requires a different smart card" -- which is literally true.
+
+ -- Szymon Frankiewicz <szymonfrankiewicz@gmail.com>  Tue, 20 Oct 2026 22:50:00 +0200
+
 sssd-smartcard (0.2.5) unstable; urgency=medium
 
   * Warn when access_provider = ad has no ad_gpo_access_control. Measured: a

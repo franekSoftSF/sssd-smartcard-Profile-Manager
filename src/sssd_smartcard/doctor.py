@@ -470,6 +470,15 @@ def run_doctor(
 
         report.add(*home_directory_checks(UserLookup(user="")))
 
+    # The account phase refuses logins the card already passed, and nothing
+    # else in this report looks at it: every check above concerns the auth
+    # phase. Read from the configuration on disk, which is what is deciding.
+    if config is not None:
+        from .sssdconf.runtime import gpo_access_checks
+
+        for name in config.domain_sections():
+            report.add(*gpo_access_checks(config.get, name))
+
     # SSH is a separate mechanism, not a consequence of the local login
     # working: the token is on the client, so pam_cert_auth and
     # local_auth_policy take no part, and sshd needs its own directive. Worth
@@ -479,6 +488,13 @@ def run_doctor(
         from .sssdconf.runtime import ssh_certificate_checks
 
         report.add(*ssh_certificate_checks(user))
+
+    # sudo is a separate consumer of the same identity, and its two halves --
+    # the nsswitch source and the package implementing it -- look configured
+    # apart while doing nothing together.
+    from .sssdconf.runtime import sudo_rules_checks
+
+    report.add(*sudo_rules_checks())
 
     if check_domains:
         trust = trust_report(config_path)

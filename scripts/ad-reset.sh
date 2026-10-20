@@ -28,7 +28,7 @@
 set -Eeuo pipefail
 
 PROGRAM=${0##*/}
-VERSION="0.2.5"
+VERSION="0.2.6"
 
 if (( BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 4) )); then
     echo "$PROGRAM needs bash 4.4 or newer (found ${BASH_VERSION})" >&2

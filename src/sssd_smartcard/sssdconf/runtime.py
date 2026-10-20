@@ -10,6 +10,7 @@ broken trust.
 from __future__ import annotations
 
 import re
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -301,6 +302,44 @@ def lookup_user(name: str) -> UserLookup:
 
 
 
+
+def gpo_access_checks(get: "Callable[[str, str], str | None]", domain: str) -> list[Check]:
+    """Warn when GPO access control will decide a login nobody configured it to.
+
+    ``access_provider = ad`` brings Group Policy evaluation with it and
+    ``ad_gpo_access_control`` defaults to ``enforcing``.  Measured: a card login
+    whose auth phase succeeded was refused in the *account* phase because one
+    Group Policy Container was unreadable, so the list could not be built --
+    ``Unable to get GPO list ... [14](Bad address)``.  The greeter reported it
+    as "smart card authentication didn't work", which sends the operator to the
+    card.  ``realm join`` writes ``access_provider = ad``, so this is the
+    default state of a freshly joined host and no Smart Card profile touches it.
+
+    *get* reads one option from a section, so the caller decides whether that is
+    the configuration on disk (doctor) or the one about to be written (apply).
+    """
+    section = f"domain/{domain}"
+    if get(section, "access_provider") != "ad" or get(section, "ad_gpo_access_control"):
+        return []
+    return [
+        Check(
+            "GPO access control",
+            "WARN",
+            f"[{section}] has access_provider = ad and no ad_gpo_access_control, "
+            "so it defaults to enforcing",
+            hint="SSSD evaluates the Windows logon rights through GPO after the "
+            "card has already authenticated. If the GPO list cannot be built -- "
+            "an unreadable Group Policy Container is enough -- the login is "
+            "denied in the account phase, and the greeter blames the card. Set "
+            "gpo.manage with gpo.access_control: permissive in the profile to "
+            "see what it would decide without being denied, then move to "
+            "enforcing once the GPOs are readable (gpo.ignore_unreadable skips "
+            "one that is not). Verify both phases: pamtester login <user> "
+            "authenticate acct_mgmt",
+        )
+    ]
+
+
 # ---------------------------------------------------------------------------
 # SSH: the card is on the client, so this is a different mechanism entirely
 
@@ -419,6 +458,14 @@ def ssh_certificate_checks(user: str = "") -> list[Check]:
                 f"{len(keys)} key(s) derived for {user}",
             )
         )
+        # A key sshd cannot accept a signature for is as good as absent, and
+        # the client is told only that it was "refused".
+        checks.extend(
+            ssh_key_algorithm_checks(
+                (k.split(None, 1)[0] for k in keys),
+                config.get("pubkeyacceptedalgorithms", ""),
+            )
+        )
     else:
         checks.append(
             Check(
@@ -432,6 +479,170 @@ def ssh_certificate_checks(user: str = "") -> list[Check]:
                 "exactly as it is at the login prompt.",
             )
         )
+    return checks
+
+
+# ---------------------------------------------------------------------------
+# sudo: two halves that look configured apart and do nothing
+
+#: What nsswitch.conf must name for sudo to ask SSSD at all.
+SUDOERS_NSS_SOURCE = "sss"
+#: The package that implements that nsswitch source.
+SUDOERS_NSS_PACKAGE = "libsss-sudo"
+
+#: Signature algorithm names a server may accept for each SSH key type.  An RSA
+#: key is usable when any of its three names is accepted: OpenSSH 8.8 dropped
+#: plain ssh-rsa (RSA/SHA-1) from the defaults but still accepts the same key
+#: signed as rsa-sha2-256 or rsa-sha2-512.
+SSH_KEY_ALGORITHMS = {
+    "ssh-rsa": ("rsa-sha2-512", "rsa-sha2-256", "ssh-rsa"),
+    "ecdsa-sha2-nistp256": ("ecdsa-sha2-nistp256",),
+    "ecdsa-sha2-nistp384": ("ecdsa-sha2-nistp384",),
+    "ecdsa-sha2-nistp521": ("ecdsa-sha2-nistp521",),
+    "ssh-ed25519": ("ssh-ed25519",),
+}
+
+
+def nsswitch_sources(database: str, path: str | Path = "/etc/nsswitch.conf") -> list[str]:
+    """Sources listed for *database* in nsswitch.conf, or ``[]`` if absent."""
+    try:
+        text = Path(path).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return []
+    for line in text.splitlines():
+        line = line.split("#", 1)[0].strip()
+        if not line or ":" not in line:
+            continue
+        name, _, rest = line.partition(":")
+        if name.strip() == database:
+            return rest.split()
+    return []
+
+
+def package_installed(name: str) -> bool | None:
+    """True/False, or None when this host has no dpkg to ask."""
+    result = run(["dpkg-query", "-W", "-f=${Status}", name])
+    if not result.found:
+        return None
+    return result.ok and "installed" in result.stdout and "not-installed" not in result.stdout
+
+
+def sudo_rules_checks() -> list[Check]:
+    """Whether sudo would actually consult SSSD, or only appear to.
+
+    Two independent halves have to agree and neither complains alone: the
+    ``sudoers`` line in nsswitch.conf, and the libsss-sudo package that
+    implements that source.  With the line and no package, sudo silently falls
+    back to the local file -- the configuration reads as finished and asks
+    nobody anything.  With the package and no line, sudo never asks SSSD.
+
+    This is the same shape as sshd holding an AuthorizedKeysCommand whose
+    responder is not running, which is why it is a check rather than a
+    paragraph in a document.
+    """
+    checks: list[Check] = []
+    if not is_linux():
+        return checks
+
+    sources = nsswitch_sources("sudoers")
+    installed = package_installed(SUDOERS_NSS_PACKAGE)
+    wired = SUDOERS_NSS_SOURCE in sources
+
+    if not sources and installed is not True:
+        # Nothing claims AD sudo rules are wanted. Local sudoers only, which is
+        # a legitimate choice, so say what is true and do not nag.
+        checks.append(
+            Check(
+                "sudo rules",
+                "INFO",
+                "no sudoers line in /etc/nsswitch.conf: sudo uses the local "
+                "/etc/sudoers and /etc/sudoers.d only",
+            )
+        )
+        return checks
+
+    if wired and installed is True:
+        checks.append(
+            Check("sudo rules", "PASS", f"sudoers: {' '.join(sources)} with "
+                  f"{SUDOERS_NSS_PACKAGE} installed")
+        )
+    elif wired and installed is False:
+        checks.append(
+            Check(
+                "sudo rules",
+                "FAIL",
+                f"nsswitch.conf has sudoers: {' '.join(sources)} but "
+                f"{SUDOERS_NSS_PACKAGE} is not installed",
+                hint="The sss source does nothing without it, so sudo quietly uses "
+                "the local file and every rule in the directory is ignored. "
+                f"Install it: apt-get install -y {SUDOERS_NSS_PACKAGE}",
+            )
+        )
+    elif installed is True and not wired:
+        checks.append(
+            Check(
+                "sudo rules",
+                "WARN",
+                f"{SUDOERS_NSS_PACKAGE} is installed but nsswitch.conf does not "
+                f"list {SUDOERS_NSS_SOURCE} for sudoers",
+                hint="sudo will never ask SSSD. Add to /etc/nsswitch.conf: "
+                "sudoers: files sss -- local rules first, then the directory.",
+            )
+        )
+    else:
+        checks.append(
+            Check(
+                "sudo rules",
+                "WARN",
+                f"sudoers: {' '.join(sources) or '(unset)'}; cannot determine "
+                f"whether {SUDOERS_NSS_PACKAGE} is installed",
+            )
+        )
+    return checks
+
+
+def ssh_key_algorithm_checks(key_types: "Iterable[str]", accepted: str) -> list[Check]:
+    """Whether sshd will accept a signature for the key types SSSD hands it.
+
+    Measured: a client offering the same RSA key as ``x509v3-ssh-rsa`` was
+    refused with ``unsupported public key algorithm``, which PuTTY reported as
+    "Server refused our key" -- indistinguishable from the key not being
+    authorised at all.  The server side of that is checkable: if none of a key
+    type's signature algorithm names are in PubkeyAcceptedAlgorithms, no client
+    can ever authenticate with it however correct the key is.
+    """
+    checks: list[Check] = []
+    allowed = {a.strip() for a in accepted.split(",") if a.strip()}
+    if not allowed:
+        return checks
+
+    for key_type in sorted(set(key_types)):
+        names = SSH_KEY_ALGORITHMS.get(key_type)
+        if names is None:
+            checks.append(
+                Check("ssh key algorithm", "INFO", f"{key_type}: not a type this "
+                      "tool knows how to check")
+            )
+            continue
+        usable = [n for n in names if n in allowed]
+        if usable:
+            checks.append(
+                Check("ssh key algorithm", "PASS", f"{key_type} accepted as "
+                      + ", ".join(usable))
+            )
+        else:
+            checks.append(
+                Check(
+                    "ssh key algorithm",
+                    "FAIL",
+                    f"sshd accepts none of {', '.join(names)}, so the "
+                    f"{key_type} key SSSD provides can never be used",
+                    hint="The client is told only that its key was refused, which "
+                    "looks the same as the key not being authorised. Add the "
+                    "needed name to PubkeyAcceptedAlgorithms, or issue the "
+                    "certificate with a key type this sshd accepts.",
+                )
+            )
     return checks
 
 def home_provisioning() -> tuple[str, str]:

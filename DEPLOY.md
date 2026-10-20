@@ -664,6 +664,59 @@ Host server.example.com
     User someone@ad.example.com
 ```
 
+### Connecting from Windows
+
+Three things cost an evening here, all measured on Windows 11 with a PIV token.
+
+**`ssh.exe` from System32 accepts `-I` and silently ignores it.** Microsoft's
+build (9.5p2) has PKCS#11 compiled out. With `-vvv` it prints no provider or
+dlopen line at all and goes straight to connecting, so the card is simply never
+used and the failure looks like a server problem. The OpenSSH shipped with Git
+for Windows (10.5p1) does support PKCS#11 — but loading a native
+`opensc-pkcs11.dll` into that MSYS2 binary segfaulted reproducibly, 4 runs out
+of 4. Use PuTTY-CAC on Windows.
+
+**PuTTY-CAC offers an X.509 certificate unless told not to.** With X.509 mode
+on it sends the key as `x509v3-ssh-rsa` (RFC 6187), which OpenSSH does not
+implement at all — it has only its own `*-cert-v01@openssh.com` format. The
+server says:
+
+```
+sshd: userauth_pubkey: unsupported public key algorithm: x509v3-ssh-rsa
+```
+
+and the client says only *"Server refused our key"*, which is what it also says
+when the key is genuinely not authorised. Turn it off in *Connection → SSH →
+Certificate → X509 Options*, or pass `-x509off`. It is a **global** setting,
+shared with Pageant, so one change covers every session.
+
+**Read the certificate thumbprint from the card, not from the Windows store.**
+The store accumulates certificates — one lab host had 18, of which 13 reported
+`Missing stored keyset` — and several can share a subject. A store entry whose
+key container no longer exists produces a Windows dialog saying the smart card
+*"cannot perform the requested operation or the operation requires a different
+smart card"*, which is literally true: the key being asked for is not on that
+card. Ask the card:
+
+```bash
+pkcs11-tool --slot-index 0 --read-object --type cert --id 01 -o 9a.der
+openssl x509 -in 9a.der -inform der -noout -fingerprint -sha1
+```
+
+Then connect with that thumbprint:
+
+```
+putty.exe -x509off -i CAPI:<thumbprint> -l someone@ad.example.com host
+```
+
+To confirm the key really is the one the server will accept, derive it and
+compare with what SSSD returns — the fingerprints must match:
+
+```bash
+openssl x509 -in 9a.der -inform der -pubkey -noout > 9a.pub
+ssh-keygen -i -m PKCS8 -f 9a.pub | ssh-keygen -lf -
+```
+
 ## Checking the result, at any point
 
 ```bash
