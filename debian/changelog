@@ -1,3 +1,47 @@
+sssd-smartcard (0.2.8) unstable; urgency=medium
+
+  * sudo can authenticate against a card held by an SSH client, and doctor now
+    checks it. pam_sss cannot do this -- over SSH the token is on the client and
+    the server never sees it, which SSSD states as "try_cert_auth flag set but
+    no certificate available" before falling through to a password.
+    pam_ssh_agent_auth closes the gap by verifying a signature from the
+    forwarded agent. Measured end to end: "Running AuthorizedKeysCommand" ->
+    "matching key found ... line 3" -> "ssh_rsa_verify: signature correct" ->
+    "Authenticated", with no prompt at all.
+  * The check distinguishes the sound configuration from the usual one. Most
+    guides say to paste the public key into ~/.ssh/authorized_keys; that copy
+    lives on the host and outlives revoking the certificate, so sudo would keep
+    working after login and SSH had stopped. authorized_keys_command= pointed at
+    sss_ssh_authorizedkeys asks the same source sshd asks, so one revocation
+    covers all three. A static file is a WARN that says why; somebody else's
+    key service is reported without a verdict.
+  * Also checked: SSH_AUTH_SOCK surviving sudo's env_reset. Without it the
+    module finds no agent and the stack falls through to the password prompt
+    with nothing shown to the user -- a FAIL, because nothing else reveals it.
+    Read from 'sudo -l', not 'sudo -V': the latter dumps settings only for root
+    and 'sudo -n -V' is not valid usage at all, it prints the usage text, which
+    a parser reads happily as "nothing preserved".
+  * The Windows helper gained -ForwardAgent and -SessionName: it checks that
+    Pageant is serving its named pipe (not the Windows OpenSSH agent pipe,
+    which this build does not implement and which would report success with
+    Pageant stopped), and that the saved session has AgentFwd and TryAgent set,
+    with the reg add to fix them. It also reports the global AuthX509 value,
+    which turns the "x509 is a global setting" claim into a checkable one.
+  * Two misleading messages are documented in DEPLOY.md and the guide, because
+    between them they cost an evening: "ssh-agent socket has incorrect
+    permissions for owner" is what the module says for any reason it cannot use
+    the socket, including a malformed SSH_AUTH_SOCK -- the mode sshd gives the
+    socket is fine and should not be changed; and "Using default
+    file=/etc/security/authorized_keys" appears even when authorized_keys_command
+    is in use, because it reports the file field's default regardless of source.
+  * DEPLOY.md step 8 covers who may run sudo, with the measured detail that a
+    group name needs no quoting -- %"group@domain" is rejected as 'empty group'
+    while the bare name and %#<gid> both parse -- and that a password prompt is
+    not evidence of having sudo rights, since sudo authenticates before it
+    authorises.
+
+ -- Szymon Frankiewicz <szymonfrankiewicz@gmail.com>  Tue, 20 Oct 2026 23:45:00 +0200
+
 sssd-smartcard (0.2.7) unstable; urgency=medium
 
   * A Windows-side helper, scripts/windows/New-SmartCardSshCommand.ps1, which

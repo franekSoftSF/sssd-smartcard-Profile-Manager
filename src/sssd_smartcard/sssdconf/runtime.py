@@ -645,6 +645,147 @@ def ssh_key_algorithm_checks(key_types: "Iterable[str]", accepted: str) -> list[
             )
     return checks
 
+
+# ---------------------------------------------------------------------------
+# sudo over a forwarded agent: the card is on the client, and that still works
+
+PAM_SUDO = PAM_DIR / "sudo"
+AGENT_MODULE = "pam_ssh_agent_auth.so"
+#: What keeps sudo's env_reset from stripping the agent out from under it.
+AGENT_ENV = "SSH_AUTH_SOCK"
+#: The helper that answers with the keys SSSD derives from the certificate --
+#: the same source sshd is pointed at, so one revocation covers both.
+AD_KEY_HELPER = "sss_ssh_authorizedkeys"
+
+
+def sudo_agent_checks(
+    pam_sudo: str | Path | None = None,
+    sudoers_env: "Iterable[str] | None" = None,
+) -> list[Check]:
+    """Whether sudo can authenticate a card held by an SSH client.
+
+    `pam_sss` cannot: over SSH the token is on the client and the server never
+    sees it, so ``try_cert_auth`` finds no certificate and the stack falls
+    through to a password.  ``pam_ssh_agent_auth`` closes that by verifying a
+    signature from the *forwarded* agent instead.
+
+    Two things decide whether it works, and each fails silently on its own:
+
+    * the module must be in the sudo stack **before** the password path, and
+    * ``SSH_AUTH_SOCK`` must survive sudo's ``env_reset``, or the module finds
+      no agent and says so only in the log.
+
+    A third decides whether it is *sound* rather than merely working.  Pointing
+    ``file=`` at ``~/.ssh/authorized_keys`` -- what most guides say -- puts a
+    copy of the key on the host, and that copy outlives revoking the
+    certificate.  ``authorized_keys_command=`` with ``sss_ssh_authorizedkeys``
+    asks the same source sshd asks, so one revocation covers login, SSH and
+    sudo together.
+    """
+    checks: list[Check] = []
+    if not is_linux():
+        return checks
+
+    path = Path(pam_sudo) if pam_sudo is not None else PAM_SUDO
+    try:
+        lines = [
+            ln for ln in path.read_text(encoding="utf-8", errors="replace").splitlines()
+            if not ln.lstrip().startswith("#")
+        ]
+    except OSError:
+        return checks
+
+    module = [ln for ln in lines if AGENT_MODULE in ln]
+    if not module:
+        # Not configured is not a fault: it is the default, and sudo over SSH
+        # then asks for a password. Only say so when a card is in play at all.
+        return checks
+
+    line = module[0]
+    if "authorized_keys_command=" in line:
+        command = line.split("authorized_keys_command=", 1)[1].split()[0]
+        if AD_KEY_HELPER in command:
+            checks.append(
+                Check("sudo via SSH agent", "PASS", f"keys from {command}")
+            )
+        else:
+            checks.append(
+                Check(
+                    "sudo via SSH agent",
+                    "INFO",
+                    f"keys from {command}",
+                    hint="Not sss_ssh_authorizedkeys, so these keys are not the ones "
+                    "AD derives from the certificate. Check that revoking a "
+                    "certificate also removes sudo access.",
+                )
+            )
+    else:
+        checks.append(
+            Check(
+                "sudo via SSH agent",
+                "WARN",
+                f"{AGENT_MODULE} is configured without authorized_keys_command",
+                hint="It is reading a static authorized_keys file, so a copy of the "
+                "key lives on this host and will outlive revoking the "
+                "certificate -- sudo would keep working after login and SSH "
+                "stopped. Point it at the same source sshd uses: "
+                "authorized_keys_command=/usr/bin/sss_ssh_authorizedkeys",
+            )
+        )
+
+    if "debug" in line.split():
+        checks.append(
+            Check(
+                "sudo via SSH agent",
+                "INFO",
+                "the module is running with debug",
+                hint="Useful while diagnosing, a dozen log lines per sudo "
+                "afterwards. Remove it once the mechanism is confirmed.",
+            )
+        )
+
+    kept = list(sudoers_env) if sudoers_env is not None else _sudoers_env_keep()
+    if kept is None:
+        checks.append(
+            Check("sudo agent environment", "WARN",
+                  "cannot read sudo's environment settings (needs root)")
+        )
+    elif AGENT_ENV in kept:
+        checks.append(
+            Check("sudo agent environment", "PASS", f"env_keep includes {AGENT_ENV}")
+        )
+    else:
+        checks.append(
+            Check(
+                "sudo agent environment",
+                "FAIL",
+                f"env_reset strips {AGENT_ENV} and env_keep does not restore it",
+                hint="The module then finds no agent and the stack falls through to "
+                "the password prompt with nothing shown to the user. Add to "
+                f'/etc/sudoers.d/: Defaults env_keep += "{AGENT_ENV}"',
+            )
+        )
+    return checks
+
+
+def _sudoers_env_keep() -> list[str] | None:
+    """Environment variables sudo preserves, or None when it cannot be read.
+
+    Taken from ``sudo -l``, which prints the effective Defaults for the calling
+    user.  Not from ``sudo -V``: that dumps the full settings only for root, and
+    ``sudo -n -V`` is not even valid usage -- it prints the usage text, which a
+    parser would happily read as "no variables preserved".
+    """
+    result = run(["sudo", "-n", "-l"])
+    if not result.ok:
+        return None
+    names: list[str] = []
+    for line in result.stdout.splitlines():
+        for match in re.finditer(r'env_keep\s*\+?=\s*"?([^",]+)"?', line):
+            names.extend(match.group(1).split())
+    return names
+
+
 def home_provisioning() -> tuple[str, str]:
     """``(module, file)`` that creates missing home directories, or ``("", "")``.
 

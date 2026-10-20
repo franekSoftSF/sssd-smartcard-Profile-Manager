@@ -722,6 +722,121 @@ openssl x509 -in 9a.der -inform der -pubkey -noout > 9a.pub
 ssh-keygen -i -m PKCS8 -f 9a.pub | ssh-keygen -lf -
 ```
 
+## Step 8 - sudo with the card, locally and over SSH
+
+Two different mechanisms, and the second one is not obvious.
+
+### Who may run sudo
+
+Keep *who* in Active Directory and *what* on the host. A group the users belong
+to needs one line:
+
+```
+%linux-admins@ad.example.com ALL=(ALL:ALL) ALL
+```
+
+No quotes: `@` and `.` in a group name need neither quoting nor escaping.
+Measured - `%"group@domain"` is rejected with `empty group`, while the bare name
+and the numeric form `%#<gid>` both parse. Write it through a staging file whose
+name contains a dot, because sudo skips those, so nothing is live until it
+validates:
+
+```bash
+sudo tee /etc/sudoers.d/.90-ad-admins.new >/dev/null <<'EOF'
+%linux-admins@ad.example.com ALL=(ALL:ALL) ALL
+EOF
+sudo visudo -c -f /etc/sudoers.d/.90-ad-admins.new   && sudo install -m 0440 -o root -g root        /etc/sudoers.d/.90-ad-admins.new /etc/sudoers.d/90-ad-admins   && sudo rm -f /etc/sudoers.d/.90-ad-admins.new && sudo visudo -c
+```
+
+The final `visudo -c` covers every file, not just the new one. Check the result
+with `sudo -l -U someone@ad.example.com`, which lists without authenticating.
+
+**A password prompt is not evidence of having sudo rights.** sudo authenticates
+first and authorises second, so it asks even a user with no rules at all and
+only then says `is not allowed`. Two unrelated failures look identical here.
+
+### Locally: the card
+
+`/etc/pam.d/sudo` includes `common-auth`, where `pam_sss.so ... try_cert_auth`
+already sits, so at a local console `sudo` asks for the PIN with no further
+configuration. `try_cert_auth` **degrades silently**: with no card it asks for a
+password and says nothing about why.
+
+### Over SSH: the forwarded agent
+
+Over SSH `pam_sss` cannot use the card - the token is on the client and the
+server never sees it. SSSD says so in its log: `try_cert_auth flag set but no
+certificate available`. `pam_ssh_agent_auth` closes the gap by verifying a
+signature from the forwarded agent instead.
+
+```bash
+sudo apt-get install -y libpam-ssh-agent-auth
+```
+
+In `/etc/pam.d/sudo`, **before** `@include common-auth`:
+
+```
+auth    sufficient  pam_ssh_agent_auth.so authorized_keys_command=/usr/bin/sss_ssh_authorizedkeys
+```
+
+and in `/etc/sudoers.d/`:
+
+```
+Defaults env_keep += "SSH_AUTH_SOCK"
+```
+
+`authorized_keys_command` is the part that matters. Most guides say to paste the
+public key into `~/.ssh/authorized_keys`; that copy lives on the host and
+**outlives revoking the certificate**, so sudo would keep working after login
+and SSH had stopped. Pointing the module at the same helper sshd uses means one
+revocation covers all three. `doctor` checks which of the two is configured.
+
+Without the `env_keep` line, sudo's `env_reset` strips the variable, the module
+finds no agent, and the stack falls through to the password prompt with nothing
+shown to the user.
+
+On the client, enable agent forwarding for that session and load the
+certificate into the agent **before connecting**.
+`scripts/windows/New-SmartCardSshCommand.ps1` checks both.
+
+**The trade-off, which is real:** while the session lives, anyone with root on
+that server can use the forwarded agent to authenticate **as the user to other
+hosts**. Enable it per session, for hosts you trust - not `Host *` in a config.
+
+### Verifying it
+
+In the session, confirm the client half first:
+
+```bash
+printenv SSH_AUTH_SOCK
+ssh-add -l
+```
+
+The fingerprint must match one of the keys the server derives from the
+certificate (`sss_ssh_authorizedkeys <user>`). Then:
+
+```bash
+sudo -k && sudo -l
+```
+
+**No prompt at all** means the module authenticated, because `sufficient`
+short-circuits the stack before the password path. `sudo -k` first, or an
+unexpired timestamp explains the silence instead.
+
+Two misleading messages, both measured, both of which cost us an evening:
+
+* `ssh-agent socket has incorrect permissions for owner` is what the module says
+  when it cannot use the socket **for any reason**, including a malformed
+  `SSH_AUTH_SOCK`. The mode sshd gives the socket (0755, inside a 0700
+  directory) is fine - do not chmod it. Check the variable first.
+* `Using default file=/etc/security/authorized_keys` appears in `debug` output
+  **even when `authorized_keys_command` is being used**. It reports the `file`
+  field's default regardless of the key source. The line that settles it is
+  `debug1: Running AuthorizedKeysCommand`.
+
+Add `debug` to the module's options while diagnosing, and take it out
+afterwards - it logs a dozen lines per `sudo`.
+
 ## Checking the result, at any point
 
 ```bash

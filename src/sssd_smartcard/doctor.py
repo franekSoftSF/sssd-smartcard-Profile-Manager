@@ -492,9 +492,12 @@ def run_doctor(
     # sudo is a separate consumer of the same identity, and its two halves --
     # the nsswitch source and the package implementing it -- look configured
     # apart while doing nothing together.
-    from .sssdconf.runtime import sudo_rules_checks
+    from .sssdconf.runtime import sudo_agent_checks, sudo_rules_checks
 
     report.add(*sudo_rules_checks())
+    # And whether sudo can use a card held by an SSH client, which pam_sss
+    # cannot: over SSH the token never reaches the server.
+    report.add(*sudo_agent_checks())
 
     if check_domains:
         trust = trust_report(config_path)

@@ -83,6 +83,26 @@
     as a cross-check of what certutil reports. Reads only public certificate
     objects; no PIN is needed or requested.
 
+.PARAMETER ForwardAgent
+    Add -A (agent forwarding) to the emitted command, and check the two
+    client-side things that agent-forwarded sudo needs: that Pageant is
+    running, and that the saved session has agent forwarding enabled.
+
+    This lets sudo on the Linux host authenticate against the card even though
+    the card is here on Windows: pam_ssh_agent_auth verifies a signature from
+    the forwarded agent.
+
+    It has a real cost. Read the security note that the script prints, and the
+    NOTES section below. (Careful: a line inside comment-based help that begins
+    with a dot and a keyword name is parsed as a new help section, which is why
+    that word is bare here.)
+
+.PARAMETER SessionName
+    A saved PuTTY session name. With -ForwardAgent, the script reads that
+    session's AgentFwd and TryAgent registry values and reports them, with the
+    exact "reg add" to fix either one. Without it, the per-session settings
+    cannot be checked -- only Pageant itself.
+
 .EXAMPLE
     .\New-SmartCardSshCommand.ps1 -User someone@ad.example.com -ComputerName linux-host.ad.example.com
 
@@ -100,6 +120,13 @@
     Same, but only consider the token in the reader whose name contains
     "YubiKey". Use this when several tokens are attached at once.
 
+.EXAMPLE
+    .\New-SmartCardSshCommand.ps1 -User someone@ad.example.com -ComputerName linux-host.ad.example.com -ForwardAgent -SessionName my-linux-host
+
+    Also check the client side of agent-forwarded sudo and add -A to the
+    emitted command. -SessionName names a saved PuTTY session whose AgentFwd
+    and TryAgent values are then reported.
+
 .NOTES
     Read-only by nature, so there is nothing for -WhatIf to suppress: the
     script changes no state and starts no connection. Use -Verbose to see the
@@ -109,6 +136,20 @@
     public key from the X.509 certificate on the card, and sshd fetches it via
     AuthorizedKeysCommand /usr/bin/sss_ssh_authorizedkeys. Nothing has to be
     copied to the server, and certificate revocation therefore covers SSH too.
+
+    Agent forwarding (-ForwardAgent) extends that to sudo, via
+    pam_ssh_agent_auth with authorized_keys_command pointed at the same
+    sss_ssh_authorizedkeys. Keys therefore come from the same AD source sshd
+    uses, so revoking the certificate removes sudo access too -- which is the
+    whole point, and the reason not to paste a key into ~/.ssh/authorized_keys
+    as most guides suggest. A key pasted there survives revocation and silently
+    undoes it.
+
+    The cost of -A: while the session is alive, anyone with root on that server
+    can use the forwarded agent to authenticate AS YOU to other hosts. The
+    agent signs whatever it is asked to sign, and root on the far end can reach
+    the forwarded socket. Enable it per session, for hosts you trust with your
+    identity -- never as "Host *" in a config.
 
     See docs/windows-smartcard-ssh.pdf in this repository for the long form.
 #>
@@ -126,7 +167,9 @@ param(
     [string] $PuttyPath,
     [string] $Thumbprint,
     [string] $Reader,
-    [switch] $UseOpenSC
+    [switch] $UseOpenSC,
+    [switch] $ForwardAgent,
+    [string] $SessionName
 )
 
 Set-StrictMode -Version 2.0
@@ -345,6 +388,166 @@ function Test-PuttyCac {
     }
 
     return $info
+}
+
+# --------------------------------------------------------------------------
+# Pageant and agent forwarding
+# --------------------------------------------------------------------------
+
+<#
+    Is Pageant running and serving?
+
+    The authoritative signal is Pageant's named pipe, because that is the
+    endpoint PuTTY and plink actually connect to. This build formats it as
+
+        \\.\pipe\pageant.<user>.<64 hex>
+
+    which matches the format string "pageant.%s.%s" found in both pageant.exe
+    and putty.exe. On the test workstation the live pipe was present while
+    Pageant ran, and enumerating \\.\pipe\ returned it among ~510 pipes on both
+    PowerShell 5.1 and 7.
+
+    What this deliberately does NOT look for: \\.\pipe\openssh-ssh-agent, the
+    Windows OpenSSH agent pipe. This Pageant does not implement it -- the
+    string "openssh-ssh-agent" is absent from both pageant.exe and putty.exe,
+    checked by scanning the images. Looking for that pipe would report "no
+    agent" on a perfectly healthy Pageant, or find the unrelated Windows
+    ssh-agent service and report success when Pageant is not running at all.
+
+    The process name is reported as corroboration only. A process called
+    "pageant" that is not serving a pipe cannot answer a signing request, so
+    the pipe is what decides.
+#>
+function Test-PageantRunning {
+    $info = [pscustomobject]@{
+        Serving     = $false
+        PipeName    = $null
+        PipeMasked  = $null
+        ProcessPath = $null
+        HowDetected = 'no pageant pipe found'
+    }
+
+    try {
+        $pipes = [System.IO.Directory]::GetFiles('\\.\pipe\')
+        foreach ($p in $pipes) {
+            $leaf = $p.Substring($p.LastIndexOf('\') + 1)
+            if ($leaf -match '^pageant\.') {
+                $info.Serving = $true
+                $info.PipeName = $p
+                # The pipe name embeds the Windows account name. Masked when
+                # printed, so that a pasted transcript does not carry it.
+                $info.PipeMasked = ($leaf -replace '^(pageant\.)[^.]+\.(.{8}).*$', '$1<user>.$2...')
+                $info.HowDetected = 'named pipe pageant.<user>.<hash> is being served'
+                break
+            }
+        }
+    } catch {
+        Write-Verbose ('could not enumerate named pipes: {0}' -f $_.Exception.Message)
+        $info.HowDetected = 'could not enumerate named pipes'
+        return $info
+    }
+
+    $proc = Get-Process -Name 'pageant' -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($proc) {
+        try { $info.ProcessPath = $proc.Path } catch { $info.ProcessPath = '(path unavailable)' }
+    }
+
+    return $info
+}
+
+<#
+    Read a saved session's agent settings.
+
+    Measured value names and kinds, from an existing saved session on the test
+    workstation:
+
+        AgentFwd  REG_DWORD   1   -- forward the agent for this session
+        TryAgent  REG_DWORD   1   -- use Pageant at all (default 1 when absent)
+
+    Both names also appear as literals in putty.exe and pageant.exe.
+
+    PuTTY percent-encodes awkward characters in session names when it makes the
+    registry key, so the key name is not always the session name typed in the
+    UI. Rather than reimplement that encoding and get it subtly wrong, this
+    matches the literal name against the actual subkey names, then against a
+    space-encoded form, and otherwise reports the session as not found and
+    lists what does exist.
+#>
+function Get-PuttySessionAgentSetting {
+    param([string] $Name)
+
+    $result = [pscustomobject]@{
+        Found      = $false
+        KeyName    = $null
+        RegPath    = $null
+        AgentFwd   = $null
+        TryAgent   = $null
+        Available  = @()
+    }
+
+    $sessionsPath = 'Software\SimonTatham\PuTTY\Sessions'
+    $root = $null
+    try {
+        $root = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey($sessionsPath)
+    } catch {
+        Write-Verbose 'could not open the PuTTY Sessions registry key'
+    }
+    if (-not $root) { return $result }
+
+    $names = @($root.GetSubKeyNames())
+    $result.Available = $names
+
+    $match = $null
+    foreach ($n in $names) {
+        if ($n -eq $Name) { $match = $n; break }
+    }
+    if (-not $match) {
+        foreach ($n in $names) {
+            if ($n -ieq $Name -or $n -ieq ($Name -replace ' ', '%20')) { $match = $n; break }
+        }
+    }
+    if (-not $match) { return $result }
+
+    $result.Found = $true
+    $result.KeyName = $match
+    # Verified that reg.exe accepts this form: "reg query
+    # HKCU\Software\SimonTatham\PuTTY\Sessions\<name> /v AgentFwd" returns the
+    # value, so the "reg add" offered to the operator is a working command.
+    $result.RegPath = 'HKCU\{0}\{1}' -f $sessionsPath, $match
+
+    try {
+        $key = $root.OpenSubKey($match)
+        if ($key) {
+            $present = @($key.GetValueNames())
+            if ($present -contains 'AgentFwd') { $result.AgentFwd = [int] $key.GetValue('AgentFwd') }
+            # TryAgent defaults to 1 (use Pageant) when the value is absent.
+            if ($present -contains 'TryAgent') {
+                $result.TryAgent = [int] $key.GetValue('TryAgent')
+            } else {
+                $result.TryAgent = 1
+            }
+        }
+    } catch {
+        Write-Verbose ('could not read values for session {0}' -f $match)
+    }
+
+    return $result
+}
+
+# The global X.509 switch, for information. Measured on the test workstation as
+# a REG_DWORD named AuthX509 directly under the PuTTY root -- NOT under the
+# per-session key, which is the mechanical reason -x509off behaves as a global,
+# persistent setting shared with Pageant rather than a per-session one.
+function Get-PuttyGlobalX509 {
+    try {
+        $key = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey('Software\SimonTatham\PuTTY')
+        if ($key -and (@($key.GetValueNames()) -contains 'AuthX509')) {
+            return [int] $key.GetValue('AuthX509')
+        }
+    } catch {
+        Write-Verbose 'could not read AuthX509'
+    }
+    return $null
 }
 
 # --------------------------------------------------------------------------
@@ -777,6 +980,83 @@ if ($opensc.Pkcs11Tool -and $opensc.OpenScTool) {
         -Remedy 'winget install --id OpenSC.OpenSC   (only needed to read the thumbprint straight off the card; certutil can usually do it alone)'
 }
 
+if ($ForwardAgent -or $SessionName) {
+
+    # --- Pageant itself ---
+    $pageant = Test-PageantRunning
+    if ($pageant.Serving) {
+        Write-Finding -Status 'PASS' -Check 'Pageant is running and serving' `
+            -Detail ('{0}  [{1}]' -f $pageant.PipeMasked, $pageant.HowDetected)
+        if ($pageant.ProcessPath) {
+            Write-Host ('         process: {0}' -f $pageant.ProcessPath) -ForegroundColor DarkGray
+        }
+    } else {
+        $pageantExe = 'pageant.exe'
+        if ($puttyExe) { $pageantExe = Join-Path (Split-Path -Parent $puttyExe) 'pageant.exe' }
+        Write-Finding -Status 'FAIL' -Check 'Pageant is running and serving' `
+            -Detail $pageant.HowDetected `
+            -Remedy ('start Pageant and load the card certificate into it before connecting: "{0}"' -f $pageantExe)
+    }
+
+    Write-Host '         Pageant must already be running with the certificate loaded' -ForegroundColor DarkGray
+    Write-Host '         AT CONNECT TIME. Adding it to Pageant after the session is up' -ForegroundColor DarkGray
+    Write-Host '         does not retrofit agent forwarding onto that session.' -ForegroundColor DarkGray
+
+    # --- per-session agent forwarding ---
+    if (-not $SessionName) {
+        Write-Finding -Status 'WARN' -Check 'Saved session has agent forwarding enabled' `
+            -Detail 'no -SessionName given, so the per-session AgentFwd/TryAgent values cannot be read' `
+            -Remedy 'pass -SessionName <saved session> to have them checked, or tick Connection > SSH > Auth > "Allow agent forwarding" in the PuTTY UI'
+    } else {
+        $sess = Get-PuttySessionAgentSetting -Name $SessionName
+        if (-not $sess.Found) {
+            $avail = 'none'
+            if (@($sess.Available).Count -gt 0) { $avail = (@($sess.Available) -join ', ') }
+            Write-Finding -Status 'WARN' -Check 'Saved session has agent forwarding enabled' `
+                -Detail ('no saved session named "{0}"; saved sessions are: {1}' -f $SessionName, $avail) `
+                -Remedy 'save the session in PuTTY first, or pass -SessionName exactly as PuTTY lists it'
+        } else {
+            $fwd = $sess.AgentFwd
+            $try = $sess.TryAgent
+            $fwdText = 'absent (treated as off)'
+            if ($null -ne $fwd) { $fwdText = "$fwd" }
+
+            if ($fwd -eq 1 -and $try -eq 1) {
+                Write-Finding -Status 'PASS' -Check 'Saved session has agent forwarding enabled' `
+                    -Detail ('session "{0}": AgentFwd={1}, TryAgent={2}' -f $sess.KeyName, $fwdText, $try)
+            } else {
+                $why = @()
+                if ($fwd -ne 1) { $why += ('AgentFwd={0} (agent forwarding off)' -f $fwdText) }
+                if ($try -ne 1) { $why += ('TryAgent={0} (Pageant not consulted at all)' -f $try) }
+                Write-Finding -Status 'FAIL' -Check 'Saved session has agent forwarding enabled' `
+                    -Detail ('session "{0}": {1}' -f $sess.KeyName, ($why -join '; ')) `
+                    -Remedy 'either tick Connection > SSH > Auth > "Allow agent forwarding" and re-save the session, or set the values directly (commands below)'
+                Write-Host ''
+                if ($fwd -ne 1) {
+                    Write-Host ('         reg add "{0}" /v AgentFwd /t REG_DWORD /d 1 /f' -f $sess.RegPath) -ForegroundColor Cyan
+                }
+                if ($try -ne 1) {
+                    Write-Host ('         reg add "{0}" /v TryAgent /t REG_DWORD /d 1 /f' -f $sess.RegPath) -ForegroundColor Cyan
+                }
+                Write-Host '         (the script changes nothing itself -- run these yourself if you want them)' -ForegroundColor DarkGray
+            }
+            Write-Host ('         Note: -A on the command line covers this run regardless of AgentFwd;' ) -ForegroundColor DarkGray
+            Write-Host  '         the saved value matters when the session is launched from the UI.' -ForegroundColor DarkGray
+        }
+    }
+}
+
+# The global X.509 switch, reported for information because it is the setting
+# -x509off manipulates and it persists between runs.
+$x509 = Get-PuttyGlobalX509
+if ($null -eq $x509) {
+    Write-Host '  [INFO] global AuthX509: not set (PuTTY-CAC default)' -ForegroundColor Gray
+} elseif ($x509 -eq 0) {
+    Write-Host '  [INFO] global AuthX509 = 0 (X.509 mode off, which is what you want)' -ForegroundColor Gray
+} else {
+    Write-Host ('  [INFO] global AuthX509 = {0} (X.509 mode ON globally -- -x509off overrides it per run)' -f $x509) -ForegroundColor Yellow
+}
+
 $card = Get-CardCertificate
 
 if (-not $card.Available) {
@@ -1030,17 +1310,24 @@ function Format-Exe { param([string] $Path) if ($Path -match '\s') { return '"' 
 $portArgs = ''
 if ($Port -ne 22) { $portArgs = ' -P {0}' -f $Port }
 
+# -A enables agent forwarding, which is what lets sudo on the far end verify a
+# signature from this agent. "plink --help" documents it as
+# "-A -a     enable / disable agent forwarding"; -A, -a, -agent and -noagent
+# were all probed and accepted by this build.
+$agentArgs = ''
+if ($ForwardAgent) { $agentArgs = ' -A' }
+
 # -x509off is not optional. With X.509 mode left on, PuTTY-CAC offers
 # x509v3-ssh-rsa (RFC 6187); OpenSSH does not implement it and answers
 # "unsupported public key algorithm", which the client reports only as
 # "Server refused our key". The setting is global and shared with Pageant, so
 # it is passed explicitly on every invocation.
 # -l is used rather than user@host because an AD UPN contains '@'.
-$interactive = '{0} -x509off -i CAPI:{1} -l {2}{3} {4}' -f `
-    (Format-Exe $puttyForCmd), $chosen.Thumbprint, $effUser, $portArgs, $effHost
+$interactive = '{0} -x509off{1} -i CAPI:{2} -l {3}{4} {5}' -f `
+    (Format-Exe $puttyForCmd), $agentArgs, $chosen.Thumbprint, $effUser, $portArgs, $effHost
 
-$scripted = '{0} -x509off -batch -i CAPI:{1} -l {2}{3} {4}' -f `
-    (Format-Exe $plinkForCmd), $chosen.Thumbprint, $effUser, $portArgs, $effHost
+$scripted = '{0} -x509off{1} -batch -i CAPI:{2} -l {3}{4} {5}' -f `
+    (Format-Exe $plinkForCmd), $agentArgs, $chosen.Thumbprint, $effUser, $portArgs, $effHost
 
 Write-Host '  All checks passed. Run this yourself -- the script does not launch it.' -ForegroundColor Green
 Write-Host ''
@@ -1068,7 +1355,38 @@ Write-Host '    -i CAPI:...  the certificate, by SHA-1 thumbprint, taken from th
 Write-Host '                 confirmed against the key container actually on the card.' -ForegroundColor Gray
 Write-Host '    -l           the login name. AD names contain "@", which user@host parsing' -ForegroundColor Gray
 Write-Host '                 would split on, so the name goes in its own argument.' -ForegroundColor Gray
+if ($ForwardAgent) {
+    Write-Host '    -A           forward the SSH agent, so that sudo on the far end can' -ForegroundColor Gray
+    Write-Host '                 verify a signature from the card via pam_ssh_agent_auth.' -ForegroundColor Gray
+}
 Write-Host ''
+
+if ($ForwardAgent) {
+    Write-Host '  SECURITY COST OF -A, which is real and not boilerplate:' -ForegroundColor Yellow
+    Write-Host '    While this session is alive, anyone with root on that server can use' -ForegroundColor Yellow
+    Write-Host '    the forwarded agent to authenticate AS YOU to other hosts. The agent' -ForegroundColor Yellow
+    Write-Host '    signs whatever it is asked to sign, and root on the far end can reach' -ForegroundColor Yellow
+    Write-Host '    the forwarded socket. It cannot extract the key -- that stays on the' -ForegroundColor Yellow
+    Write-Host '    card -- but it does not need to.' -ForegroundColor Yellow
+    Write-Host '    Enable it per session, for hosts you trust with your identity. Never' -ForegroundColor Yellow
+    Write-Host '    as "Host *" in a config, and not by default on jump hosts.' -ForegroundColor Yellow
+    Write-Host ''
+    Write-Host '  To confirm it worked, in the session:' -ForegroundColor White
+    Write-Host '    ssh-add -l          # must list the same fingerprint the server accepts' -ForegroundColor Gray
+    Write-Host '    sudo -k && sudo -l  # no password prompt at all means the module' -ForegroundColor Gray
+    Write-Host '                        # authenticated: "sufficient" short-circuits the' -ForegroundColor Gray
+    Write-Host '                        # stack before pam_unix is ever reached.' -ForegroundColor Gray
+    Write-Host ''
+    Write-Host '  If sudo still prompts, two measured red herrings to skip:' -ForegroundColor White
+    Write-Host '    "ssh-agent socket has incorrect permissions for owner" is usually a' -ForegroundColor Gray
+    Write-Host '    malformed SSH_AUTH_SOCK, not the socket mode. Mode 0755 as sshd creates' -ForegroundColor Gray
+    Write-Host '    it is fine. Do not chmod the socket -- run "printenv SSH_AUTH_SOCK" and' -ForegroundColor Gray
+    Write-Host '    then "ls -l" on exactly that path.' -ForegroundColor Gray
+    Write-Host '    "Using default file=/etc/security/authorized_keys" appears even when' -ForegroundColor Gray
+    Write-Host '    authorized_keys_command IS in use. It reports the file field default' -ForegroundColor Gray
+    Write-Host '    regardless of the key source. It is not the problem.' -ForegroundColor Gray
+    Write-Host ''
+}
 Write-Host '  The server needs nothing copied to it: SSSD derives the SSH public key from' -ForegroundColor Gray
 Write-Host '  the certificate and sshd fetches it through' -ForegroundColor Gray
 Write-Host '  AuthorizedKeysCommand /usr/bin/sss_ssh_authorizedkeys, so revoking the' -ForegroundColor Gray
