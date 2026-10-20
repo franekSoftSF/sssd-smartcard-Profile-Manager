@@ -1,3 +1,43 @@
+sssd-smartcard (0.2.9) unstable; urgency=medium
+
+  * 'sssd-smartcard debug on|off|status|bundle'. Every failure in this project
+    was found by raising debug_level, reproducing, reading the log and putting
+    it back; doing that by hand on a host that is already half-configured is
+    how a working sssd.conf gets broken. So the raising is a change like any
+    other here: backed up, validated with sssctl config-check before the
+    service is restarted, rolled back if it objects. The sshd half is a drop-in
+    under sshd_config.d, validated with 'sshd -t' before the reload, so turning
+    it down is deleting a file rather than editing the distribution's config.
+  * doctor warns for as long as logging is raised. At level 9 SSSD writes the
+    full base64 of every certificate it reads, on every authentication, which
+    fills a disk on a host with real users -- and the operator who needed the
+    logging is the one who will not remember it. Hexadecimal levels are
+    understood, since sssd.conf accepts them and a decimal-only reader would
+    report a raised host as quiet.
+  * 'debug bundle' collects configuration, PAM stacks, SSSD logs, the journal
+    for sssd/ssh/sudo, package versions, sssctl config-check, sshd -T and the
+    effective sudo defaults into one archive, written 0600 -- created that way
+    with os.open rather than opened and chmod-ed afterwards, which leaves the
+    file world-readable for as long as it takes to write. What it never
+    contains is listed in its own MANIFEST.txt: the keytab, /var/lib/sss/db
+    (the cache holds credential material when cache_credentials is set),
+    private keys, and the values of options named like secrets. Matching is on
+    the option name rather than the value, so a password mentioned in a comment
+    survives and a secret in an unfamiliar field is still caught. Certificates
+    are included: they are public, and a bundle without them cannot answer the
+    question it was made for.
+  * The Windows helper and its guide cover preloading the certificate into
+    Pageant, including the measured trap: -autoload does not load the saved
+    list, it enumerates the entire certificate store and rewrites the list on
+    every start -- 18 entries on the test machine, several with dead key
+    containers. Since the agent offers keys one at a time and OpenSSH's default
+    MaxAuthTries is 6, the right key may never be reached, and the symptom is
+    "Server refused our key", which is also what three unrelated causes
+    produce. AutoloadCerts=0 plus the thumbprint as a positional argument,
+    through a Startup shortcut, loads exactly one.
+
+ -- Szymon Frankiewicz <szymonfrankiewicz@gmail.com>  Wed, 21 Oct 2026 00:30:00 +0200
+
 sssd-smartcard (0.2.8) unstable; urgency=medium
 
   * sudo can authenticate against a card held by an SSH client, and doctor now

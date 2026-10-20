@@ -1633,6 +1633,212 @@ def _apply_common_flags(parser: argparse.ArgumentParser) -> None:
     _add_common_flags(parser, root=False)
 
 
+# ---------------------------------------------------------------------------
+# debug: raising the logging, and collecting what it produced
+
+
+def _write_sssd_config(args, printer, config, *, what: str) -> int:
+    """Back up, write, validate, restart -- and roll back if sssctl objects.
+
+    The same order as every other change here, for the same reason: a host must
+    never be left with an sssd.conf that SSSD will not load, least of all by the
+    command someone ran *because* something was already wrong.
+    """
+    from .backup import new_backup_set, write_atomic
+    from .sssdconf.runtime import config_check, restart_sssd
+
+    path = Path(args.config)
+    backups = new_backup_set(args.backup_dir)
+    if path.exists():
+        backups.add(path)
+    write_atomic(path, config.render(), mode=0o600)
+
+    check = config_check(args.config)
+    if check.found and not check.ok:
+        for line in backups.rollback():
+            printer.write(f"  {line}")
+        printer.status(Check("sssctl config-check", "FAIL", check.output.strip()))
+        printer.write("  rolled back; nothing was changed")
+        return 1
+
+    printer.write(f"  wrote {path} ({what})")
+    if check.found:
+        printer.write("  sssctl config-check passed")
+    restart = restart_sssd()
+    if restart.ok:
+        printer.write("  sssd restarted")
+    else:
+        printer.write(f"  sssd restart failed: {restart.output.strip()}")
+    if backups.entries:
+        printer.write(printer.dim(f"  Backups: {backups.directory}"))
+    return 0 if restart.ok else 1
+
+
+def cmd_debug_on(args, printer: Printer) -> int:
+    from .sssdconf.conf import SssdConfig
+    from .support import (
+        SSHD_DROPIN,
+        SSHD_DROPIN_BODY,
+        debug_changes,
+        sections_to_debug,
+        sshd_reload_ok,
+    )
+
+    dry_run = not args.yes if args.dry_run is None else args.dry_run
+    config = SssdConfig.load(args.config)
+    sections = sections_to_debug(config.domain_sections())
+    changes = debug_changes(sections, args.level)
+
+    printer.heading("Verbose logging")
+    for section, key, value in changes:
+        printer.write(f"  [{section}] {key} = {value}")
+    if args.sshd:
+        printer.write(f"  {SSHD_DROPIN}  (LogLevel VERBOSE)")
+
+    printer.heading("Cost")
+    printer.note(
+        f"At level {args.level} SSSD logs the full base64 of every certificate it "
+        "reads, on every authentication. On a host with real users that fills a "
+        "disk. Put it back with 'sssd-smartcard debug off' as soon as the "
+        "mechanism is confirmed -- doctor warns while it is raised."
+    )
+
+    if dry_run:
+        printer.heading("Result")
+        printer.write("  dry run: nothing was written")
+        printer.write(printer.dim("  Re-run with --yes to apply."))
+        return 0
+
+    working = config.copy()
+    for section, key, value in changes:
+        working.set(section, key, value)
+
+    printer.heading("Result")
+    rc = _write_sssd_config(args, printer, working, what=f"debug_level {args.level}")
+
+    if args.sshd and rc == 0:
+        from .backup import write_atomic
+
+        SSHD_DROPIN.parent.mkdir(parents=True, exist_ok=True)
+        write_atomic(SSHD_DROPIN, SSHD_DROPIN_BODY, mode=0o644)
+        ok, detail = sshd_reload_ok()
+        if not ok:
+            SSHD_DROPIN.unlink(missing_ok=True)
+            printer.status(Check("sshd -t", "FAIL", detail))
+            printer.write(f"  removed {SSHD_DROPIN}; sshd left alone")
+            return 1
+        reload = run(["systemctl", "reload", "ssh"], timeout=60)
+        if reload.ok:
+            printer.write(f"  wrote {SSHD_DROPIN} and reloaded ssh")
+        else:
+            printer.write(f"  wrote {SSHD_DROPIN}; reload failed: {reload.output.strip()}")
+    return rc
+
+
+def cmd_debug_off(args, printer: Printer) -> int:
+    from .sssdconf.conf import SssdConfig
+    from .support import SSHD_DROPIN, sshd_reload_ok
+
+    dry_run = not args.yes if args.dry_run is None else args.dry_run
+    config = SssdConfig.load(args.config)
+
+    removing = [s for s in config.sections() if config.get(s, "debug_level")]
+    printer.heading("Returning logging to its default")
+    if removing:
+        for section in removing:
+            printer.write(f"  [{section}] debug_level removed")
+    else:
+        printer.write("  no debug_level is set in sssd.conf")
+    if SSHD_DROPIN.exists():
+        printer.write(f"  {SSHD_DROPIN} removed")
+
+    if dry_run:
+        printer.heading("Result")
+        printer.write("  dry run: nothing was written")
+        printer.write(printer.dim("  Re-run with --yes to apply."))
+        return 0
+
+    printer.heading("Result")
+    rc = 0
+    if removing:
+        working = config.copy()
+        for section in removing:
+            working.unset(section, "debug_level")
+        rc = _write_sssd_config(args, printer, working, what="debug_level removed")
+    else:
+        printer.write("  sssd.conf unchanged")
+
+    if SSHD_DROPIN.exists():
+        SSHD_DROPIN.unlink()
+        ok, detail = sshd_reload_ok()
+        if ok:
+            reload = run(["systemctl", "reload", "ssh"], timeout=60)
+            if reload.ok:
+                printer.write(f"  removed {SSHD_DROPIN} and reloaded ssh")
+            else:
+                printer.write(f"  removed {SSHD_DROPIN}; reload failed: {reload.output.strip()}")
+        else:
+            printer.status(Check("sshd -t", "FAIL", detail))
+            rc = 1
+    return rc
+
+
+def cmd_debug_status(args, printer: Printer) -> int:
+    from .support import SSHD_DROPIN, debug_state_checks
+
+    checks = debug_state_checks(args.config)
+    if args.json:
+        return emit_json(
+            {
+                "raised": [
+                    {"name": c.name, "status": c.status, "detail": c.detail}
+                    for c in checks
+                ],
+                "sshd_dropin": str(SSHD_DROPIN) if SSHD_DROPIN.exists() else None,
+            }
+        )
+    printer.heading("Logging")
+    if not checks:
+        printer.status(Check("debug logging", "PASS", "at its default level"))
+        return 0
+    for check in checks:
+        printer.status(check)
+    return 0
+
+
+def cmd_debug_bundle(args, printer: Printer) -> int:
+    from .backup import timestamp
+    from .support import collect, write_bundle
+
+    dest = Path(args.output or f"sssd-smartcard-bundle-{timestamp()}.tar.gz")
+    printer.heading("Collecting")
+    bundle = collect()
+    for item in bundle.items:
+        line = f"  {'ok  ' if item.ok else 'FAIL'} {item.name}"
+        if item.note:
+            line += f"  -- {item.note}"
+        printer.write(line)
+
+    printer.heading("Deliberately not collected")
+    for skipped in bundle.skipped:
+        printer.write(f"  {skipped}")
+
+    path = write_bundle(bundle, dest)
+    if args.json:
+        return emit_json({"bundle": str(path), "items": len(bundle.items)})
+    printer.heading("Result")
+    printer.write(f"  wrote {path} (mode 0o600, {path.stat().st_size} bytes)")
+    printer.note(
+        "Values of options named like secrets are replaced. Certificates are "
+        "included -- they are public and they are what the bundle is for. Read "
+        "MANIFEST.txt inside before sending it anywhere."
+    )
+    return 0
+
+
+from .support import DEBUG_LEVEL as _DEBUG_LEVEL  # noqa: E402  (parser default)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="sssd-smartcard",
@@ -1931,6 +2137,36 @@ def build_parser() -> argparse.ArgumentParser:
     pam_sub = pam.add_subparsers(dest="command", required=True)
     pam_check = pam_sub.add_parser("check", help="report on pam_sss and authselect")
     pam_check.set_defaults(func=cmd_pam_check)
+
+    debug = subparsers.add_parser(
+        "debug", help="turn verbose logging on or off, and collect a bundle"
+    )
+    debug_sub = debug.add_subparsers(dest="debug_command", required=True)
+
+    dbg_on = debug_sub.add_parser("on", help="raise SSSD (and optionally sshd) logging")
+    dbg_on.add_argument("--level", type=int, default=_DEBUG_LEVEL,
+                        help=f"SSSD debug_level (default {_DEBUG_LEVEL})")
+    dbg_on.add_argument("--sshd", action="store_true",
+                        help="also raise sshd's LogLevel, through a drop-in file")
+    dbg_on.add_argument("--yes", action="store_true", help="write the changes")
+    dbg_on.add_argument("--dry-run", action="store_true", default=None)
+    dbg_on.add_argument("--backup-dir", help="where to keep backups")
+    dbg_on.set_defaults(func=cmd_debug_on)
+
+    dbg_off = debug_sub.add_parser("off", help="put logging back where it was")
+    dbg_off.add_argument("--yes", action="store_true", help="write the changes")
+    dbg_off.add_argument("--dry-run", action="store_true", default=None)
+    dbg_off.add_argument("--backup-dir", help="where to keep backups")
+    dbg_off.set_defaults(func=cmd_debug_off)
+
+    dbg_status = debug_sub.add_parser("status", help="report what is currently raised")
+    dbg_status.set_defaults(func=cmd_debug_status)
+
+    dbg_bundle = debug_sub.add_parser(
+        "bundle", help="collect configuration, logs and state into one archive"
+    )
+    dbg_bundle.add_argument("-o", "--output", help="path to write (default: a dated file in the current directory)")
+    dbg_bundle.set_defaults(func=cmd_debug_bundle)
 
     doctor = subparsers.add_parser("doctor", help="run every diagnostic")
     doctor.add_argument("--user", help="also verify this user resolves")

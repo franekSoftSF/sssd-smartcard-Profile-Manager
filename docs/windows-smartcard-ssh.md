@@ -209,6 +209,72 @@ The full command is the one from section 2 with `-A` added:
 putty.exe -x509off -A -i CAPI:<sha1-thumbprint> -l someone@ad.example.com linux-host.ad.example.com
 ```
 
+### Preloading the certificate into Pageant
+
+Requirement 1 above is tedious if it means clicking *Add CAPI Cert* before
+every session. Pageant can come up at logon with the certificate already
+loaded. Three values control this, all directly under the PuTTY root:
+
+| Value | Type | Meaning |
+|---|---|---|
+| `AutoloadCerts` | REG_DWORD | Enumerate the whole certificate store at start |
+| `SaveCertListEnabled` | REG_DWORD | Remember a list across restarts |
+| `SaveCertList` | REG_MULTI_SZ | The list; entries are `CAPI:<sha1>`, lowercase hex, no separators |
+
+The matching switches are `-autoload` / `-autoloadoff` and `-savecertlist` /
+`-savecertlistoff`. The UI label for the first is *Autoload Certs && Keys*.
+
+**The trap: `-autoload` does not mean "load the saved list".** It enumerates
+the **entire** Windows certificate store and **rewrites `SaveCertList` on every
+start**. Measured: on a test workstation it wrote **18** entries, including
+certificates whose key containers are dead (`Missing stored keyset`). Pinning
+the list to a single entry and restarting Pageant with no arguments gave **18
+again** — so trimming the list by hand is futile while `AutoloadCerts = 1`.
+
+That is not untidiness. **The agent offers keys to the server one at a time,
+and OpenSSH's default `MaxAuthTries` is 6.** With a store full of certificates
+the card's key may never be reached, and the failure surfaces as:
+
+```
+Server refused our key
+```
+
+which is the *same four words* produced by the X.509 trap in 4.2 and by a stale
+store entry in 4.3. Three unrelated causes, one message.
+
+The approach that works, verified end to end:
+
+1. Stop the store being enumerated:
+
+```
+reg add "HKCU\Software\SimonTatham\PuTTY" /v AutoloadCerts /t REG_DWORD /d 0 /f
+```
+
+2. Load the one certificate by passing it as a positional argument. Given to an
+   already-running Pageant, this adds the certificate to that agent rather than
+   starting a second one:
+
+```
+pageant.exe CAPI:<sha1-thumbprint>
+```
+
+3. Make it happen at logon with a shortcut in
+   `%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup` whose target is
+   `pageant.exe` and whose **Arguments** are `CAPI:<sha1-thumbprint>`.
+
+Afterwards `SaveCertList` stays at one entry across restarts, and `ssh-add -l`
+inside a forwarded session shows **exactly one** key — the card's, with the
+fingerprint the server derives from the certificate.
+
+The helper script prints all three commands with the thumbprint already filled
+in from the card.
+
+**One switch to leave alone unless you mean it: `-forcepincache`.** It keeps
+the card PIN in the agent's memory, so every later signature — each SSH login,
+each `sudo` over the forwarded agent — goes through with no prompt. Convenient
+for a demo, and it stops the card being a second factor for anyone who reaches
+an unlocked session. Decide that deliberately rather than by accident.
+
 ### What `-A` costs you
 
 This is the one real price of the technique, and it is worth being blunt about.
@@ -411,6 +477,7 @@ It reports each prerequisite as PASS / WARN / FAIL with a one-line remedy:
 | Key container matches the card | Trap 4.3 — the check that matters |
 | Pageant is running and serving | With `-ForwardAgent`; detected by its named pipe |
 | Saved session has agent forwarding | With `-ForwardAgent -SessionName`; reads `AgentFwd`/`TryAgent` |
+| Pageant preloads one certificate | `AutoloadCerts` and the `SaveCertList` size (section 3) |
 
 It then identifies the token family (Yubico YubiKey, HID Crescendo, or a
 generic PIV token) and the minidriver Windows has bound to it, and emits both
@@ -451,7 +518,9 @@ suppress.
 
 In rough order of likelihood:
 
-- `Server refused our key` — add `-x509off` (4.2).
+- `Server refused our key` — add `-x509off` (4.2). If it is already set, check
+  how many certificates Pageant is offering: with `AutoloadCerts = 1` the key
+  may never be reached before `MaxAuthTries` runs out (section 3).
 - `the smart card cannot perform the requested operation` — wrong store entry;
   re-read the thumbprint from the card (4.3).
 - The card PIN prompt never appears — the certificate was not found in the

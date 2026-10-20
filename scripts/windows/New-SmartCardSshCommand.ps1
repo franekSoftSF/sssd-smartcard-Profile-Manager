@@ -550,6 +550,61 @@ function Get-PuttyGlobalX509 {
     return $null
 }
 
+<#
+    Pageant's certificate-preloading configuration.
+
+    Three values, all directly under the PuTTY root (not a session key),
+    measured on the test workstation:
+
+        AutoloadCerts        REG_DWORD        enumerate the whole store at start
+        SaveCertListEnabled  REG_DWORD        remember a list across restarts
+        SaveCertList         REG_MULTI_SZ     the list, entries "CAPI:<sha1>"
+                                              with lowercase hex, no separators
+
+    All three value names, and the switches -savecertlist/-savecertlistoff,
+    -autoload/-autoloadoff, -forcepincache/-forcepincacheoff and
+    -certauthprompting/-certauthpromptingoff, were confirmed present as literals
+    in pageant.exe.
+
+    THE TRAP, and the reason this check exists:
+
+    -autoload does NOT mean "load the saved list". It enumerates the ENTIRE
+    Windows certificate store and REWRITES SaveCertList on every start. On the
+    test workstation that produced 18 entries, including certificates whose key
+    containers are dead ("Missing stored keyset"). Pinning the list to a single
+    entry and restarting Pageant with no arguments gave 18 again, so trimming
+    the list by hand is futile while AutoloadCerts = 1.
+
+    That is not a tidiness problem. The agent offers keys to the server ONE AT
+    A TIME, and OpenSSH's default MaxAuthTries is 6. With a store full of
+    certificates the right key may never be reached, and the failure surfaces
+    as "Server refused our key" -- the same four words produced by the X.509
+    trap and by a stale store entry. Three distinct causes, one message.
+#>
+function Get-PageantPreloadConfig {
+    $info = [pscustomobject]@{
+        Readable        = $false
+        AutoloadCerts   = $null
+        SaveListEnabled = $null
+        EntryCount      = $null
+    }
+    try {
+        $key = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey('Software\SimonTatham\PuTTY')
+        if (-not $key) { return $info }
+        $info.Readable = $true
+        $present = @($key.GetValueNames())
+        if ($present -contains 'AutoloadCerts') { $info.AutoloadCerts = [int] $key.GetValue('AutoloadCerts') }
+        if ($present -contains 'SaveCertListEnabled') { $info.SaveListEnabled = [int] $key.GetValue('SaveCertListEnabled') }
+        if ($present -contains 'SaveCertList') {
+            $list = $key.GetValue('SaveCertList')
+            if ($null -ne $list) { $info.EntryCount = @($list).Count }
+        }
+    } catch {
+        Write-Verbose ('could not read Pageant preload configuration: {0}' -f $_.Exception.Message)
+    }
+    return $info
+}
+
 # --------------------------------------------------------------------------
 # Card discovery
 # --------------------------------------------------------------------------
@@ -1057,6 +1112,38 @@ if ($null -eq $x509) {
     Write-Host ('  [INFO] global AuthX509 = {0} (X.509 mode ON globally -- -x509off overrides it per run)' -f $x509) -ForegroundColor Yellow
 }
 
+# Pageant's preload configuration. Checked unconditionally, not just under
+# -ForwardAgent: whenever Pageant is consulted at all (TryAgent defaults to 1)
+# an over-full SaveCertList can exhaust the server's MaxAuthTries before the
+# card's key is reached, and that failure reads as "Server refused our key".
+$preload = Get-PageantPreloadConfig
+if (-not $preload.Readable) {
+    Write-Host '  [INFO] Pageant preload configuration: unknown (PuTTY registry key unreadable)' -ForegroundColor Gray
+} else {
+    $countText = 'not set'
+    if ($null -ne $preload.EntryCount) { $countText = '{0} entr(y/ies)' -f $preload.EntryCount }
+
+    if ($preload.AutoloadCerts -eq 1) {
+        Write-Finding -Status 'WARN' -Check 'Pageant preloads one certificate, not the whole store' `
+            -Detail ('AutoloadCerts = 1: Pageant re-enumerates the ENTIRE Windows certificate store at every start and rewrites SaveCertList (currently {0}), dead key containers included' -f $countText) `
+            -Remedy 'set AutoloadCerts = 0 and preload the one certificate instead (commands printed below). Trimming SaveCertList by hand does nothing while this is 1 -- it is rebuilt on the next start'
+        Write-Host '         Why it matters: the agent offers keys ONE AT A TIME and OpenSSH''s' -ForegroundColor Yellow
+        Write-Host '         default MaxAuthTries is 6. With a full store the card''s key may' -ForegroundColor Yellow
+        Write-Host '         never be reached, and you get "Server refused our key" -- the same' -ForegroundColor Yellow
+        Write-Host '         message as the X.509 trap and as a stale store entry.' -ForegroundColor Yellow
+    } elseif ($null -eq $preload.AutoloadCerts) {
+        Write-Host ('  [INFO] Pageant preload: AutoloadCerts not set (default), SaveCertList holds {0}' -f $countText) -ForegroundColor Gray
+    } else {
+        Write-Finding -Status 'PASS' -Check 'Pageant preloads one certificate, not the whole store' `
+            -Detail ('AutoloadCerts = 0, SaveCertList holds {0}' -f $countText)
+        if ($null -ne $preload.EntryCount -and $preload.EntryCount -gt 1) {
+            Write-Host ('         Note: {0} entries are saved. The store is no longer being' -f $preload.EntryCount) -ForegroundColor Yellow
+            Write-Host '         enumerated, so trimming the list will now stick -- and with' -ForegroundColor Yellow
+            Write-Host '         MaxAuthTries at 6 it is worth trimming.' -ForegroundColor Yellow
+        }
+    }
+}
+
 $card = Get-CardCertificate
 
 if (-not $card.Available) {
@@ -1387,6 +1474,46 @@ if ($ForwardAgent) {
     Write-Host '    regardless of the key source. It is not the problem.' -ForegroundColor Gray
     Write-Host ''
 }
+# Preloading setup, parameterised by the thumbprint just discovered from the
+# card. Printed only; the script applies none of it. Pageant stores the list in
+# lowercase hex, so the commands use that form -- PuTTY-CAC's own saved value
+# and the upstream README example differ in case, which is nothing to worry
+# about, but matching what Pageant writes keeps the list from gaining a
+# duplicate entry.
+$thumbLower = $chosen.Thumbprint.ToLower()
+$pageantForCmd = 'pageant.exe'
+if ($puttyExe) { $pageantForCmd = Join-Path (Split-Path -Parent $puttyExe) 'pageant.exe' }
+$startupDir = Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs\Startup'
+
+Write-Host '  To have Pageant come up at logon with just this certificate loaded,' -ForegroundColor White
+Write-Host '  so that no "Add CAPI Cert" is needed before each session:' -ForegroundColor White
+Write-Host ''
+Write-Host '    1. Stop the store being enumerated (this is the important one):' -ForegroundColor Gray
+Write-Host '       reg add "HKCU\Software\SimonTatham\PuTTY" /v AutoloadCerts /t REG_DWORD /d 0 /f' -ForegroundColor Cyan
+Write-Host ('       (or run: {0} -autoloadoff)' -f (Format-Exe $pageantForCmd)) -ForegroundColor DarkGray
+Write-Host ''
+Write-Host '    2. Load this one certificate. Passing it to an already-running' -ForegroundColor Gray
+Write-Host '       Pageant adds it to that agent rather than starting a second one:' -ForegroundColor Gray
+Write-Host ('       {0} CAPI:{1}' -f (Format-Exe $pageantForCmd), $thumbLower) -ForegroundColor Cyan
+Write-Host ''
+Write-Host '    3. Make it happen at logon, via a Startup shortcut whose Arguments' -ForegroundColor Gray
+Write-Host '       are the CAPI: thumbprint:' -ForegroundColor Gray
+Write-Host ('       $s = (New-Object -ComObject WScript.Shell).CreateShortcut("{0}\Pageant.lnk")' -f $startupDir) -ForegroundColor Cyan
+Write-Host ('       $s.TargetPath = "{0}"' -f $pageantForCmd) -ForegroundColor Cyan
+Write-Host ('       $s.Arguments  = "CAPI:{0}"' -f $thumbLower) -ForegroundColor Cyan
+Write-Host '       $s.Save()' -ForegroundColor Cyan
+Write-Host ''
+Write-Host '    None of the above is applied by this script. Run it yourself.' -ForegroundColor DarkGray
+Write-Host '    Afterwards SaveCertList should stay at one entry across restarts,' -ForegroundColor DarkGray
+Write-Host '    and "ssh-add -l" in a forwarded session should show exactly one key.' -ForegroundColor DarkGray
+Write-Host ''
+Write-Host '  Not recommended by default: -forcepincache. It keeps the card PIN in the' -ForegroundColor Gray
+Write-Host '  agent''s memory, so every later signature -- each SSH login, each sudo over' -ForegroundColor Gray
+Write-Host '  the forwarded agent -- goes through with no prompt. Convenient for a demo,' -ForegroundColor Gray
+Write-Host '  and it stops the card being a second factor for anyone who reaches an' -ForegroundColor Gray
+Write-Host '  unlocked session. Decide deliberately, not by accident.' -ForegroundColor Gray
+Write-Host ''
+
 Write-Host '  The server needs nothing copied to it: SSSD derives the SSH public key from' -ForegroundColor Gray
 Write-Host '  the certificate and sshd fetches it through' -ForegroundColor Gray
 Write-Host '  AuthorizedKeysCommand /usr/bin/sss_ssh_authorizedkeys, so revoking the' -ForegroundColor Gray

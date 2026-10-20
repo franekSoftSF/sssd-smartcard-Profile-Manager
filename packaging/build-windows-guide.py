@@ -205,6 +205,12 @@ def convert(text: str, styles) -> list:
     i = 0
     first_heading = True
 
+    # An ordered list whose items contain fenced code blocks is emitted as
+    # several ListFlowables, because a fence ends the list. Without carrying the
+    # number across, every fragment restarts at 1. This tracks where the next
+    # fragment should resume; any heading or thematic break starts a new list.
+    next_number = 1
+
     while i < len(lines):
         line = lines[i]
         stripped = line.strip()
@@ -241,6 +247,7 @@ def convert(text: str, styles) -> list:
 
         # thematic break
         if re.match(r"^-{3,}$", stripped):
+            next_number = 1
             story.append(Spacer(1, 4))
             story.append(HRFlowable(
                 width="100%", thickness=0.5, color=colors.HexColor("#bbbbbb"),
@@ -252,6 +259,7 @@ def convert(text: str, styles) -> list:
         # headings
         m = re.match(r"^(#{1,4})\s+(.*)$", stripped)
         if m:
+            next_number = 1
             level = len(m.group(1))
             body = m.group(2)
             if level == 1 and first_heading:
@@ -312,10 +320,12 @@ def convert(text: str, styles) -> list:
                 bulletType="bullet" if is_bullet else "1",
                 bulletFontName=BODY_FONT,
                 bulletFontSize=7 if is_bullet else 9,
-                start="circle" if is_bullet else 1,
+                start="circle" if is_bullet else next_number,
                 leftIndent=12, bulletOffsetY=-1 if is_bullet else 0,
                 spaceBefore=1, spaceAfter=6,
             ))
+            if not is_bullet:
+                next_number += len(items)
             continue
 
         if stripped == "":

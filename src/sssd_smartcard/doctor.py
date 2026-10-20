@@ -492,6 +492,13 @@ def run_doctor(
     # sudo is a separate consumer of the same identity, and its two halves --
     # the nsswitch source and the package implementing it -- look configured
     # apart while doing nothing together.
+    # Verbose logging left on is not a configuration error, but it fills a
+    # disk on a host with real users, and the operator who raised it is the one
+    # who will not remember. Reported here because this is what gets run next.
+    from .support import debug_state_checks
+
+    report.add(*debug_state_checks(config_path))
+
     from .sssdconf.runtime import sudo_agent_checks, sudo_rules_checks
 
     report.add(*sudo_rules_checks())

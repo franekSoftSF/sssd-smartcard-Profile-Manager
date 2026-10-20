@@ -401,6 +401,66 @@ refused, so an unedited template cannot set your DNS to `10.0.0.10`.
 | `/var/lib/sssd-smartcard/crl-sources.json` | remembered CRL URLs per CA |
 | `/usr/share/doc/sssd-smartcard/` | this and the other documents |
 
+## Diagnostics
+
+Every failure in this project was found the same way: raise the logging,
+reproduce, read the log, put it back. These commands are that loop, with the
+putting-back made hard to forget.
+
+```bash
+sudo sssd-smartcard debug on --dry-run      # what would be raised
+sudo sssd-smartcard debug on --yes          # raise it
+sudo sssd-smartcard debug on --yes --sshd   # and sshd's LogLevel, via a drop-in
+sudo sssd-smartcard debug status            # what is raised right now
+sudo sssd-smartcard debug off --yes         # back to the default
+```
+
+`debug on` writes `debug_level` into every responder section and every domain
+section, then runs `sssctl config-check` **before** restarting SSSD, and rolls
+the file back if it objects. The sshd half is a drop-in under
+`/etc/ssh/sshd_config.d/`, validated with `sshd -t` before the reload and
+removed again by `debug off` — so turning it down is deleting a file, not
+editing the distribution's configuration.
+
+**At level 9 SSSD logs the full base64 of every certificate it reads, on every
+authentication.** On a host with real users that fills a disk. `doctor` warns
+for as long as it is raised, because the person who needed the logging is the
+one who will not remember it.
+
+### A bundle to send with a question
+
+```bash
+sudo sssd-smartcard debug bundle
+sudo sssd-smartcard debug bundle -o /tmp/case-1234.tar.gz
+```
+
+Collects the configuration, the PAM stacks, SSSD's logs, the journal for `sssd`,
+`ssh` and `sudo`, package versions, `sssctl config-check`, `sshd -T` and the
+effective sudo defaults — the set that answers *which mechanism ran*. Written
+`0600`, created that way rather than chmod-ed afterwards.
+
+What it never contains, listed in its own `MANIFEST.txt` so the reader can see
+the omissions rather than wonder:
+
+| Excluded | Why |
+|---|---|
+| `/etc/krb5.keytab` | machine credentials |
+| `/var/lib/sss/db` | the cache holds credential material when `cache_credentials` is set |
+| `*.key` under `/etc/sssd/pki` | private keys, which this tool never reads |
+| values of options named `*authtok*`, `*password*`, `*secret*`, `*passphrase*` | replaced with `<redacted>` |
+
+Matching is on the option **name**, not the value, so a password mentioned in a
+comment survives and a secret in a field this code has never heard of is still
+caught. One documented exception: `krb5_store_password_if_offline` is a boolean,
+and it is the setting that explains why the cache is excluded — hiding it would
+hide the bundle's own justification.
+
+Certificates **are** included. They are public, and a bundle without them
+cannot answer the question it was made for.
+
+Logs are truncated to the last few megabytes each: the end is where the failure
+is, the start is where the boot was.
+
 ---
 
 ## Further reading
