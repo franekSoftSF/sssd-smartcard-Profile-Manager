@@ -1,130 +1,105 @@
-# Status — 2026-10-12
+# Status — 2026-10-20
 
 End-of-session snapshot. Everything below was verified on the real lab host, not
-inferred.
+inferred. Where something was not verified, it says so.
 
 ## Where things stand
 
-**The whole chain works, end to end, and is documented.** Smart Card login,
-graphical login, a Kerberos TGT via PKINIT, and CRL revocation enforced.
+**One certificate, four surfaces.** Each confirmed by the mechanism in the log,
+never by a prompt alone — a prompt proved nothing three separate times in this
+project's history.
 
-| Step | State |
+| Surface | Evidence |
 |---|---|
-| 0–3 join, CA trust bundle | ✅ verified |
-| 4–7 certificate → profile → `sssd.conf`, mapping | ✅ verified |
-| 8 PAM, card login (`pamtester` → PIN prompt) | ✅ verified |
-| 8b home directories (`pam_mkhomedir`) | ✅ verified |
-| 9 GDM graphical login | ✅ works (username must be full UPN) |
-| 10 PKINIT / Kerberos ticket | ✅ verified, trace-confirmed |
-| 11 CRL revocation | ✅ enforced, timer running |
+| Local login | `Backend cannot handle Smartcard authentication, trying local Smartcard authentication` |
+| SSH | `Accepted key RSA … found at /usr/bin/sss_ssh_authorizedkeys:3` |
+| `sudo`, locally | PIN prompt instead of a password |
+| `sudo`, over SSH | `Running AuthorizedKeysCommand` → `ssh_rsa_verify: signature correct` |
 
-- Version **0.2.2**, **398 tests** passing
-- `dist/sssd-smartcard_0.2.2_all.deb` — sha256 `212498e40973c6eacce3f50a9634910f021ab76eb63b25bdde1aac3eddcdac80`
-- `dist/sssd-smartcard-0.2.2.tar.gz` — sha256 `a746f42eca74089d9c92e381f2e37c0dca154176d8f34ee533424393d67f2010`
+All four resolve the same key, derived by SSSD from the same certificate in AD.
+**One revocation closes all four.** That the CRL is load-bearing was proved by a
+negative test: remove the file and the prompt changes from PIN to password;
+restore it and the PIN returns.
 
-Documentation: [docs/HOW-IT-WORKS.md](docs/HOW-IT-WORKS.md) (the mechanism as it
-runs), [DEPLOY.md](DEPLOY.md) (a clean machine, step by step),
-[docs/COMMANDS.md](docs/COMMANDS.md) (every command) and
-[docs/sssd-reference.md](docs/sssd-reference.md) (every emitted option with its
-source, and the measured findings).
+- Version **0.2.9**, **580 tests** passing (1 skipped: a POSIX permission-bit
+  assertion that Windows cannot express)
+- `sssd-smartcard_0.2.9_all.deb` — sha256
+  `86a5eee44d1fd2d5a36f0795711ca9306ae3d6c11c24571b880e2e2d30a20f8d`
+- `packaging/sanitise.py --check` clean; the Windows script, guide and PDF were
+  additionally grepped by hand against 30 real identifiers, including the PDF's
+  *extracted* text
 
-`docs/TUTORIAL.md` is the record of this lab's own run. It keeps the real
-hostnames, addresses and fingerprints, so it is deliberately **not** in the
-repository and **not** in the package.
+## Tomorrow: the recording
 
-## Lab host 10.0.0.50 — final state
+Host and workstation are both in a clean, working state. Nothing needs to be
+configured before filming.
 
-```
-sssd                     active
-/etc/sssd/sssd.conf      mode 0600
-sssctl config-check      OK
-debug_level              not set (0 lines)
-sssd-smartcard-crl.timer enabled, next run 2026-10-13 00:10 CEST
-sssd-smartcard           0.2.2
-```
+Suggested order, because it builds the argument rather than listing features:
 
-Effective configuration, the four lines that make card login work plus
-revocation:
+1. **Local card login** — `pamtester -v login <user> authenticate acct_mgmt`,
+   then `doctor`. Note `acct_mgmt`: `authenticate` alone exercises only the auth
+   phase and passed on a host where every real login was refused.
+2. **Revocation enforced** — the negative test above. The strongest single
+   moment, because it shows the control working rather than asserted.
+3. **SSH with the same card** — `putty.exe -x509off -A -i CAPI:<thumbprint> -l
+   <user> <host>`, then the server log line showing the key came from AD and not
+   from any `authorized_keys` file.
+4. **`sudo` from an AD group** — `sudo -l -U <user>`. The file names a group and
+   no person; membership is managed in AD.
+5. **PIN locally vs password over SSH** — the contrast explains the model
+   better than a paragraph. Then `sudo` over the forwarded agent closes it.
 
-```ini
-[sssd]
-certificate_verification = no_ocsp, crl_file=/etc/sssd/pki/revocation.crl.pem
+The CRL timer is worth a sentence: on 2026-10-20 it refreshed the list at
+**00:02 UTC, 59 minutes before expiry**, unattended and with no card present,
+and the revoked count moved 65 → 66, so it was a real fetch rather than the same
+file rewritten.
 
-[domain/ad.example.com]
-local_auth_policy = enable:smartcard
+## Open, and honest about it
 
-[certmap/ad.example.com/AD-PIV-UPN]
-matchrule = KRB5:<ISSUER>^CN=Example Issuing CA,DC=ad,DC=example,DC=pl$<EKU>clientAuth,msScLogin<SAN:ntPrincipalName>.*@ad\.example\.pl$
-maprule = LDAP:(|(userPrincipalName={subject_nt_principal})(sAMAccountName={subject_nt_principal.short_name}))
-
-[pam]
-pam_cert_auth = True
-```
-
-`/etc/krb5.conf` additionally carries `includedir`, `pkinit_anchors`,
-`pkinit_eku_checking = kpServerAuth` and
-`pkinit_kdc_hostname = DC01.ad.example.com`.
-
-### Backups on the host
-
-| Path | What |
+| Item | State |
 |---|---|
-| `/var/lib/sssd-smartcard/backups/2026101*` | every `config apply`, newest `20261012-000941` |
-| `/root/AD-PIV-UPN.yaml.pre-crl` | profile before CRL was enabled |
-| `/root/krb5.conf.pre-pkinit-eku` | krb5.conf before the PKINIT EKU options |
-| `/root/sssd.conf.predebug` | sssd.conf before `debug_level` was raised (already reverted) |
-| `/root/pam-backup-20261011-235026` | the whole PAM stack plus the debconf selection |
+| `AutoloadCerts = 1` WARN branch in the Windows script | **untested** — needs that registry value flipped and the script re-run |
+| Stock PuTTY detection, negative side | inferred, not measured; stock PuTTY is not installed here |
+| A third-vendor PIV token, end to end | generic path unit-tested, never exercised with real hardware |
+| `MaxAuthTries` exhaustion as the cause of a refused key | asserted from OpenSSH's documented default; not reproduced |
+| `pam_ssh_agent_auth` with a third-party key service | reported without a verdict by design |
+| `krb5-pkinit`, `includedir`, anchors on this domain | not configured; `doctor` warns, nothing depends on it |
+| `dc02` | unreachable, being deprovisioned, deliberately ignored |
 
-## Open threads
+## Host state, for picking up cold
 
-1. **A revoked certificate has not been tested.** This is the one gap that
-   matters. Revocation is enabled and a *valid* certificate passes, but nothing
-   has confirmed that a *revoked* one is actually refused. The issuing CA's CRL
-   lists 5 revoked serials — a card holding one of those would close this. An
-   artificial control is possible instead.
-2. **`allow_missing_name` did not work at the GDM greeter.** The
-   `gdm-smartcard-sssd-exclusive` stack carries it, so the user should have been
-   identified from the certificate with nothing typed; the full UPN was still
-   required. Login works either way, so this is recorded as unexplained rather
-   than fixed.
-3. **PKINIT works via a client-side relaxation, not a proper fix.** `dc01`
-   presents a *Domain Controller* certificate (serverAuth + dNSName) rather than
-   a *Kerberos Authentication* one (`id-pkinit-KPKdc` + `id-pkinit-san`).
-   Reissuing it from the right template would let both `pkinit_eku_checking` and
-   `pkinit_kdc_hostname` be removed.
-4. **`fail_mode: closed`** is deliberate: an expired CRL stops every card login.
-   That is what enforcing revocation means. `revocation.fail_mode: open` emits
-   `soft_crl` and trades enforcement for availability — one line in the profile.
-5. **`pam_mkhomedir` creates homes as `0750`**, so other members of
-   `domain users` can read them. `doctor` warns; `chmod 0700` if unwanted.
-
-## The five findings worth remembering
-
-Each one is a case where a layer reported success while a layer beneath it had
-failed. All are measured and sourced in `docs/sssd-reference.md`.
-
-1. **Matching-rule components are concatenated, with no operator.** An infix
-   `" && "` makes SSSD reject the rule (`[22][Invalid argument]`), skip it, fall
-   back to its default mapping, find nobody, and drop to the password prompt.
-2. **`local_auth_policy` defaults to `match`**, and the AD provider offers no
-   local Smart Card authentication — so SSSD reads the card, verifies it, maps
-   it to a real user, and then declines. Needs `enable:smartcard`.
-3. **No home directory means a black screen**, after a completely successful
-   authentication. `fallback_homedir` only names the path.
-4. **A Kerberos ticket is not proof of PKINIT.** Without `krb5-pkinit`, `kinit`
-   ignores `-X X509_user_identity`, asks for the account password and returns a
-   valid TGT. The verdict must come from `KRB5_TRACE` showing `PA-PK-AS-REQ`.
-5. **`crl_file` needs a CRL for every CA in the chain**, concatenated into one
-   PEM. One short and no card works at all. `soft_crl` forgives expiry but never
-   absence; OCSP does not relax it; `partial_chain` combined with `crl_file`
-   breaks verification outright.
-
-## Picking this up again
-
-```bash
-sudo sssd-smartcard doctor --user testuser@ad.example.com
+```
+/etc/sssd/sssd.conf          certificate_verification = no_ocsp, crl_file=…
+                             local_auth_policy = enable:smartcard
+                             ad_gpo_access_control = permissive
+                             [certmap/…] any UPN suffix, pinned issuer + EKU
+/etc/sudoers.d/90-ad-…       %<group>@<domain> ALL=(ALL:ALL) ALL
+/etc/sudoers.d/91-ssh-…      Defaults env_keep += "SSH_AUTH_SOCK"
+/etc/pam.d/sudo              pam_ssh_agent_auth.so authorized_keys_command=…
+                             backup at /root/pam.d-sudo.20261020-204602.bak
+/etc/ssh/sshd_config.d/60-…  AuthorizedKeysCommand sss_ssh_authorizedkeys
+debug logging                off; `debug status` confirms
 ```
 
-That single command covers every layer above and is the right starting point.
-Expect no failures and one warning (`SSSD reports no trusted domains`, which is
-correct for a single-domain lab).
+`ad_gpo_access_control = permissive` is a **diagnostic, not a destination**:
+while it is set, the AD logon rights are not enforced at all. One Group Policy
+Container is unreadable by the machine account, which aborts the whole GPO list.
+The route back to `enforcing` is `gpo.ignore_unreadable`, with the cost stated —
+a skipped GPO's settings are not applied. Granting the machine account read
+access on that object in AD is the clean fix.
+
+## What today cost, and what it taught
+
+Four causes produced the identical symptom `Server refused our key`, and three
+of them were not the key: an `x509v3-ssh-rsa` offer OpenSSH does not implement,
+a certificate that was not on the card, and a username typo. The fourth —
+`MaxAuthTries` exhaustion from an over-full agent — is still only reasoned.
+
+Two things I handed over without testing, and both cost time: the sudoers
+syntax `%"group@domain"`, which is rejected as `empty group` despite the man
+page's grammar, and printing `SSH_AUTH_SOCK` wrapped in brackets, which came
+back as a shell assignment and produced a convincing false lead about socket
+permissions. The socket's mode was never the problem; `0755` is fine.
+
+Both misleading messages are now written down in `DEPLOY.md` and
+`docs/sssd-reference.md`, with the exact text each produces.
