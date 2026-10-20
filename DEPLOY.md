@@ -666,6 +666,11 @@ Host server.example.com
 
 ### Connecting from Windows
 
+`scripts/windows/New-SmartCardSshCommand.ps1` checks a Windows workstation for
+everything below and prints the command, without launching anything;
+`docs/windows-smartcard-ssh.pdf` is the same material as a handout.
+
+
 Three things cost an evening here, all measured on Windows 11 with a PIV token.
 
 **`ssh.exe` from System32 accepts `-I` and silently ignores it.** Microsoft's

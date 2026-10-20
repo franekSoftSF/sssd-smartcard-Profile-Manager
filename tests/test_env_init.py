@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import pathlib
+import os
 import subprocess
 import sys
 
@@ -20,13 +21,24 @@ import pytest
 
 ENV_PY = pathlib.Path(__file__).resolve().parent.parent / "scripts" / "lib" / "env.py"
 
+#: Decoding the child's output with locale.getpreferredencoding() measures the
+#: console code page rather than the loader: on a pl-PL Windows that is cp1250
+#: under PowerShell and UTF-8 under Git Bash, so a non-ASCII assertion passed or
+#: failed depending on which shell ran the suite. The scripts run on Linux,
+#: where the question does not arise. Pin both sides instead.
+UTF8 = {
+    "text": True,
+    "encoding": "utf-8",
+    "env": {**os.environ, "PYTHONIOENCODING": "utf-8", "PYTHONUTF8": "1"},
+}
+
 
 def init(*pairs: str) -> dict:
     result = subprocess.run(
         [sys.executable, str(ENV_PY), "--init", *pairs],
         capture_output=True,
-        text=True,
         check=False,
+        **UTF8,
     )
     assert result.returncode == 0, result.stderr
     return json.loads(result.stdout)
@@ -36,8 +48,8 @@ def init_fails(*pairs: str) -> str:
     result = subprocess.run(
         [sys.executable, str(ENV_PY), "--init", *pairs],
         capture_output=True,
-        text=True,
         check=False,
+        **UTF8,
     )
     assert result.returncode != 0
     return result.stderr
@@ -135,7 +147,7 @@ class TestLoaderAgreement:
         bools = "desktop gpo adsys crl ocsp smartcard_required"
         result = subprocess.run(
             [sys.executable, str(ENV_PY), str(path), scalars, lists, bools],
-            capture_output=True, text=True, check=False,
+            capture_output=True, check=False, **UTF8,
         )
         assert result.returncode == 0, result.stderr
         assert "ENV_DOMAIN=ad.corp.test" in result.stdout
@@ -154,7 +166,7 @@ class TestLoaderAgreement:
         result = subprocess.run(
             [sys.executable, str(ENV_PY), str(path), scalars, "dns search ca",
              "desktop gpo adsys crl ocsp smartcard_required"],
-            capture_output=True, text=True, check=False,
+            capture_output=True, check=False, **UTF8,
         )
         assert result.returncode == 0, result.stderr
 
@@ -187,7 +199,7 @@ class TestCaIsEmptyByDefault:
              "domain realm hostname join_user test_user account_domain "
              "sssd_domain desktop_package crl_file role notes",
              "dns search ca", "desktop gpo adsys crl ocsp smartcard_required"],
-            capture_output=True, text=True, check=False,
+            capture_output=True, check=False, **UTF8,
         )
         assert result.returncode == 0, result.stderr
         assert "ENV_CA=()" in result.stdout

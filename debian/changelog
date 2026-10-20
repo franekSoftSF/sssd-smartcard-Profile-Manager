@@ -1,3 +1,30 @@
+sssd-smartcard (0.2.7) unstable; urgency=medium
+
+  * A Windows-side helper, scripts/windows/New-SmartCardSshCommand.ps1, which
+    checks the workstation and prints the PuTTY command rather than running it.
+    It verifies PuTTY-CAC rather than stock PuTTY (stock has no CAPI support at
+    all), finds OpenSC, lists readers and cards, and -- the useful part --
+    compares the key container named by the certificate in the Windows store
+    against the containers actually on the card. A mismatch is what produces
+    "the smart card cannot perform the requested operation or the operation
+    requires a different smart card", and on the test machine 12 of 20 store
+    entries reported Missing stored keyset. Yubico and HID Crescendo tokens are
+    recognised by name; any other PIV token still works through a generic path
+    rather than being refused, and only the minidriver suggestion is
+    vendor-specific.
+  * docs/windows-smartcard-ssh.pdf, with packaging/build-windows-guide.py to
+    regenerate it from the Markdown source.
+  * tests/test_env_init.py pinned the encoding across its subprocess boundary.
+    Without it Python decoded the child's output with
+    locale.getpreferredencoding(), so on a pl-PL Windows the non-ASCII
+    assertion passed under Git Bash and failed under PowerShell: the test was
+    measuring the console code page, not the loader. The scripts run on Linux,
+    where the question does not arise, which is why the failure looked like a
+    product defect and was not one. 541 tests now pass under both shells; the
+    0.2.6 notes claimed 541 on the strength of one of them.
+
+ -- Szymon Frankiewicz <szymonfrankiewicz@gmail.com>  Tue, 20 Oct 2026 23:20:00 +0200
+
 sssd-smartcard (0.2.6) unstable; urgency=medium
 
   * Check that sudo would actually consult SSSD. Two halves have to agree and
