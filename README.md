@@ -450,7 +450,18 @@ python packaging/bump-version.py 0.2.4       # set it everywhere
 ```
 
 Then add a changelog entry, build, tag and publish — `bump-version.py` prints
-the exact sequence. Every change gets its own version, because `apt-get
+the exact sequence, which includes three artifacts:
+
+| Artifact | For |
+|---|---|
+| `sssd-smartcard_<v>_all.deb` | the Linux host |
+| `sssd-smartcard-<v>.tar.gz` | the whole project, source included |
+| `sssd-smartcard-windows-<v>.zip` | the Windows workstation: the helper script, the PDF guide and a README |
+
+The Windows archive exists separately because the person who needs those two
+files runs Windows and has no use for a Debian package; making them download the
+whole project to get a PowerShell script is how a script ends up being emailed
+around instead. Every change gets its own version, because `apt-get
 install` stops at *already the newest version* without unpacking anything, so
 re-releasing under one number leaves the old code installed.
 

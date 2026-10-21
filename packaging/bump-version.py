@@ -104,6 +104,8 @@ def bump(new: str) -> int:
 
     print(f"\nNow add a {new} entry at the top of {CHANGELOG}, then:")
     print("  ./packaging/build-deb.sh && ./packaging/build-tarball.sh")
+    print("  python packaging/build-windows-guide.py   # regenerate the PDF")
+    print("  python packaging/build-windows-zip.py     # the Windows-side archive")
     print(f"  git commit -am 'Release {new}' && git tag -a v{new} -m {new}")
     print(f"  git push origin main && git push origin v{new}")
     print(f"  gh release create v{new} dist/*{new}* --title '{new} — ...'")

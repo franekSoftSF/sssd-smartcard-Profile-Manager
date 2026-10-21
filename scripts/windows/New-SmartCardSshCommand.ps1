@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     Checks whether this Windows workstation can do SSH public-key authentication
     with a PIV smart card, and prints the PuTTY-CAC command line to use.
@@ -96,6 +96,24 @@
     NOTES section below. (Careful: a line inside comment-based help that begins
     with a dot and a keyword name is parsed as a new help section, which is why
     that word is bare here.)
+
+.PARAMETER Language
+    Output language: en (default) or pl.
+
+    Technical identifiers are never translated -- option names, registry paths,
+    command lines, CAPI:, and anything quoted verbatim from Windows, OpenSSH or
+    certutil. Only the prose around them changes, so a command you copy out of
+    Polish output is the same command.
+
+    A message with no Polish translation prints in English rather than blank,
+    so an English line among Polish ones means exactly that and nothing worse.
+    Run with -SelfTest to list any such gaps.
+
+.PARAMETER SelfTest
+    Check the message catalogue and exit: every message must have either a
+    Polish translation or an explicit EnglishOnly marker. Prints a per-language
+    count and the ids of anything missing. Exits 0 when the catalogue holds,
+    1 when it does not. Touches nothing else.
 
 .PARAMETER Launch
     Apply the per-user configuration this run found necessary, re-check it by
@@ -195,15 +213,1001 @@ param(
     [switch] $UseOpenSC,
     [switch] $ForwardAgent,
     [string] $SessionName,
-    [switch] $Launch
+    [switch] $Launch,
+    [ValidateSet('en', 'pl')] [string] $Language = 'en',
+    [switch] $SelfTest
 )
 
 Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Continue'
 
+# Set before anything is printed, because T reads it.
+$script:Language = $Language
+
+# Polish output needs a console that can render the diacritics. On Windows
+# PowerShell 5.1 the output encoding defaults to the OEM code page, which turns
+# them into mojibake even though the file itself is correct UTF-8. Setting the
+# console to UTF-8 is a display-only change, local to this process.
+if ($script:Language -ne 'en') {
+    try {
+        [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+    } catch {
+        Write-Verbose 'could not set the console output encoding to UTF-8'
+    }
+}
+
 # --------------------------------------------------------------------------
 # Reporting helpers
 # --------------------------------------------------------------------------
+
+# --------------------------------------------------------------------------
+# Message catalogue
+# --------------------------------------------------------------------------
+#
+# One entry per message, keyed by id, with an 'en' string and either a 'pl'
+# string or an explicit EnglishOnly marker. There is deliberately no second
+# copy of any text anywhere else in this file: every translatable line is
+# emitted through T.
+#
+# Rules that keep it honest:
+#
+#   * A missing 'pl' falls back to the English string, visibly -- an English
+#     line among Polish ones is the signal. Never a blank, never the key id.
+#   * EnglishOnly marks a message that is meant to stay English, so the
+#     self-test can tell "deliberate" from "forgotten".
+#   * Technical identifiers are NOT translated: option names, registry paths,
+#     command lines, CAPI:, and strings quoted verbatim from Windows, OpenSSH
+#     or certutil. Those stay in the format arguments or in the English text,
+#     so a command copied out of Polish output is the same command.
+#   * Values are single-line, single-quoted strings. tests/test_windows_catalogue.py
+#     parses this block to enforce the invariant, so keep the shape regular:
+#     one key per line, then en/pl/EnglishOnly one per line.
+#
+# Run with -SelfTest to check the invariant from PowerShell itself.
+
+$script:Messages = @{
+
+    # ---- banner ----------------------------------------------------------
+    'hdr.title' = @{
+        en = 'Smart card SSH readiness check (PuTTY-CAC)'
+        pl = 'Kontrola gotowości do logowania SSH kartą inteligentną (PuTTY-CAC)'
+    }
+    'hdr.platform' = @{
+        en = 'PowerShell {0} on {1}'
+        pl = 'PowerShell {0} w systemie {1}'
+    }
+    'hdr.readonly' = @{
+        en = 'Read-only: nothing is launched, downloaded, installed or modified.'
+        pl = 'Tylko odczyt: nic nie jest uruchamiane, pobierane, instalowane ani zmieniane.'
+    }
+    'hdr.launchmode' = @{
+        en = '-Launch given: configuration found necessary WILL be applied, each change reported with its undo.'
+        pl = 'Podano -Launch: potrzebne ustawienia ZOSTANA zastosowane, kazda zmiana z poleceniem cofajacym.'
+    }
+    'hdr.nokey' = @{
+        en = 'No private key is read and no PIN is requested, stored or logged.'
+        pl = 'Klucz prywatny nie jest odczytywany; PIN nie jest pobierany, zapisywany ani logowany.'
+    }
+    'hdr.noadmin1' = @{
+        en = 'The checks need no administrator rights; only the suggested'
+        pl = 'Kontrole nie wymagają uprawnień administratora; wymagają ich tylko'
+    }
+    'hdr.noadmin2' = @{
+        en = 'remedies (installing a minidriver) do.'
+        pl = 'proponowane naprawy (instalacja ministerownika).'
+    }
+
+    # ---- section titles --------------------------------------------------
+    'sec.dependencies' = @{
+        en = 'Dependencies'
+        pl = 'Zależności'
+    }
+    'sec.tokens' = @{
+        en = 'Tokens'
+        pl = 'Tokeny'
+    }
+    'sec.certificates' = @{
+        en = 'Card certificates and key containers'
+        pl = 'Certyfikaty na karcie i kontenery kluczy'
+    }
+    'sec.result' = @{
+        en = 'Result'
+        pl = 'Wynik'
+    }
+    'sec.commands' = @{
+        en = 'Commands to run on this workstation'
+        pl = 'Polecenia do uruchomienia na tej stacji roboczej'
+    }
+    'sec.applying' = @{
+        en = 'Applying (-Launch)'
+        pl = 'Stosowanie zmian (-Launch)'
+    }
+
+    # ---- checks: PuTTY-CAC ----------------------------------------------
+    'chk.putty' = @{
+        en = 'PuTTY-CAC present'
+        pl = 'PuTTY-CAC jest zainstalowany'
+    }
+    'chk.putty.absent' = @{
+        en = 'no putty.exe found in the usual install locations or on PATH'
+        pl = 'nie znaleziono putty.exe w typowych lokalizacjach instalacji ani w PATH'
+    }
+    'chk.putty.stock' = @{
+        en = 'this looks like stock PuTTY, which has no CAPI: support -- {0}'
+        pl = 'to wygląda na zwykle PuTTY, które nie obsługuje CAPI: -- {0}'
+    }
+    'chk.putty.remedy' = @{
+        en = 'install PuTTY-CAC (releases: https://github.com/NoMoreFood/putty-cac/releases)'
+        pl = 'zainstaluj PuTTY-CAC (wydania: https://github.com/NoMoreFood/putty-cac/releases)'
+    }
+    'chk.putty.remedy.path' = @{
+        en = 'install PuTTY-CAC, or pass -PuttyPath to point at an existing PuTTY-CAC install'
+        pl = 'zainstaluj PuTTY-CAC albo wskaż istniejącą instalację przez -PuttyPath'
+    }
+    'fix.putty.install' = @{
+        en = 'Install PuTTY-CAC (stock PuTTY cannot do CAPI: at all)'
+        pl = 'Zainstaluj PuTTY-CAC (zwykle PuTTY w ogóle nie obsługuje CAPI:)'
+    }
+    'fix.putty.install.stock' = @{
+        en = 'Install PuTTY-CAC (what is installed is stock PuTTY, which has no CAPI: support)'
+        pl = 'Zainstaluj PuTTY-CAC (zainstalowane jest zwykle PuTTY, bez obsługi CAPI:)'
+    }
+    'putty.detectedvia' = @{
+        en = 'detected via: {0}'
+        pl = 'rozpoznano przez: {0}'
+    }
+    'putty.probe' = @{
+        en = 'plink -x509off probe: {0}'
+        pl = 'test plink -x509off: {0}'
+    }
+
+    # ---- checks: OpenSC --------------------------------------------------
+    'chk.opensc' = @{
+        en = 'OpenSC present (optional)'
+        pl = 'OpenSC jest zainstalowany (opcjonalnie)'
+    }
+    'chk.opensc.found' = @{
+        en = 'pkcs11-tool.exe and opensc-tool.exe found under {0}'
+        pl = 'znaleziono pkcs11-tool.exe i opensc-tool.exe w {0}'
+    }
+    'chk.opensc.partial' = @{
+        en = 'only part of the OpenSC toolset was found'
+        pl = 'znaleziono tylko część narzędzi OpenSC'
+    }
+    'chk.opensc.absent' = @{
+        en = 'pkcs11-tool.exe / opensc-tool.exe not found'
+        pl = 'nie znaleziono pkcs11-tool.exe ani opensc-tool.exe'
+    }
+    'chk.opensc.remedy' = @{
+        en = 'only needed to read the thumbprint straight off the card; certutil can usually do it alone'
+        pl = 'potrzebne tylko do odczytu odcisku bezpośrednio z karty; zwykle wystarcza samo certutil'
+    }
+    'fix.opensc.install' = @{
+        en = 'Install OpenSC, to read the certificate off the card'
+        pl = 'Zainstaluj OpenSC, aby odczytać certyfikat z karty'
+    }
+
+    # ---- checks: Pageant -------------------------------------------------
+    'chk.pageant' = @{
+        en = 'Pageant is running and serving'
+        pl = 'Pageant działa i obsługuje żądania'
+    }
+    'chk.pageant.detail' = @{
+        en = '{0}  [{1}]'
+        pl = '{0}  [{1}]'
+    }
+    'chk.pageant.remedy' = @{
+        en = 'start Pageant and load the card certificate into it before connecting: "{0}"'
+        pl = 'uruchom Pageant i wczytaj do niego certyfikat karty przed połączeniem: "{0}"'
+    }
+    'pageant.process' = @{
+        en = 'process: {0}'
+        pl = 'proces: {0}'
+    }
+    'pageant.attime1' = @{
+        en = 'Pageant must already be running with the certificate loaded'
+        pl = 'Pageant musi już działać z wczytanym certyfikatem'
+    }
+    'pageant.attime2' = @{
+        en = 'AT CONNECT TIME. Adding it to Pageant after the session is up'
+        pl = 'W MOMENCIE POŁĄCZENIA. Dodanie go do Pageanta po zestawieniu sesji'
+    }
+    'pageant.attime3' = @{
+        en = 'does not retrofit agent forwarding onto that session.'
+        pl = 'nie włączy przekazywania agenta w tej sesji.'
+    }
+    'fix.pageant.start' = @{
+        en = 'Start Pageant with the card certificate loaded'
+        pl = 'Uruchom Pageant z wczytanym certyfikatem karty'
+    }
+
+    # ---- checks: session agent forwarding --------------------------------
+    'chk.session' = @{
+        en = 'Saved session has agent forwarding enabled'
+        pl = 'Zapisana sesja ma włączone przekazywanie agenta'
+    }
+    'chk.session.nonamegiven' = @{
+        en = 'no -SessionName given, so the per-session AgentFwd/TryAgent values cannot be read'
+        pl = 'nie podano -SessionName, więc nie można odczytać wartości AgentFwd/TryAgent dla sesji'
+    }
+    'chk.session.nonamegiven.remedy' = @{
+        en = 'pass -SessionName <saved session> to have them checked, or tick Connection > SSH > Auth > "Allow agent forwarding" in the PuTTY UI'
+        pl = 'podaj -SessionName <zapisana sesja>, aby je sprawdzic, albo zaznacz Connection > SSH > Auth > "Allow agent forwarding" w oknie PuTTY'
+    }
+    'chk.session.notfound' = @{
+        en = 'no saved session named "{0}"; saved sessions are: {1}'
+        pl = 'brak zapisanej sesji o nazwie "{0}"; zapisane sesję to: {1}'
+    }
+    'chk.session.notfound.remedy' = @{
+        en = 'save the session in PuTTY first, or pass -SessionName exactly as PuTTY lists it'
+        pl = 'najpierw zapisz sesję w PuTTY albo podaj -SessionName dokładnie tak, jak wyświetla ją PuTTY'
+    }
+    'chk.session.ok' = @{
+        en = 'session "{0}": AgentFwd={1}, TryAgent={2}'
+        pl = 'sesja "{0}": AgentFwd={1}, TryAgent={2}'
+    }
+    'chk.session.bad' = @{
+        en = 'session "{0}": {1}'
+        pl = 'sesja "{0}": {1}'
+    }
+    'chk.session.bad.fwd' = @{
+        en = 'AgentFwd={0} (agent forwarding off)'
+        pl = 'AgentFwd={0} (przekazywanie agenta wyłączone)'
+    }
+    'chk.session.bad.try' = @{
+        en = 'TryAgent={0} (Pageant not consulted at all)'
+        pl = 'TryAgent={0} (Pageant w ogóle nie jest uzywany)'
+    }
+    'chk.session.bad.remedy' = @{
+        en = 'either tick Connection > SSH > Auth > "Allow agent forwarding" and re-save the session, or set the values directly (commands below)'
+        pl = 'zaznacz Connection > SSH > Auth > "Allow agent forwarding" i zapisz sesję ponownie albo ustaw wartości bezpośrednio (polecenia niżej)'
+    }
+    'fix.session.agentfwd' = @{
+        en = 'Enable agent forwarding on the saved session "{0}"'
+        pl = 'Włącz przekazywanie agenta w zapisanej sesji "{0}"'
+    }
+    'session.nothingunless' = @{
+        en = '(the script changes nothing unless -Launch is given)'
+        pl = '(skrypt niczego nie zmienia, o ile nie podano -Launch)'
+    }
+    'session.anote1' = @{
+        en = 'Note: -A on the command line covers this run regardless of AgentFwd;'
+        pl = 'Uwaga: -A w wierszu poleceń działa w tym uruchomieniu niezależnie od AgentFwd;'
+    }
+    'session.anote2' = @{
+        en = 'the saved value matters when the session is launched from the UI.'
+        pl = 'zapisana wartosc ma znaczenie przy uruchamianiu sesji z okna PuTTY.'
+    }
+    'session.narrowed' = @{
+        en = 'Narrowed to one token by -Reader "{0}".'
+        pl = 'Zawężono do jednego tokena przez -Reader "{0}".'
+    }
+
+    # ---- checks: X.509 and Pageant preload -------------------------------
+    'x509.unset' = @{
+        en = 'global AuthX509: not set (PuTTY-CAC default)'
+        pl = 'globalne AuthX509: nieustawione (domyslnie w PuTTY-CAC)'
+    }
+    'x509.off' = @{
+        en = 'global AuthX509 = 0 (X.509 mode off, which is what you want)'
+        pl = 'globalne AuthX509 = 0 (tryb X.509 wyłączony, i o to chodzi)'
+    }
+    'x509.on' = @{
+        en = 'global AuthX509 = {0} (X.509 mode ON globally -- -x509off overrides it per run)'
+        pl = 'globalne AuthX509 = {0} (tryb X.509 WŁĄCZONY globalnie -- -x509off wyłącza go na jedno uruchomienie)'
+    }
+    'chk.preload' = @{
+        en = 'Pageant preloads one certificate, not the whole store'
+        pl = 'Pageant wczytuje jeden certyfikat, a nie cały magazyn'
+    }
+    'chk.preload.unknown' = @{
+        en = 'Pageant preload configuration: unknown (PuTTY registry key unreadable)'
+        pl = 'Konfiguracja wczytywania w Pageancie: nieznana (nie można odczytać klucza rejestru PuTTY)'
+    }
+    'chk.preload.autoload' = @{
+        en = 'AutoloadCerts = 1: Pageant re-enumerates the ENTIRE Windows certificate store at every start and rewrites SaveCertList (currently {0}), dead key containers included'
+        pl = 'AutoloadCerts = 1: Pageant przy każdym starcie przegląda CAŁY magazyn certyfikatów Windows i nadpisuje SaveCertList (obecnie {0}), razem z martwymi kontenerami kluczy'
+    }
+    'chk.preload.autoload.remedy' = @{
+        en = 'set AutoloadCerts = 0 and preload the one certificate instead. Trimming SaveCertList by hand does nothing while this is 1 -- it is rebuilt on the next start'
+        pl = 'ustaw AutoloadCerts = 0 i wczytuj tylko jeden certyfikat. Ręczne skracanie SaveCertList nic nie daje, dopóki jest 1 -- lista jest odbudowywana przy kolejnym starcie'
+    }
+    'chk.preload.ok' = @{
+        en = 'AutoloadCerts = 0, SaveCertList holds {0}'
+        pl = 'AutoloadCerts = 0, SaveCertList zawiera {0}'
+    }
+    'chk.preload.default' = @{
+        en = 'Pageant preload: AutoloadCerts not set (default), SaveCertList holds {0}'
+        pl = 'Wczytywanie w Pageancie: AutoloadCerts nieustawione (domyslnie), SaveCertList zawiera {0}'
+    }
+    'preload.entries' = @{
+        en = '{0} entr(y/ies)'
+        pl = 'wpisów: {0}'
+    }
+    'preload.notset' = @{
+        en = 'not set'
+        pl = 'nieustawione'
+    }
+    'preload.maxauth1' = @{
+        en = 'Why it matters: the agent offers keys ONE AT A TIME and OpenSSH''s'
+        pl = 'Dlaczego to ważne: agent podaje klucze PO JEDNYM, a domyslne'
+    }
+    'preload.maxauth2' = @{
+        en = 'default MaxAuthTries is 6. With a full store the card''s key may'
+        pl = 'MaxAuthTries w OpenSSH wynosi 6. Przy pełnym magazynie klucz karty'
+    }
+    'preload.maxauth3' = @{
+        en = 'never be reached, and you get "Server refused our key" -- the same'
+        pl = 'może nigdy nie zostać użyty, a komunikat brzmi "Server refused our key"'
+    }
+    'preload.maxauth4' = @{
+        en = 'message as the X.509 trap and as a stale store entry.'
+        pl = '-- tak samo jak przy pułapce X.509 i przy nieaktualnym wpisie magazynu.'
+    }
+    'preload.trim1' = @{
+        en = 'Note: {0} entries are saved. The store is no longer being'
+        pl = 'Uwaga: zapisanych wpisów: {0}. Magazyn nie jest już przeglądany,'
+    }
+    'preload.trim2' = @{
+        en = 'enumerated, so trimming the list will now stick -- and with'
+        pl = 'więc skrócenie listy tym razem się utrzyma -- a przy'
+    }
+    'preload.trim3' = @{
+        en = 'MaxAuthTries at 6 it is worth trimming.'
+        pl = 'MaxAuthTries równym 6 warto ją skrócić.'
+    }
+    'fix.preload.autoload' = @{
+        en = 'Stop Pageant enumerating the whole certificate store (MaxAuthTries)'
+        pl = 'Przestań przeglądać cały magazyn certyfikatów w Pageancie (MaxAuthTries)'
+    }
+    'fix.startup.shortcut' = @{
+        en = 'Load the certificate into Pageant at every logon'
+        pl = 'Wczytuj certyfikat do Pageanta przy każdym logowaniu'
+    }
+    'fix.startup.shortcut.note' = @{
+        en = 'One line, so it pastes as a single unit. Replaces any existing Pageant shortcut in Startup; -Launch keeps a .bak of the old one.'
+        pl = 'Jedna linia, więc wkleja się w całości. Zastępuje istniejący skrot Pageanta w Autostarcie; -Launch zachowuje kopie .bak poprzedniego.'
+    }
+
+    # ---- checks: reader and card -----------------------------------------
+    'chk.reader' = @{
+        en = 'Reader and card present'
+        pl = 'Czytnik i karta są obecne'
+    }
+    'chk.reader.nooutput' = @{
+        en = 'certutil -scinfo produced no output'
+        pl = 'certutil -scinfo nie zwrocil żadnych danych'
+    }
+    'chk.reader.nooutput.remedy' = @{
+        en = 'check that the Smart Card service (SCardSvr) is running and a reader is attached'
+        pl = 'sprawdź, czy usługa kart inteligentnych (SCardSvr) działa i czy czytnik jest podłączony'
+    }
+    'chk.reader.noreaders' = @{
+        en = 'no smart card readers reported'
+        pl = 'nie zgłoszono żadnego czytnika kart inteligentnych'
+    }
+    'chk.reader.noreaders.remedy' = @{
+        en = 'attach a reader or token, then re-run'
+        pl = 'podlacz czytnik lub token i uruchom ponownie'
+    }
+    'chk.reader.nocard' = @{
+        en = '{0} reader(s) present but none holds a card'
+        pl = 'czytników: {0}, ale w zadnym nie ma karty'
+    }
+    'chk.reader.nocard.remedy' = @{
+        en = 'insert the token or card, then re-run'
+        pl = 'włóż token lub kartę i uruchom ponownie'
+    }
+    'chk.reader.ok' = @{
+        en = '{0} of {1} reader(s) hold a card: {2}'
+        pl = 'kartę zawiera {0} z {1} czytników: {2}'
+    }
+    'reader.list' = @{
+        en = 'readers: {0}'
+        pl = 'czytniki: {0}'
+    }
+    'reader.empty' = @{
+        en = 'empty: {0}'
+        pl = 'puste: {0}'
+    }
+    'tokens.minidriver.unknown' = @{
+        en = 'Bound minidriver: unknown (Get-PnpDevice unavailable on this host)'
+        pl = 'Powiązany ministerownik: nieznany (Get-PnpDevice niedostępne na tym hoście)'
+    }
+    'tokens.minidriver.none' = @{
+        en = 'Bound minidriver: none reported for a present card'
+        pl = 'Powiązany ministerownik: brak zgłoszonego dla obecnej karty'
+    }
+    'tokens.none' = @{
+        en = 'No tokens to classify.'
+        pl = 'Brak tokenów do sklasyfikowania.'
+    }
+    'tokens.multiple1' = @{
+        en = '{0} tokens are attached at once. The script will not pick one for you.'
+        pl = 'Podłączono jednoczesnie tokenów: {0}. Skrypt nie wybierze za Ciebie.'
+    }
+    'tokens.multiple2' = @{
+        en = 'Narrow the choice with -Reader <text> or -Thumbprint <sha1> if the'
+        pl = 'Zawęź wybór przez -Reader <tekst> lub -Thumbprint <sha1>, jeśli poniższe'
+    }
+    'tokens.multiple3' = @{
+        en = 'checks below leave more than one usable certificate.'
+        pl = 'kontrole zostawia więcej niż jeden użyteczny certyfikat.'
+    }
+    'tokens.readernotmatched' = @{
+        en = 'No reader name contains "{0}"; showing all readers.'
+        pl = 'Żadna nazwa czytnika nie zawiera "{0}"; pokazano wszystkie czytniki.'
+    }
+    'token.generic' = @{
+        en = 'PIV token (vendor not recognised)'
+        pl = 'Token PIV (nierozpoznany producent)'
+    }
+    'minidriver.inbox' = @{
+        en = 'Windows inbox PIV minidriver (msclmd.inf)'
+        pl = 'wbudowany ministerownik PIV systemu Windows (msclmd.inf)'
+    }
+    'minidriver.none' = @{
+        en = 'no minidriver bound (scunknown.inf)'
+        pl = 'brak powiazanego ministerownika (scunknown.inf)'
+    }
+    'minidriver.vendor' = @{
+        en = 'vendor minidriver ({0})'
+        pl = 'ministerownik producenta ({0})'
+    }
+    'minidriver.other' = @{
+        en = 'minidriver {0}'
+        pl = 'ministerownik {0}'
+    }
+    'minidriver.unknown' = @{
+        en = 'unknown'
+        pl = 'nieznany'
+    }
+
+    # ---- certificates ----------------------------------------------------
+    'cert.heading' = @{
+        en = 'Certificate {0}'
+        pl = 'Certyfikat {0}'
+    }
+    'cert.reader' = @{
+        en = 'reader:         {0}'
+        pl = 'czytnik:        {0}'
+    }
+    'cert.source' = @{
+        en = 'read from:      {0}'
+        pl = 'odczytano z:    {0}'
+    }
+    'cert.containercard' = @{
+        en = 'container on card:  {0}'
+        pl = 'kontener na karcie: {0}'
+    }
+    'cert.containercard.unknown' = @{
+        en = 'container on card:  unknown'
+        pl = 'kontener na karcie: nieznany'
+    }
+    'cert.containerstore' = @{
+        en = 'container in store: {0}'
+        pl = 'kontener w magazynie: {0}'
+    }
+    'cert.containerstore.unknown' = @{
+        en = 'container in store: unknown'
+        pl = 'kontener w magazynie: nieznany'
+    }
+    'cert.filtered' = @{
+        en = 'Filtered to readers matching "{0}": {1} candidate(s)'
+        pl = 'Zawężono do czytników pasujących do "{0}": kandydatów: {1}'
+    }
+    'chk.cert.none' = @{
+        en = 'A usable card certificate was found'
+        pl = 'Znaleziono użyteczny certyfikat na karcie'
+    }
+    'chk.cert.none.detail' = @{
+        en = 'no certificate could be read from any card'
+        pl = 'nie udało się odczytać certyfikatu z żadnej karty'
+    }
+    'chk.cert.none.remedy' = @{
+        en = 'the card may not be provisioned, or its minidriver may be missing -- see below'
+        pl = 'karta może nie być zainicjowana albo brakuje jej ministerownika -- patrz niżej'
+    }
+    'chk.cert.instore' = @{
+        en = '{0}: present in the user certificate store'
+        pl = '{0}: obecny w magazynie certyfikatów użytkownika'
+    }
+    'chk.cert.instore.detail' = @{
+        en = 'the certificate is on the card but not in Cert:\CurrentUser\My'
+        pl = 'certyfikat jest na karcie, ale nie ma go w Cert:\CurrentUser\My'
+    }
+    'chk.cert.instore.remedy' = @{
+        en = 'CAPI: addressing reads the store, so the certificate has to be registered there'
+        pl = 'adresowanie CAPI: czyta magazyn, więc certyfikat musi być tam zarejestrowany'
+    }
+    'fix.cert.reinsert' = @{
+        en = 'Re-insert the token, then re-run -- certificate {0} is on the card but not in the store'
+        pl = 'Wyjmij i włóż token ponownie, potem uruchom skrypt jeszcze raz -- certyfikat {0} jest na karcie, ale nie w magazynie'
+    }
+    'fix.cert.reinsert.note' = @{
+        en = 'The propagation service only registers card certificates on an insertion event, so a certificate written to a card that was already in the reader is never seen. Unplug the token, plug it back in, and run this script again. The two steps that follow are only needed if that does not fix it.'
+        pl = 'Usługa propagacji rejestruje certyfikaty karty tylko przy zdarzeniu włożenia, więc certyfikat zapisany na karcie już obecnej w czytniku nigdy nie zostanie zauważony. Wyjmij token, włóż go ponownie i uruchom skrypt jeszcze raz. Dwa kolejne kroki są potrzebne tylko wtedy, gdy to nie pomoże.'
+    }
+    'fix.cert.addstore' = @{
+        en = 'Only if re-inserting did not work: add certificate {0} to the store'
+        pl = 'Tylko jeśli ponowne wlozenie nie pomogło: dodaj certyfikat {0} do magazynu'
+    }
+    'fix.cert.addstore.note' = @{
+        en = 'Read the certificate off the card first -- see -UseOpenSC, which prints the pkcs11-tool command that writes it to a .der file.'
+        pl = 'Najpierw odczytaj certyfikat z karty -- zobacz -UseOpenSC, które wypisuje polecenie pkcs11-tool zapisujące go do pliku .der.'
+    }
+    'fix.cert.repair' = @{
+        en = 'Only if re-inserting did not work: bind {0} to the key on the card'
+        pl = 'Tylko jeśli ponowne wlozenie nie pomogło: powiąż {0} z kluczem na karcie'
+    }
+    'fix.cert.repair.note' = @{
+        en = '"Encryption test passed" in the output means the binding took. The CSP below is the one -scinfo reported for this card; a wrong CSP fails in a way that looks like a bad card.'
+        pl = 'Napis "Encryption test passed" w wyniku oznacza, że powiązanie się udało. Poniższy CSP to ten, który -scinfo zgłosił dla tej karty; błędny CSP kończy się błędem wyglądającym jak uszkodzona karta.'
+    }
+    'chk.cert.keyset' = @{
+        en = '{0}: key container resolves'
+        pl = '{0}: kontener klucza daje się otworzyć'
+    }
+    'chk.cert.keyset.detail' = @{
+        en = 'certutil reports "Missing stored keyset" -- the store entry names a key container that cannot be opened'
+        pl = 'certutil zgłasza "Missing stored keyset" -- wpis magazynu wskazuje kontener klucza, którego nie można otworzyć'
+    }
+    'chk.cert.keyset.remedy' = @{
+        en = 'this certificate is unusable; pick another, or delete the stale store entry and re-register the card certificate'
+        pl = 'ten certyfikat jest bezużyteczny; wybierz inny albo usuń nieaktualny wpis i zarejestruj certyfikat karty ponownie'
+    }
+    'fix.cert.rebind' = @{
+        en = 'Re-bind store entry {0} to the key on the card'
+        pl = 'Powiąż ponownie wpis magazynu {0} z kluczem na karcie'
+    }
+    'fix.cert.rebind.note' = @{
+        en = '"Encryption test passed" in the output means the binding took. If it still fails the certificate belongs to a card that is not here -- pick another, or delete the entry with "certutil -user -delstore My <thumbprint>".'
+        pl = 'Napis "Encryption test passed" w wyniku oznacza, że powiązanie się udało. Jeśli nadal się nie udaje, certyfikat należy do karty, ktorej tu nie ma -- wybierz inny albo usuń wpis poleceniem "certutil -user -delstore My <thumbprint>".'
+    }
+    'chk.cert.container' = @{
+        en = '{0}: key container matches the card'
+        pl = '{0}: kontener klucza zgadza się z kartą'
+    }
+    'chk.cert.container.unknown' = @{
+        en = 'could not read one or both container names, so the comparison is unknown'
+        pl = 'nie udało się odczytać jednej lub obu nazw kontenerow, więc porównanie jest nieznane'
+    }
+    'chk.cert.container.unknown.remedy' = @{
+        en = 'run "certutil -scinfo -silent" and "certutil -silent -user -store My <thumbprint>" by hand and compare the Key Container lines'
+        pl = 'uruchom ręcznie "certutil -scinfo -silent" oraz "certutil -silent -user -store My <thumbprint>" i porównaj linie Key Container'
+    }
+    'chk.cert.container.ok' = @{
+        en = 'store and card both name {0}'
+        pl = 'magazyn i karta wskazują ten sam: {0}'
+    }
+    'chk.cert.container.bad' = @{
+        en = 'store names {0}, but the card holds {1}'
+        pl = 'magazyn wskazuje {0}, a karta zawiera {1}'
+    }
+    'chk.cert.container.bad.remedy' = @{
+        en = 'this store entry belongs to a different (probably older) card; Windows will say the smart card cannot perform the requested operation. Delete the stale entry or pick the certificate whose container is on this card'
+        pl = 'ten wpis magazynu należy do innej (zapewne starszej) karty; Windows powie, że karta nie może wykonać żądanej operacji. Usuń nieaktualny wpis albo wybierz certyfikat, którego kontener jest na tej karcie'
+    }
+    'store.count1' = @{
+        en = 'The user certificate store holds {0} entr(y/ies).'
+        pl = 'Magazyn certyfikatów użytkownika zawiera wpisów: {0}.'
+    }
+    'store.count2' = @{
+        en = 'Stale smart card entries are normal and harmless until one is picked'
+        pl = 'Nieaktualne wpisy kart są normalne i nieszkodliwe, dopóki któregoś'
+    }
+    'store.count3' = @{
+        en = 'by mistake; always take the thumbprint from the card, as above.'
+        pl = 'nie wybierze się przez pomyłkę; odcisk zawsze bierz z karty, jak wyżej.'
+    }
+    'opensc.agrees' = @{
+        en = 'OpenSC agrees with certutil on {0} ({1})'
+        pl = 'OpenSC zgadza się z certutil co do {0} ({1})'
+    }
+    'opensc.extra' = @{
+        en = 'OpenSC found a certificate certutil did not report: {0} ({1})'
+        pl = 'OpenSC znalazł certyfikat, którego certutil nie zgłosił: {0} ({1})'
+    }
+
+    # ---- result ----------------------------------------------------------
+    'result.nocert' = @{
+        en = 'No usable card certificate, so no command is emitted.'
+        pl = 'Brak uzytecznego certyfikatu na karcie, więc nie wypisano polecenia.'
+    }
+    'result.pertoken' = @{
+        en = 'More than one token is attached, so the advice below is given per token.'
+        pl = 'Podłączono więcej niż jeden token, więc poniższe wskazówki podano dla każdego osobno.'
+    }
+    'result.readoff1' = @{
+        en = 'To read the certificates straight off the card, independently of the'
+        pl = 'Aby odczytać certyfikaty bezpośrednio z karty, niezależnie od'
+    }
+    'result.readoff2' = @{
+        en = 'Windows store, re-run this script with -UseOpenSC, or by hand:'
+        pl = 'magazynu Windows, uruchom skrypt z -UseOpenSC albo ręcznie:'
+    }
+    'result.ambiguous1' = @{
+        en = '{0} usable certificates were found. Choose one -- the script will not'
+        pl = 'Znaleziono użytecznych certyfikatów: {0}. Wybierz jeden -- skrypt nie'
+    }
+    'result.ambiguous2' = @{
+        en = 'choose for you:'
+        pl = 'wybierze za Ciebie:'
+    }
+    'result.ambiguous3' = @{
+        en = 'Re-run with -Thumbprint <sha1>, or -Reader <text> to narrow by reader.'
+        pl = 'Uruchom ponownie z -Thumbprint <sha1> albo -Reader <tekst>, aby zawezic po czytniku.'
+    }
+    'result.ambiguous.reader' = @{
+        en = '-Thumbprint {0}    (reader: {1})'
+        pl = '-Thumbprint {0}    (czytnik: {1})'
+    }
+    'fix.rerun' = @{
+        en = 'Re-run this script once the steps above are done'
+        pl = 'Uruchom ten skrypt ponownie po wykonaniu powyższych kroków'
+    }
+    'fix.rerun.named' = @{
+        en = 'Re-run naming the certificate you want'
+        pl = 'Uruchom ponownie, wskazując wybrany certyfikat'
+    }
+    'fix.rerun.named.note' = @{
+        en = 'The thumbprint above is the first of the usable certificates listed; substitute whichever one you mean.'
+        pl = 'Powyższy odcisk to pierwszy z wypisanych użytecznych certyfikatów; podstaw ten, o który Ci chodzi.'
+    }
+    'result.allpass' = @{
+        en = 'All checks passed. Run this yourself -- the script does not launch it.'
+        pl = 'Wszystkie kontrole zaliczone. Uruchom to samodzielnie -- skrypt tego nie robi.'
+    }
+    'result.allpass.launch' = @{
+        en = 'All checks passed. -Launch will apply what is needed and then connect.'
+        pl = 'Wszystkie kontrole zaliczone. -Launch zastosuje potrzebne zmiany i polaczy się.'
+    }
+    'result.interactive' = @{
+        en = 'Interactive (PuTTY window):'
+        pl = 'Interaktywnie (okno PuTTY):'
+    }
+    'result.scripted' = @{
+        en = 'Scripted / batch (plink, no interactive prompts):'
+        pl = 'Skryptowo / wsadowo (plink, bez pytań interaktywnych):'
+    }
+    'result.placeholder1' = @{
+        en = 'NOTE: -User and/or -ComputerName were not given, so the command above'
+        pl = 'UWAGA: nie podano -User i/lub -ComputerName, więc powyższe polecenie'
+    }
+    'result.placeholder2' = @{
+        en = 'contains example values. Re-run with your own, e.g.'
+        pl = 'zawiera wartości przykładowe. Uruchom ponownie z własnymi, np.'
+    }
+
+    # ---- command block ---------------------------------------------------
+    'block.nothingtofix' = @{
+        en = 'Every check passed: there is nothing to fix on this workstation.'
+        pl = 'Wszystkie kontrole zaliczone: na tej stacji nie ma nic do poprawienia.'
+    }
+    'block.copyrun' = @{
+        en = 'Nothing below has been applied. Copy and run these yourself, in order.'
+        pl = 'Nic poniższego nie zostało zastosowane. Skopiuj i uruchom samodzielnie, po kolei.'
+    }
+    'block.unit' = @{
+        en = '(these lines are one unit -- paste them in together)'
+        pl = '(te linie stanowią calosc -- wklej je razem)'
+    }
+    'block.separate' = @{
+        en = '(separate commands; run them in this order)'
+        pl = '(osobne polecenia; uruchom je w tej kolejności)'
+    }
+    'block.connect' = @{
+        en = 'Connect'
+        pl = 'Połącz się'
+    }
+
+    # ---- -Launch ---------------------------------------------------------
+    'launch.stopinstall' = @{
+        en = 'Stopping before any change: something has to be installed first.'
+        pl = 'Zatrzymano przed jakąkolwiek zmianą: najpierw trzeba cos zainstalować.'
+    }
+    'launch.noinstall1' = @{
+        en = '-Launch configures what is already on this machine; it does not install'
+        pl = '-Launch konfiguruje to, co już jest na tej maszynie; nie instaluje'
+    }
+    'launch.noinstall2' = @{
+        en = 'software, because that downloads, usually needs elevation, and changes'
+        pl = 'oprogramowania, bo to pobieranie, zwykle z podniesieniem uprawnień, i zmienia'
+    }
+    'launch.noinstall3' = @{
+        en = 'the machine rather than your configuration.'
+        pl = 'maszynę, a nie Twoją konfigurację.'
+    }
+    'launch.installthenrerun' = @{
+        en = 'Install the above, then re-run. NOTHING HAS BEEN CHANGED.'
+        pl = 'Zainstaluj powyższe i uruchom ponownie. NICZEGO NIE ZMIENIONO.'
+    }
+    'launch.nothingtoapply' = @{
+        en = 'Nothing to apply: this workstation is already configured.'
+        pl = 'Nie ma czego stosowac: ta stacja jest już skonfigurowana.'
+    }
+    'launch.skip' = @{
+        en = '[SKIP] {0}'
+        pl = '[POMIŃ] {0}'
+    }
+    'launch.skip.why1' = @{
+        en = 'Cannot be applied automatically -- it needs a decision or a'
+        pl = 'Nie można zastosować automatycznie -- wymaga decyzji albo pliku,'
+    }
+    'launch.skip.why2' = @{
+        en = 'file this script will not invent. Run it yourself:'
+        pl = 'którego skrypt nie wymyśli. Uruchom to samodzielnie:'
+    }
+    'launch.done' = @{
+        en = '[DONE] {0}'
+        pl = '[ZROBIONE] {0}'
+    }
+    'launch.fail' = @{
+        en = '[FAIL] {0}'
+        pl = '[BŁĄD] {0}'
+    }
+    'launch.undo' = @{
+        en = 'undo: {0}'
+        pl = 'cofnięcie: {0}'
+    }
+    'launch.noresult' = @{
+        en = 'no result returned'
+        pl = 'nie zwrócono wyniku'
+    }
+    'launch.denied1' = @{
+        en = 'If this says access is denied, it needs rights the checks do not'
+        pl = 'Jeśli to błąd odmowy dostępu, potrzebne są uprawnienia, których kontrole'
+    }
+    'launch.denied2' = @{
+        en = 'assume. Nothing is retried with elevation.'
+        pl = 'nie zakładają. Nic nie jest ponawiane z podniesieniem uprawnień.'
+    }
+    'launch.failedcount' = @{
+        en = '{0} step(s) did not complete, so no connection is started.'
+        pl = 'Nieukończonych kroków: {0}, więc połączenie nie jest nawiązywane.'
+    }
+    'launch.fixthose' = @{
+        en = 'Fix those and re-run, or run the printed commands yourself.'
+        pl = 'Napraw je i uruchom ponownie albo wykonaj wypisane polecenia samodzielnie.'
+    }
+    'launch.rechecking' = @{
+        en = 'Re-checking the applied state by reading it back...'
+        pl = 'Ponowna kontrola zastosowanych zmian przez odczyt...'
+    }
+    'launch.recheckfailed' = @{
+        en = 'The re-check did not pass, so no connection is started.'
+        pl = 'Ponowna kontrola nie powiodła się, więc połączenie nie jest nawiązywane.'
+    }
+    'launch.recheckok' = @{
+        en = 'Re-check passed.'
+        pl = 'Ponowna kontrola zaliczona.'
+    }
+    'launch.nothingtostart' = @{
+        en = 'PuTTY was not found, so there is nothing to start.'
+        pl = 'Nie znaleziono PuTTY, więc nie ma czego uruchomić.'
+    }
+    'launch.starting' = @{
+        en = 'Starting: {0}'
+        pl = 'Uruchamianie: {0}'
+    }
+    'launch.pinprompt' = @{
+        en = 'PuTTY will ask for the card PIN. This script never sees it.'
+        pl = 'PuTTY zapyta o PIN karty. Ten skrypt nigdy go nie widzi.'
+    }
+    'launch.startfailed' = @{
+        en = 'Could not start PuTTY: {0}'
+        pl = 'Nie udało się uruchomić PuTTY: {0}'
+    }
+    'launch.nochanges' = @{
+        en = 'No changes were made.'
+        pl = 'Nie wprowadzono żadnych zmian.'
+    }
+    'launch.changecount' = @{
+        en = '{0} change(s) made. To reverse them:'
+        pl = 'Wprowadzonych zmian: {0}. Aby je cofnąć:'
+    }
+    'launch.needuserhost1' = @{
+        en = '-Launch needs -User and -ComputerName: the command above still'
+        pl = '-Launch wymaga -User i -ComputerName: powyższe polecenie nadal'
+    }
+    'launch.needuserhost2' = @{
+        en = 'contains example values, and connecting to those would be pointless.'
+        pl = 'zawiera wartości przykładowe, a łączenie się z nimi nie ma sensu.'
+    }
+    'launch.nothingchanged' = @{
+        en = 'NOTHING HAS BEEN CHANGED.'
+        pl = 'NICZEGO NIE ZMIENIONO.'
+    }
+    'recheck.x509ok' = @{
+        en = 'AuthX509 = 0 or unset (X.509 mode off): ok'
+        pl = 'AuthX509 = 0 lub nieustawione (tryb X.509 wyłączony): ok'
+    }
+    'recheck.x509bad' = @{
+        en = 'AuthX509 = {0}: still on'
+        pl = 'AuthX509 = {0}: nadal włączone'
+    }
+    'recheck.autoloadbad' = @{
+        en = 'AutoloadCerts = 1: still enumerating the whole store'
+        pl = 'AutoloadCerts = 1: nadal przegląda cały magazyn'
+    }
+    'recheck.autoloadok' = @{
+        en = 'AutoloadCerts = 0 or unset: ok'
+        pl = 'AutoloadCerts = 0 lub nieustawione: ok'
+    }
+    'recheck.sessionok' = @{
+        en = 'session "{0}": AgentFwd=1, TryAgent=1: ok'
+        pl = 'sesja "{0}": AgentFwd=1, TryAgent=1: ok'
+    }
+    'recheck.sessionbad' = @{
+        en = 'session "{0}": AgentFwd={1}, TryAgent={2}: not both 1'
+        pl = 'sesja "{0}": AgentFwd={1}, TryAgent={2}: nie obie rowne 1'
+    }
+    'recheck.shortcutok' = @{
+        en = 'Startup shortcut arguments match the chosen certificate: ok'
+        pl = 'Argumenty skrótu w Autostarcie zgadzają się z wybranym certyfikatem: ok'
+    }
+    'recheck.shortcutbad' = @{
+        en = 'Startup shortcut arguments are "{0}": not the chosen certificate'
+        pl = 'Argumenty skrótu w Autostarcie to "{0}": to nie wybrany certyfikat'
+    }
+    'recheck.shortcutunread' = @{
+        en = 'Startup shortcut could not be read back'
+        pl = 'Nie udało się odczytać skrótu w Autostarcie'
+    }
+
+    # ---- minidriver steps -------------------------------------------------
+    'fix.minidriver.yubico' = @{
+        en = 'Install the YubiKey Smart Card Minidriver (for provisioning/management)'
+        pl = 'Zainstaluj YubiKey Smart Card Minidriver (do inicjowania i zarządzania)'
+    }
+    'fix.minidriver.hid' = @{
+        en = 'Install the HID Crescendo Minidriver (no winget package exists)'
+        pl = 'Zainstaluj HID Crescendo Minidriver (nie ma pakietu winget)'
+    }
+    'fix.minidriver.hid.note' = @{
+        en = 'Download it from www.hidglobal.com/drivers -- HID''s own documentation names that as the location, and the portal refuses automated clients, so open it in a browser or ask your HID representative. Install docs: https://docs.hidglobal.com/crescendo-md-v1.3/MiniDriver/install_minidriver.htm'
+        pl = 'Pobierz go z www.hidglobal.com/drivers -- własna dokumentacja HID wskazuje to miejsce, a portal odrzuca klientów automatycznych, więc otwórz go w przeglądarce lub zapytaj przedstawiciela HID. Dokumentacja instalacji: https://docs.hidglobal.com/crescendo-md-v1.3/MiniDriver/install_minidriver.htm'
+    }
+    'fix.minidriver.unknown' = @{
+        en = 'Find the minidriver for this token: {0}'
+        pl = 'Znajdź ministerownik dla tego tokena: {0}'
+    }
+    'fix.minidriver.unknown.note' = @{
+        en = 'This vendor is not one the script recognises, so it cannot name the driver. Check the vendor''s own support site. Windows'' inbox PIV minidriver (msclmd.inf) is often enough on its own for an already-provisioned card, so this may not be the problem at all.'
+        pl = 'Tego producenta skrypt nie rozpoznaje, więc nie wskaże sterownika. Sprawdź witrynę wsparcia producenta. Wbudowany ministerownik PIV systemu Windows (msclmd.inf) często w zupełności wystarcza dla karty już zainicjowanej, więc to może w ogóle nie być problem.'
+    }
+
+    # ---- detection diagnostics -------------------------------------------
+    # Deliberately English. These name binary symbols and exact option
+    # spellings ("CAPI:", "-x509off", "plink.exe") and are what an operator
+    # pastes into a bug report; translating the frame around identifiers that
+    # must stay verbatim would make them harder to compare, not easier.
+    'detect.capi' = @{
+        en = 'CAPI: prefix present in the putty.exe image'
+        EnglishOnly = $true
+    }
+    'detect.plink.accepted' = @{
+        en = 'plink accepted -x509off'
+        EnglishOnly = $true
+    }
+    'detect.plink.rejected' = @{
+        en = 'plink rejected -x509off as an unknown option'
+        EnglishOnly = $true
+    }
+    'detect.probe.accepted' = @{
+        en = 'accepted (-x509off is a known option)'
+        EnglishOnly = $true
+    }
+    'detect.probe.rejected' = @{
+        en = 'rejected (-x509off unknown: stock PuTTY)'
+        EnglishOnly = $true
+    }
+    'detect.probe.inconclusive' = @{
+        en = 'inconclusive'
+        EnglishOnly = $true
+    }
+    'detect.probe.norun' = @{
+        en = 'could not run plink.exe'
+        EnglishOnly = $true
+    }
+
+    # ---- self-test --------------------------------------------------------
+    'selftest.header' = @{
+        en = 'Message catalogue self-test'
+        pl = 'Autotest katalogu komunikatów'
+    }
+    'selftest.ok' = @{
+        en = 'Catalogue holds: every message has a Polish translation or an explicit EnglishOnly marker.'
+        pl = 'Katalog jest spójny: każdy komunikat ma tłumaczenie polskie albo jawny znacznik EnglishOnly.'
+    }
+    'selftest.missing' = @{
+        en = 'Missing Polish translation, and not marked EnglishOnly:'
+        pl = 'Brak tłumaczenia polskiego i brak znacznika EnglishOnly:'
+    }
+}
+
+# Messages that are deliberately English only, with the reason. Kept as a
+# separate list rather than a flag inside each entry so that the reason is
+# recorded somewhere a reader will find it, and so the self-test can report
+# "deliberate" counts without trawling the catalogue.
+$script:EnglishOnly = @{}
+
+<#
+    Look up a message.
+
+    Falls back to English when the requested language has no translation --
+    visibly, because the English text itself is the signal that a translation
+    is missing. Never returns a blank line.
+
+    A completely unknown id returns a loud marker rather than nothing: that is
+    a bug in the caller, and the self-test exists to catch it before an
+    operator does.
+#>
+function T {
+    param(
+        [Parameter(Mandatory = $true)] [string] $Id,
+        # NB: deliberately not called $Args. That is an automatic variable in
+        # PowerShell and shadowing it inside a function is a trap.
+        [object[]] $Fmt = @()
+    )
+
+    $entry = $null
+    if ($script:Messages.ContainsKey($Id)) { $entry = $script:Messages[$Id] }
+
+    if (-not $entry) {
+        return ('[[missing message: {0}]]' -f $Id)
+    }
+
+    $text = $null
+    if ($script:Language -ne 'en' -and $entry.ContainsKey($script:Language)) {
+        $text = [string] $entry[$script:Language]
+    }
+    if (-not $text) { $text = [string] $entry['en'] }
+    if (-not $text) { return ('[[empty message: {0}]]' -f $Id) }
+
+    if (@($Fmt).Count -gt 0) { return ($text -f $Fmt) }
+    return $text
+}
+
+function Invoke-CatalogueSelfTest {
+    Write-Host ''
+    Write-Host (T 'selftest.header') -ForegroundColor White
+    Write-Host ('-' * 40) -ForegroundColor DarkGray
+
+    $total = 0
+    $translated = 0
+    $deliberate = 0
+    $missing = @()
+
+    foreach ($id in ($script:Messages.Keys | Sort-Object)) {
+        $total++
+        $entry = $script:Messages[$id]
+        if ($entry.ContainsKey('pl') -and [string] $entry['pl']) {
+            $translated++
+        } elseif ($script:EnglishOnly.ContainsKey($id) -or $entry.ContainsKey('EnglishOnly')) {
+            $deliberate++
+        } else {
+            $missing += $id
+        }
+    }
+
+    Write-Host ('  messages:              {0}' -f $total) -ForegroundColor Gray
+    Write-Host ('  translated (pl):       {0}' -f $translated) -ForegroundColor Gray
+    Write-Host ('  English only (marked): {0}' -f $deliberate) -ForegroundColor Gray
+    Write-Host ('  missing:               {0}' -f @($missing).Count) -ForegroundColor Gray
+    Write-Host ''
+
+    if (@($missing).Count -gt 0) {
+        Write-Host (T 'selftest.missing') -ForegroundColor Red
+        foreach ($m in $missing) { Write-Host ('    {0}' -f $m) -ForegroundColor Red }
+        Write-Host ''
+        return 1
+    }
+
+    Write-Host (T 'selftest.ok') -ForegroundColor Green
+    Write-Host ''
+    return 0
+}
 
 $script:Findings = @()
 
@@ -339,14 +1343,14 @@ function Show-CommandBlock {
         [string] $Thumbprint
     )
 
-    Write-Section 'Commands to run on this workstation'
+    Write-Section (T 'sec.commands')
 
     $steps = @($script:Steps | Sort-Object Order, Seq)
 
     if (@($steps).Count -eq 0 -and @($ConnectCommands).Count -gt 0) {
-        Write-Host '  Every check passed: there is nothing to fix on this workstation.' -ForegroundColor Green
+        Write-Host ('  ' + (T 'block.nothingtofix')) -ForegroundColor Green
     } else {
-        Write-Host '  Nothing below has been applied. Copy and run these yourself, in order.' -ForegroundColor Gray
+        Write-Host ('  ' + (T 'block.copyrun')) -ForegroundColor Gray
     }
     Write-Host ''
 
@@ -360,9 +1364,9 @@ function Show-CommandBlock {
 
         $cmds = @($s.Commands)
         if ($s.Unit -and @($cmds).Count -gt 1) {
-            Write-Host '       (these lines are one unit -- paste them in together)' -ForegroundColor DarkGray
+            Write-Host ('       ' + (T 'block.unit')) -ForegroundColor DarkGray
         } elseif (@($cmds).Count -gt 1) {
-            Write-Host '       (separate commands; run them in this order)' -ForegroundColor DarkGray
+            Write-Host ('       ' + (T 'block.separate')) -ForegroundColor DarkGray
         }
 
         $i = 0
@@ -382,7 +1386,7 @@ function Show-CommandBlock {
     if (@($ConnectCommands).Count -gt 0) {
         $n++
         $label = $ConnectLabel
-        if (-not $label) { $label = 'Connect' }
+        if (-not $label) { $label = T 'block.connect' }
         Write-Host ('  {0}. {1}' -f $n, $label) -ForegroundColor White
         foreach ($c in $ConnectCommands) {
             Write-Host ('       {0}' -f $c) -ForegroundColor Green
@@ -531,16 +1535,16 @@ function Set-StartupShortcutChecked {
 function Invoke-Launch {
     param([string] $ConnectCommand, [string] $PuttyExe)
 
-    Write-Section 'Applying (-Launch)'
+    Write-Section (T 'sec.applying')
 
     $steps = @($script:Steps | Sort-Object Order, Seq)
     $installs = @($steps | Where-Object { $_.IsInstall })
 
     if (@($installs).Count -gt 0) {
-        Write-Host '  Stopping before any change: something has to be installed first.' -ForegroundColor Red
-        Write-Host '  -Launch configures what is already on this machine; it does not install' -ForegroundColor Yellow
-        Write-Host '  software, because that downloads, usually needs elevation, and changes' -ForegroundColor Yellow
-        Write-Host '  the machine rather than your configuration.' -ForegroundColor Yellow
+        Write-Host ('  ' + (T 'launch.stopinstall')) -ForegroundColor Red
+        Write-Host ('  ' + (T 'launch.noinstall1')) -ForegroundColor Yellow
+        Write-Host ('  ' + (T 'launch.noinstall2')) -ForegroundColor Yellow
+        Write-Host ('  ' + (T 'launch.noinstall3')) -ForegroundColor Yellow
         Write-Host ''
         foreach ($s in $installs) {
             Write-Host ('    {0}' -f $s.Label) -ForegroundColor White
@@ -548,7 +1552,7 @@ function Invoke-Launch {
             if ($s.Note) { Write-Host ('      {0}' -f $s.Note) -ForegroundColor Gray }
         }
         Write-Host ''
-        Write-Host '  Install the above, then re-run. NOTHING HAS BEEN CHANGED.' -ForegroundColor Red
+        Write-Host ('  ' + (T 'launch.installthenrerun')) -ForegroundColor Red
         Write-Host ''
         return 3
     }
@@ -557,14 +1561,14 @@ function Invoke-Launch {
     $failed = 0
 
     if (@($actionable).Count -eq 0) {
-        Write-Host '  Nothing to apply: this workstation is already configured.' -ForegroundColor Green
+        Write-Host ('  ' + (T 'launch.nothingtoapply')) -ForegroundColor Green
     }
 
     foreach ($s in $actionable) {
         if (-not $s.Apply) {
-            Write-Host ('  [SKIP] {0}' -f $s.Label) -ForegroundColor Yellow
-            Write-Host '         Cannot be applied automatically -- it needs a decision or a' -ForegroundColor Gray
-            Write-Host '         file this script will not invent. Run it yourself:' -ForegroundColor Gray
+            Write-Host ('  ' + (T 'launch.skip' @($s.Label))) -ForegroundColor Yellow
+            Write-Host ('         ' + (T 'launch.skip.why1')) -ForegroundColor Gray
+            Write-Host ('         ' + (T 'launch.skip.why2')) -ForegroundColor Gray
             foreach ($c in @($s.Commands)) {
                 $line = $c -replace '<THUMBPRINT>', $script:ChosenThumbprint
                 Write-Host ('           {0}' -f $line) -ForegroundColor Cyan
@@ -577,28 +1581,28 @@ function Invoke-Launch {
         try {
             $result = & $s.Apply
         } catch {
-            Write-Host ('  [FAIL] {0}' -f $s.Label) -ForegroundColor Red
+            Write-Host ('  ' + (T 'launch.fail' @($s.Label))) -ForegroundColor Red
             Write-Host ('         {0}' -f $_.Exception.Message) -ForegroundColor Red
             $failed++
             continue
         }
 
         if ($result -and $result.Ok) {
-            Write-Host ('  [DONE] {0}' -f $s.Label) -ForegroundColor Green
+            Write-Host ('  ' + (T 'launch.done' @($s.Label))) -ForegroundColor Green
             $undo = @()
             if ($result.PSObject.Properties.Name -contains 'Undo') { $undo = @($result.Undo) }
             if (@($undo).Count -eq 0) { $undo = @($s.Undo) }
             Add-ChangeRecord -What $s.Label -Undo $undo
             foreach ($u in $undo) {
-                Write-Host ('         undo: {0}' -f $u) -ForegroundColor DarkGray
+                Write-Host ('         ' + (T 'launch.undo' @($u))) -ForegroundColor DarkGray
             }
         } else {
-            $msg = 'no result returned'
+            $msg = T 'launch.noresult'
             if ($result -and $result.PSObject.Properties.Name -contains 'Error' -and $result.Error) { $msg = $result.Error }
-            Write-Host ('  [FAIL] {0}' -f $s.Label) -ForegroundColor Red
+            Write-Host ('  ' + (T 'launch.fail' @($s.Label))) -ForegroundColor Red
             Write-Host ('         {0}' -f $msg) -ForegroundColor Red
-            Write-Host '         If this says access is denied, it needs rights the checks do not' -ForegroundColor Gray
-            Write-Host '         assume. Nothing is retried with elevation.' -ForegroundColor Gray
+            Write-Host ('         ' + (T 'launch.denied1')) -ForegroundColor Gray
+            Write-Host ('         ' + (T 'launch.denied2')) -ForegroundColor Gray
             $failed++
         }
     }
@@ -607,34 +1611,34 @@ function Invoke-Launch {
     Show-AppliedSummary
 
     if ($failed -gt 0) {
-        Write-Host ('  {0} step(s) did not complete, so no connection is started.' -f $failed) -ForegroundColor Red
-        Write-Host '  Fix those and re-run, or run the printed commands yourself.' -ForegroundColor Yellow
+        Write-Host ('  ' + (T 'launch.failedcount' @($failed))) -ForegroundColor Red
+        Write-Host ('  ' + (T 'launch.fixthose')) -ForegroundColor Yellow
         Write-Host ''
         return 4
     }
 
     # Re-check: read the state back rather than assume the writes took.
-    Write-Host '  Re-checking the applied state by reading it back...' -ForegroundColor White
+    Write-Host ('  ' + (T 'launch.rechecking')) -ForegroundColor White
     $recheck = Test-LaunchPreconditions
     foreach ($line in $recheck.Lines) {
         Write-Host ('    {0}' -f $line) -ForegroundColor Gray
     }
     if (-not $recheck.Ok) {
         Write-Host ''
-        Write-Host '  The re-check did not pass, so no connection is started.' -ForegroundColor Red
+        Write-Host ('  ' + (T 'launch.recheckfailed')) -ForegroundColor Red
         Write-Host ''
         return 5
     }
-    Write-Host '  Re-check passed.' -ForegroundColor Green
+    Write-Host ('  ' + (T 'launch.recheckok')) -ForegroundColor Green
     Write-Host ''
 
     if (-not $PuttyExe -or -not (Test-Path -LiteralPath $PuttyExe)) {
-        Write-Host '  PuTTY was not found, so there is nothing to start.' -ForegroundColor Red
+        Write-Host ('  ' + (T 'launch.nothingtostart')) -ForegroundColor Red
         return 6
     }
 
-    Write-Host ('  Starting: {0}' -f $ConnectCommand) -ForegroundColor Green
-    Write-Host '  PuTTY will ask for the card PIN. This script never sees it.' -ForegroundColor Gray
+    Write-Host ('  ' + (T 'launch.starting' @($ConnectCommand))) -ForegroundColor Green
+    Write-Host ('  ' + (T 'launch.pinprompt')) -ForegroundColor Gray
     Write-Host ''
     try {
         # Argument array rather than a command string, so a path with spaces
@@ -646,7 +1650,7 @@ function Invoke-Launch {
         $argList += $script:LaunchHost
         Start-Process -FilePath $PuttyExe -ArgumentList $argList | Out-Null
     } catch {
-        Write-Host ('  Could not start PuTTY: {0}' -f $_.Exception.Message) -ForegroundColor Red
+        Write-Host ('  ' + (T 'launch.startfailed' @($_.Exception.Message))) -ForegroundColor Red
         return 7
     }
     return 0
@@ -661,24 +1665,24 @@ function Test-LaunchPreconditions {
 
     $x = Get-PuttyGlobalX509
     if ($null -eq $x -or $x -eq 0) {
-        $lines += 'AuthX509 = 0 or unset (X.509 mode off): ok'
+        $lines += (T 'recheck.x509ok')
     } else {
-        $lines += ('AuthX509 = {0}: still on' -f $x); $ok = $false
+        $lines += (T 'recheck.x509bad' @($x)); $ok = $false
     }
 
     $pre = Get-PageantPreloadConfig
     if ($pre.AutoloadCerts -eq 1) {
-        $lines += 'AutoloadCerts = 1: still enumerating the whole store'; $ok = $false
+        $lines += (T 'recheck.autoloadbad'); $ok = $false
     } else {
-        $lines += 'AutoloadCerts = 0 or unset: ok'
+        $lines += (T 'recheck.autoloadok')
     }
 
     if ($script:LaunchSessionKey) {
         $s = Get-PuttySessionAgentSetting -Name $script:LaunchSessionKey
         if ($s.Found -and $s.AgentFwd -eq 1 -and $s.TryAgent -eq 1) {
-            $lines += ('session "{0}": AgentFwd=1, TryAgent=1: ok' -f $s.KeyName)
+            $lines += (T 'recheck.sessionok' @($s.KeyName))
         } elseif ($s.Found) {
-            $lines += ('session "{0}": AgentFwd={1}, TryAgent={2}: not both 1' -f $s.KeyName, $s.AgentFwd, $s.TryAgent)
+            $lines += (T 'recheck.sessionbad' @($s.KeyName, $s.AgentFwd, $s.TryAgent))
             $ok = $false
         }
     }
@@ -687,13 +1691,13 @@ function Test-LaunchPreconditions {
         try {
             $sc = (New-Object -ComObject WScript.Shell).CreateShortcut($script:StartupLnk)
             if ($sc.Arguments.Trim() -ieq $script:StartupArgs) {
-                $lines += 'Startup shortcut arguments match the chosen certificate: ok'
+                $lines += (T 'recheck.shortcutok')
             } else {
-                $lines += ('Startup shortcut arguments are "{0}": not the chosen certificate' -f $sc.Arguments.Trim())
+                $lines += (T 'recheck.shortcutbad' @($sc.Arguments.Trim()))
                 $ok = $false
             }
         } catch {
-            $lines += 'Startup shortcut could not be read back'; $ok = $false
+            $lines += (T 'recheck.shortcutunread'); $ok = $false
         }
     }
 
@@ -702,11 +1706,11 @@ function Test-LaunchPreconditions {
 
 function Show-AppliedSummary {
     if (@($script:Applied).Count -eq 0) {
-        Write-Host '  No changes were made.' -ForegroundColor Gray
+        Write-Host ('  ' + (T 'launch.nochanges')) -ForegroundColor Gray
         Write-Host ''
         return
     }
-    Write-Host ('  {0} change(s) made. To reverse them:' -f @($script:Applied).Count) -ForegroundColor White
+    Write-Host ('  ' + (T 'launch.changecount' @(@($script:Applied).Count))) -ForegroundColor White
     foreach ($a in $script:Applied) {
         Write-Host ('    {0}' -f $a.What) -ForegroundColor Gray
         foreach ($u in @($a.Undo)) {
@@ -882,7 +1886,7 @@ function Test-PuttyCac {
     $info.HasX509Off = $scan['x509off']
     if ($info.HasCapi) {
         $info.IsCac = $true
-        $info.HowDetected += 'CAPI: prefix present in the putty.exe image'
+        $info.HowDetected += (T 'detect.capi')
     }
 
     # (b) behavioural probe via plink
@@ -894,20 +1898,20 @@ function Test-PuttyCac {
         $probe = Invoke-Capture -FilePath $plink -Arguments @('-x509off')
         if ($probe.Ok) {
             if ($probe.Text -match 'unknown option') {
-                $info.ProbeResult = 'rejected (-x509off unknown: stock PuTTY)'
+                $info.ProbeResult = T 'detect.probe.rejected'
                 $info.IsCac = $false
-                $info.HowDetected = @('plink rejected -x509off as an unknown option')
+                $info.HowDetected = @((T 'detect.plink.rejected'))
             } elseif ($probe.Text -match 'no valid host name|no hostname|host name') {
-                $info.ProbeResult = 'accepted (-x509off is a known option)'
+                $info.ProbeResult = T 'detect.probe.accepted'
                 $info.IsCac = $true
-                if ($info.HowDetected -notcontains 'plink accepted -x509off') {
-                    $info.HowDetected += 'plink accepted -x509off'
+                if ($info.HowDetected -notcontains (T 'detect.plink.accepted')) {
+                    $info.HowDetected += (T 'detect.plink.accepted')
                 }
             } else {
-                $info.ProbeResult = 'inconclusive'
+                $info.ProbeResult = T 'detect.probe.inconclusive'
             }
         } else {
-            $info.ProbeResult = 'could not run plink.exe'
+            $info.ProbeResult = T 'detect.probe.norun'
         }
     }
 
@@ -1338,7 +2342,7 @@ function Get-TokenFamily {
     param([string] $Name)
 
     if (-not $Name) {
-        return [pscustomobject]@{ Family = 'Unknown'; Display = 'PIV token (vendor not recognised)' }
+        return [pscustomobject]@{ Family = 'Unknown'; Display = (T 'token.generic') }
     }
     if ($Name -match 'Yubico|YubiKey') {
         return [pscustomobject]@{ Family = 'Yubico'; Display = 'Yubico YubiKey' }
@@ -1350,7 +2354,7 @@ function Get-TokenFamily {
     if ($Name -match 'Crescendo') {
         return [pscustomobject]@{ Family = 'HIDCrescendo'; Display = 'HID Crescendo' }
     }
-    return [pscustomobject]@{ Family = 'Unknown'; Display = 'PIV token (vendor not recognised)' }
+    return [pscustomobject]@{ Family = 'Unknown'; Display = (T 'token.generic') }
 }
 
 function Get-BoundMinidriver {
@@ -1386,11 +2390,11 @@ function Get-BoundMinidriver {
 
 function Get-MinidriverKind {
     param([string] $Inf)
-    if (-not $Inf) { return 'unknown' }
-    if ($Inf -match '^msclmd\.inf$') { return 'Windows inbox PIV minidriver (msclmd.inf)' }
-    if ($Inf -match '^scunknown\.inf$') { return 'no minidriver bound (scunknown.inf)' }
-    if ($Inf -match '^oem\d+\.inf$') { return ('vendor minidriver ({0})' -f $Inf) }
-    return ('minidriver {0}' -f $Inf)
+    if (-not $Inf) { return (T 'minidriver.unknown') }
+    if ($Inf -match '^msclmd\.inf$') { return (T 'minidriver.inbox') }
+    if ($Inf -match '^scunknown\.inf$') { return (T 'minidriver.none') }
+    if ($Inf -match '^oem\d+\.inf$') { return (T 'minidriver.vendor' @($Inf)) }
+    return (T 'minidriver.other' @($Inf))
 }
 
 # --------------------------------------------------------------------------
@@ -1544,17 +2548,17 @@ function Add-MinidriverStep {
 
     if ($Family -eq 'Yubico') {
         Add-Step -Order $script:OrderInstall `
-            -Label 'Install the YubiKey Smart Card Minidriver (for provisioning/management)' `
+            -Label (T 'fix.minidriver.yubico') `
             -Commands @('winget install --id Yubico.YubiKeySmartCardMinidriver')
     }
     elseif ($Family -eq 'HIDCrescendo') {
         Add-Step -Order $script:OrderInstall `
-            -Label 'Install the HID Crescendo Minidriver (no winget package exists)' `
+            -Label (T 'fix.minidriver.hid') `
             -Note 'Download it from www.hidglobal.com/drivers -- HID''s own documentation names that as the location, and the portal refuses automated clients, so open it in a browser or ask your HID representative. Install docs: https://docs.hidglobal.com/crescendo-md-v1.3/MiniDriver/install_minidriver.htm'
     }
     else {
         Add-Step -Order $script:OrderInstall `
-            -Label ('Find the minidriver for this token: {0}' -f $TokenName) `
+            -Label (T 'fix.minidriver.unknown' @($TokenName)) `
             -Note 'This vendor is not one the script recognises, so it cannot name the driver. Check the vendor''s own support site. Windows'' inbox PIV minidriver (msclmd.inf) is often enough on its own for an already-provisioned card, so this may not be the problem at all.'
     }
 }
@@ -1585,60 +2589,69 @@ function Get-SelfInvocation {
 # Main
 # --------------------------------------------------------------------------
 
+# Catalogue check and nothing else, so it is safe to run anywhere.
+if ($SelfTest) {
+    exit (Invoke-CatalogueSelfTest)
+}
+
 Write-Host ''
-Write-Host 'Smart card SSH readiness check (PuTTY-CAC)' -ForegroundColor White
-Write-Host '------------------------------------------' -ForegroundColor DarkGray
-Write-Host ('PowerShell {0} on {1}' -f $PSVersionTable.PSVersion, [System.Environment]::OSVersion.VersionString) -ForegroundColor Gray
-Write-Host 'Read-only: nothing is launched, downloaded, installed or modified.' -ForegroundColor Gray
-Write-Host 'No private key is read and no PIN is requested, stored or logged.' -ForegroundColor Gray
-Write-Host 'The checks need no administrator rights; only the suggested' -ForegroundColor Gray
-Write-Host 'remedies (installing a minidriver) do.' -ForegroundColor Gray
+Write-Host (T 'hdr.title') -ForegroundColor White
+Write-Host ('-' * 42) -ForegroundColor DarkGray
+Write-Host (T 'hdr.platform' @($PSVersionTable.PSVersion, [System.Environment]::OSVersion.VersionString)) -ForegroundColor Gray
+if ($Launch) {
+    Write-Host (T 'hdr.launchmode') -ForegroundColor Yellow
+} else {
+    Write-Host (T 'hdr.readonly') -ForegroundColor Gray
+}
+Write-Host (T 'hdr.nokey') -ForegroundColor Gray
+Write-Host (T 'hdr.noadmin1') -ForegroundColor Gray
+Write-Host (T 'hdr.noadmin2') -ForegroundColor Gray
 
 # ---- 1. dependencies -----------------------------------------------------
 
-Write-Section 'Dependencies'
+Write-Section (T 'sec.dependencies')
 
 $puttyExe = Find-Putty -Override $PuttyPath
 $cac = $null
 
 if (-not $puttyExe) {
-    Write-Finding -Status 'FAIL' -Check 'PuTTY-CAC present' `
-        -Detail 'no putty.exe found in the usual install locations or on PATH' `
-        -Remedy 'install PuTTY-CAC: winget install --id NoMoreFood.PuTTY-CAC (releases: https://github.com/NoMoreFood/putty-cac/releases)' `
-        -FixLabel 'Install PuTTY-CAC (stock PuTTY cannot do CAPI: at all)' `
+    Write-Finding -Status 'FAIL' -Check (T 'chk.putty') `
+        -Detail (T 'chk.putty.absent') `
+        -Remedy (T 'chk.putty.remedy') `
+        -FixLabel (T 'fix.putty.install') `
         -FixOrder $script:OrderInstall -FixIsInstall `
         -Fix @('winget install --id NoMoreFood.PuTTY-CAC')
 } else {
     $cac = Test-PuttyCac -PuttyExe $puttyExe
     $detail = '{0}  [version: {1}]' -f $puttyExe, $cac.FileVersion
     if ($cac.IsCac) {
-        Write-Finding -Status 'PASS' -Check 'PuTTY-CAC present' -Detail $detail
-        Write-Host ('         detected via: {0}' -f ($cac.HowDetected -join '; ')) -ForegroundColor DarkGray
-        Write-Host ('         plink -x509off probe: {0}' -f $cac.ProbeResult) -ForegroundColor DarkGray
+        Write-Finding -Status 'PASS' -Check (T 'chk.putty') -Detail $detail
+        Write-Host ('         ' + (T 'putty.detectedvia' @(($cac.HowDetected -join '; ')))) -ForegroundColor DarkGray
+        Write-Host ('         ' + (T 'putty.probe' @($cac.ProbeResult))) -ForegroundColor DarkGray
         Write-Host ('         CAPI: {0}   PKCS: {1}   x509off: {2}' -f $cac.HasCapi, $cac.HasPkcs, $cac.HasX509Off) -ForegroundColor DarkGray
     } else {
-        Write-Finding -Status 'FAIL' -Check 'PuTTY-CAC present' `
-            -Detail ('this looks like stock PuTTY, which has no CAPI: support -- {0}' -f $detail) `
-            -Remedy 'install PuTTY-CAC: winget install --id NoMoreFood.PuTTY-CAC   (or pass -PuttyPath to point at an existing PuTTY-CAC install)' `
-            -FixLabel 'Install PuTTY-CAC (what is installed is stock PuTTY, which has no CAPI: support)' `
+        Write-Finding -Status 'FAIL' -Check (T 'chk.putty') `
+            -Detail (T 'chk.putty.stock' @($detail)) `
+            -Remedy (T 'chk.putty.remedy.path') `
+            -FixLabel (T 'fix.putty.install.stock') `
             -FixOrder $script:OrderInstall -FixIsInstall `
             -Fix @('winget install --id NoMoreFood.PuTTY-CAC')
-        Write-Host ('         plink -x509off probe: {0}' -f $cac.ProbeResult) -ForegroundColor DarkGray
+        Write-Host ('         ' + (T 'putty.probe' @($cac.ProbeResult))) -ForegroundColor DarkGray
     }
 }
 
 $opensc = Find-OpenSC
 if ($opensc.Pkcs11Tool -and $opensc.OpenScTool) {
-    Write-Finding -Status 'PASS' -Check 'OpenSC present (optional)' `
-        -Detail ('pkcs11-tool.exe and opensc-tool.exe found under {0}' -f (Split-Path -Parent $opensc.Pkcs11Tool))
+    Write-Finding -Status 'PASS' -Check (T 'chk.opensc') `
+        -Detail (T 'chk.opensc.found' @((Split-Path -Parent $opensc.Pkcs11Tool)))
 } elseif ($opensc.Pkcs11Tool -or $opensc.OpenScTool) {
-    Write-Finding -Status 'WARN' -Check 'OpenSC present (optional)' `
-        -Detail 'only part of the OpenSC toolset was found' `
-        -Remedy 'winget install --id OpenSC.OpenSC   (only needed to read the thumbprint straight off the card)'
+    Write-Finding -Status 'WARN' -Check (T 'chk.opensc') `
+        -Detail (T 'chk.opensc.partial') `
+        -Remedy ('winget install --id OpenSC.OpenSC -- ' + (T 'chk.opensc.remedy'))
 } else {
-    Write-Finding -Status 'WARN' -Check 'OpenSC present (optional)' `
-        -Detail 'pkcs11-tool.exe / opensc-tool.exe not found' `
-        -Remedy 'winget install --id OpenSC.OpenSC   (only needed to read the thumbprint straight off the card; certutil can usually do it alone)'
+    Write-Finding -Status 'WARN' -Check (T 'chk.opensc') `
+        -Detail (T 'chk.opensc.absent') `
+        -Remedy ('winget install --id OpenSC.OpenSC -- ' + (T 'chk.opensc.remedy'))
 }
 
 if ($ForwardAgent -or $SessionName) {
@@ -1646,39 +2659,39 @@ if ($ForwardAgent -or $SessionName) {
     # --- Pageant itself ---
     $pageant = Test-PageantRunning
     if ($pageant.Serving) {
-        Write-Finding -Status 'PASS' -Check 'Pageant is running and serving' `
-            -Detail ('{0}  [{1}]' -f $pageant.PipeMasked, $pageant.HowDetected)
+        Write-Finding -Status 'PASS' -Check (T 'chk.pageant') `
+            -Detail (T 'chk.pageant.detail' @($pageant.PipeMasked, $pageant.HowDetected))
         if ($pageant.ProcessPath) {
-            Write-Host ('         process: {0}' -f $pageant.ProcessPath) -ForegroundColor DarkGray
+            Write-Host ('         ' + (T 'pageant.process' @($pageant.ProcessPath))) -ForegroundColor DarkGray
         }
     } else {
         $pageantExe = 'pageant.exe'
         if ($puttyExe) { $pageantExe = Join-Path (Split-Path -Parent $puttyExe) 'pageant.exe' }
-        Write-Finding -Status 'FAIL' -Check 'Pageant is running and serving' `
+        Write-Finding -Status 'FAIL' -Check (T 'chk.pageant') `
             -Detail $pageant.HowDetected `
-            -Remedy ('start Pageant and load the card certificate into it before connecting: "{0}"' -f $pageantExe) `
-            -FixLabel 'Start Pageant with the card certificate loaded' `
+            -Remedy (T 'chk.pageant.remedy' @($pageantExe)) `
+            -FixLabel (T 'fix.pageant.start') `
             -FixOrder $script:OrderAgent `
             -Fix @(('{0} CAPI:<THUMBPRINT>' -f (Format-Exe $pageantExe)))
     }
 
-    Write-Host '         Pageant must already be running with the certificate loaded' -ForegroundColor DarkGray
-    Write-Host '         AT CONNECT TIME. Adding it to Pageant after the session is up' -ForegroundColor DarkGray
-    Write-Host '         does not retrofit agent forwarding onto that session.' -ForegroundColor DarkGray
+    Write-Host ('         ' + (T 'pageant.attime1')) -ForegroundColor DarkGray
+    Write-Host ('         ' + (T 'pageant.attime2')) -ForegroundColor DarkGray
+    Write-Host ('         ' + (T 'pageant.attime3')) -ForegroundColor DarkGray
 
     # --- per-session agent forwarding ---
     if (-not $SessionName) {
-        Write-Finding -Status 'WARN' -Check 'Saved session has agent forwarding enabled' `
-            -Detail 'no -SessionName given, so the per-session AgentFwd/TryAgent values cannot be read' `
-            -Remedy 'pass -SessionName <saved session> to have them checked, or tick Connection > SSH > Auth > "Allow agent forwarding" in the PuTTY UI'
+        Write-Finding -Status 'WARN' -Check (T 'chk.session') `
+            -Detail (T 'chk.session.nonamegiven') `
+            -Remedy (T 'chk.session.nonamegiven.remedy')
     } else {
         $sess = Get-PuttySessionAgentSetting -Name $SessionName
         if (-not $sess.Found) {
             $avail = 'none'
             if (@($sess.Available).Count -gt 0) { $avail = (@($sess.Available) -join ', ') }
-            Write-Finding -Status 'WARN' -Check 'Saved session has agent forwarding enabled' `
-                -Detail ('no saved session named "{0}"; saved sessions are: {1}' -f $SessionName, $avail) `
-                -Remedy 'save the session in PuTTY first, or pass -SessionName exactly as PuTTY lists it'
+            Write-Finding -Status 'WARN' -Check (T 'chk.session') `
+                -Detail (T 'chk.session.notfound' @($SessionName, $avail)) `
+                -Remedy (T 'chk.session.notfound.remedy')
         } else {
             $fwd = $sess.AgentFwd
             $try = $sess.TryAgent
@@ -1689,12 +2702,12 @@ if ($ForwardAgent -or $SessionName) {
             if ($null -ne $fwd) { $fwdText = "$fwd" }
 
             if ($fwd -eq 1 -and $try -eq 1) {
-                Write-Finding -Status 'PASS' -Check 'Saved session has agent forwarding enabled' `
-                    -Detail ('session "{0}": AgentFwd={1}, TryAgent={2}' -f $sess.KeyName, $fwdText, $try)
+                Write-Finding -Status 'PASS' -Check (T 'chk.session') `
+                    -Detail (T 'chk.session.ok' @($sess.KeyName, $fwdText, $try))
             } else {
                 $why = @()
-                if ($fwd -ne 1) { $why += ('AgentFwd={0} (agent forwarding off)' -f $fwdText) }
-                if ($try -ne 1) { $why += ('TryAgent={0} (Pageant not consulted at all)' -f $try) }
+                if ($fwd -ne 1) { $why += (T 'chk.session.bad.fwd' @($fwdText)) }
+                if ($try -ne 1) { $why += (T 'chk.session.bad.try' @($try)) }
                 # Built as a plain array first. Writing the filter as a pipe
                 # inside the @( ... ) argument parses on PowerShell 7 but is
                 # "An empty pipe element is not allowed" on 5.1, which is the
@@ -1703,10 +2716,10 @@ if ($ForwardAgent -or $SessionName) {
                 if ($fwd -ne 1) { $sessionFix += ('reg add "{0}" /v AgentFwd /t REG_DWORD /d 1 /f' -f $sess.RegPath) }
                 if ($try -ne 1) { $sessionFix += ('reg add "{0}" /v TryAgent /t REG_DWORD /d 1 /f' -f $sess.RegPath) }
 
-                Write-Finding -Status 'FAIL' -Check 'Saved session has agent forwarding enabled' `
-                    -Detail ('session "{0}": {1}' -f $sess.KeyName, ($why -join '; ')) `
-                    -Remedy 'either tick Connection > SSH > Auth > "Allow agent forwarding" and re-save the session, or set the values directly (commands below)' `
-                    -FixLabel ('Enable agent forwarding on the saved session "{0}"' -f $sess.KeyName) `
+                Write-Finding -Status 'FAIL' -Check (T 'chk.session') `
+                    -Detail (T 'chk.session.bad' @($sess.KeyName, ($why -join '; '))) `
+                    -Remedy (T 'chk.session.bad.remedy') `
+                    -FixLabel (T 'fix.session.agentfwd' @($sess.KeyName)) `
                     -FixOrder $script:OrderSettings `
                     -Fix $sessionFix `
                     -FixApply {
@@ -1729,10 +2742,10 @@ if ($ForwardAgent -or $SessionName) {
                 foreach ($line in $sessionFix) {
                     Write-Host ('         {0}' -f $line) -ForegroundColor Cyan
                 }
-                Write-Host '         (the script changes nothing unless -Launch is given)' -ForegroundColor DarkGray
+                Write-Host ('         ' + (T 'session.nothingunless')) -ForegroundColor DarkGray
             }
-            Write-Host ('         Note: -A on the command line covers this run regardless of AgentFwd;' ) -ForegroundColor DarkGray
-            Write-Host  '         the saved value matters when the session is launched from the UI.' -ForegroundColor DarkGray
+            Write-Host ('         ' + (T 'session.anote1')) -ForegroundColor DarkGray
+            Write-Host ('         ' + (T 'session.anote2')) -ForegroundColor DarkGray
         }
     }
 }
@@ -1741,11 +2754,11 @@ if ($ForwardAgent -or $SessionName) {
 # -x509off manipulates and it persists between runs.
 $x509 = Get-PuttyGlobalX509
 if ($null -eq $x509) {
-    Write-Host '  [INFO] global AuthX509: not set (PuTTY-CAC default)' -ForegroundColor Gray
+    Write-Host ('  [INFO] ' + (T 'x509.unset')) -ForegroundColor Gray
 } elseif ($x509 -eq 0) {
-    Write-Host '  [INFO] global AuthX509 = 0 (X.509 mode off, which is what you want)' -ForegroundColor Gray
+    Write-Host ('  [INFO] ' + (T 'x509.off')) -ForegroundColor Gray
 } else {
-    Write-Host ('  [INFO] global AuthX509 = {0} (X.509 mode ON globally -- -x509off overrides it per run)' -f $x509) -ForegroundColor Yellow
+    Write-Host ('  [INFO] ' + (T 'x509.on' @($x509))) -ForegroundColor Yellow
 }
 
 # Pageant's preload configuration. Checked unconditionally, not just under
@@ -1754,32 +2767,32 @@ if ($null -eq $x509) {
 # card's key is reached, and that failure reads as "Server refused our key".
 $preload = Get-PageantPreloadConfig
 if (-not $preload.Readable) {
-    Write-Host '  [INFO] Pageant preload configuration: unknown (PuTTY registry key unreadable)' -ForegroundColor Gray
+    Write-Host ('  [INFO] ' + (T 'chk.preload.unknown')) -ForegroundColor Gray
 } else {
-    $countText = 'not set'
-    if ($null -ne $preload.EntryCount) { $countText = '{0} entr(y/ies)' -f $preload.EntryCount }
+    $countText = T 'preload.notset'
+    if ($null -ne $preload.EntryCount) { $countText = T 'preload.entries' @($preload.EntryCount) }
 
     if ($preload.AutoloadCerts -eq 1) {
-        Write-Finding -Status 'WARN' -Check 'Pageant preloads one certificate, not the whole store' `
-            -Detail ('AutoloadCerts = 1: Pageant re-enumerates the ENTIRE Windows certificate store at every start and rewrites SaveCertList (currently {0}), dead key containers included' -f $countText) `
-            -Remedy 'set AutoloadCerts = 0 and preload the one certificate instead (commands printed below). Trimming SaveCertList by hand does nothing while this is 1 -- it is rebuilt on the next start' `
-            -FixLabel 'Stop Pageant enumerating the whole certificate store (MaxAuthTries)' `
+        Write-Finding -Status 'WARN' -Check (T 'chk.preload') `
+            -Detail (T 'chk.preload.autoload' @($countText)) `
+            -Remedy (T 'chk.preload.autoload.remedy') `
+            -FixLabel (T 'fix.preload.autoload') `
             -FixOrder $script:OrderPreload `
             -Fix @('reg add "HKCU\Software\SimonTatham\PuTTY" /v AutoloadCerts /t REG_DWORD /d 0 /f') `
             -FixApply { Set-RegDwordChecked -SubKey 'Software\SimonTatham\PuTTY' -Name 'AutoloadCerts' -Value 0 }
-        Write-Host '         Why it matters: the agent offers keys ONE AT A TIME and OpenSSH''s' -ForegroundColor Yellow
-        Write-Host '         default MaxAuthTries is 6. With a full store the card''s key may' -ForegroundColor Yellow
-        Write-Host '         never be reached, and you get "Server refused our key" -- the same' -ForegroundColor Yellow
-        Write-Host '         message as the X.509 trap and as a stale store entry.' -ForegroundColor Yellow
+        Write-Host ('         ' + (T 'preload.maxauth1')) -ForegroundColor Yellow
+        Write-Host ('         ' + (T 'preload.maxauth2')) -ForegroundColor Yellow
+        Write-Host ('         ' + (T 'preload.maxauth3')) -ForegroundColor Yellow
+        Write-Host ('         ' + (T 'preload.maxauth4')) -ForegroundColor Yellow
     } elseif ($null -eq $preload.AutoloadCerts) {
-        Write-Host ('  [INFO] Pageant preload: AutoloadCerts not set (default), SaveCertList holds {0}' -f $countText) -ForegroundColor Gray
+        Write-Host ('  [INFO] ' + (T 'chk.preload.default' @($countText))) -ForegroundColor Gray
     } else {
-        Write-Finding -Status 'PASS' -Check 'Pageant preloads one certificate, not the whole store' `
-            -Detail ('AutoloadCerts = 0, SaveCertList holds {0}' -f $countText)
+        Write-Finding -Status 'PASS' -Check (T 'chk.preload') `
+            -Detail (T 'chk.preload.ok' @($countText))
         if ($null -ne $preload.EntryCount -and $preload.EntryCount -gt 1) {
-            Write-Host ('         Note: {0} entries are saved. The store is no longer being' -f $preload.EntryCount) -ForegroundColor Yellow
-            Write-Host '         enumerated, so trimming the list will now stick -- and with' -ForegroundColor Yellow
-            Write-Host '         MaxAuthTries at 6 it is worth trimming.' -ForegroundColor Yellow
+            Write-Host ('         ' + (T 'preload.trim1' @($preload.EntryCount))) -ForegroundColor Yellow
+            Write-Host ('         ' + (T 'preload.trim2')) -ForegroundColor Yellow
+            Write-Host ('         ' + (T 'preload.trim3')) -ForegroundColor Yellow
         }
     }
 }
@@ -1787,41 +2800,41 @@ if (-not $preload.Readable) {
 $card = Get-CardCertificate
 
 if (-not $card.Available) {
-    Write-Finding -Status 'FAIL' -Check 'Reader and card present' `
-        -Detail 'certutil -scinfo produced no output' `
-        -Remedy 'check that the Smart Card service (SCardSvr) is running and a reader is attached'
+    Write-Finding -Status 'FAIL' -Check (T 'chk.reader') `
+        -Detail (T 'chk.reader.nooutput') `
+        -Remedy (T 'chk.reader.nooutput.remedy')
 } elseif (@($card.Readers).Count -eq 0) {
-    Write-Finding -Status 'FAIL' -Check 'Reader and card present' `
-        -Detail 'no smart card readers reported' `
-        -Remedy 'attach a reader or token, then re-run'
+    Write-Finding -Status 'FAIL' -Check (T 'chk.reader') `
+        -Detail (T 'chk.reader.noreaders') `
+        -Remedy (T 'chk.reader.noreaders.remedy')
 } elseif (@($card.ReadersWithCard).Count -eq 0) {
     # A reader is not a card. Counting readers alone reported "card present"
     # on a workstation with both tokens unplugged, which is the kind of green
     # result that sends someone looking at the server.
-    Write-Finding -Status 'FAIL' -Check 'Reader and card present' `
-        -Detail ('{0} reader(s) attached, none holding a card' -f @($card.Readers).Count) `
-        -Remedy 'insert the card or plug the token in, then re-run'
-    Write-Host ('         readers: {0}' -f (@($card.Readers) -join ', ')) -ForegroundColor Gray
+    Write-Finding -Status 'FAIL' -Check (T 'chk.reader') `
+        -Detail (T 'chk.reader.nocard' @(@($card.Readers).Count)) `
+        -Remedy (T 'chk.reader.nocard.remedy')
+    Write-Host ('         ' + (T 'reader.list' @((@($card.Readers) -join ', ')))) -ForegroundColor Gray
 } else {
-    Write-Finding -Status 'PASS' -Check 'Reader and card present' `
-        -Detail ('{0} of {1} reader(s) hold a card: {2}' -f `
+    Write-Finding -Status 'PASS' -Check (T 'chk.reader') `
+        -Detail (T 'chk.reader.ok' @(
             @($card.ReadersWithCard).Count, @($card.Readers).Count,
-            (@($card.ReadersWithCard) -join ', '))
+            (@($card.ReadersWithCard) -join ', ')))
     $empty = @($card.Readers | Where-Object { @($card.ReadersWithCard) -notcontains $_ })
     if ($empty.Count -gt 0) {
-        Write-Host ('         empty: {0}' -f ($empty -join ', ')) -ForegroundColor Gray
+        Write-Host ('         ' + (T 'reader.empty' @(($empty -join ', ')))) -ForegroundColor Gray
     }
 }
 
 # ---- 2. tokens -----------------------------------------------------------
 
-Write-Section 'Tokens'
+Write-Section (T 'sec.tokens')
 
 $minidrivers = Get-BoundMinidriver
 if ($null -eq $minidrivers) {
-    Write-Host '  Bound minidriver: unknown (Get-PnpDevice unavailable on this host)' -ForegroundColor Yellow
+    Write-Host ('  ' + (T 'tokens.minidriver.unknown')) -ForegroundColor Yellow
 } elseif (@($minidrivers).Count -eq 0) {
-    Write-Host '  Bound minidriver: none reported for a present card' -ForegroundColor Yellow
+    Write-Host ('  ' + (T 'tokens.minidriver.none')) -ForegroundColor Yellow
 } else {
     foreach ($m in $minidrivers) {
         $label = [string] $m.FriendlyName
@@ -1831,13 +2844,22 @@ if ($null -eq $minidrivers) {
 }
 
 $readerList = @($card.Readers)
+# Whether -Reader actually narrowed anything. The certificate section filters
+# against $readerList rather than re-deriving the narrowing from $Reader, so the
+# two sections cannot end up looking at different sets in the same run --
+# measured: with -Reader naming an absent reader, the token section fell back to
+# all readers while the certificate section filtered to zero and then reported
+# "no certificate could be read from any card", which blamed the card for a
+# certificate it had read perfectly well and suggested installing a minidriver.
+$readerFilterApplied = $false
 if ($Reader) {
     $narrowed = @($readerList | Where-Object { $_ -like ('*' + $Reader + '*') })
     if (@($narrowed).Count -gt 0) {
         $readerList = $narrowed
+        $readerFilterApplied = $true
     } else {
         Write-Host ''
-        Write-Host ('  No reader name contains "{0}"; showing all readers.' -f $Reader) -ForegroundColor Yellow
+        Write-Host ('  ' + (T 'tokens.readernotmatched' @($Reader))) -ForegroundColor Yellow
     }
 }
 
@@ -1855,7 +2877,7 @@ foreach ($r in $readerList) {
 }
 
 if (@($tokens).Count -eq 0) {
-    Write-Host '  No tokens to classify.' -ForegroundColor Yellow
+    Write-Host ('  ' + (T 'tokens.none')) -ForegroundColor Yellow
 } else {
     Write-Host ''
     foreach ($t in $tokens) {
@@ -1868,18 +2890,18 @@ if (@($tokens).Count -eq 0) {
     $withCards = @($tokens | Where-Object { $_.HasCard })
     if (@($withCards).Count -gt 1) {
         Write-Host ''
-        Write-Host ('  {0} tokens are attached at once. The script will not pick one for you.' -f @($withCards).Count) -ForegroundColor Yellow
-        Write-Host '  Narrow the choice with -Reader <text> or -Thumbprint <sha1> if the' -ForegroundColor Yellow
-        Write-Host '  checks below leave more than one usable certificate.' -ForegroundColor Yellow
+        Write-Host ('  ' + (T 'tokens.multiple1' @(@($withCards).Count))) -ForegroundColor Yellow
+        Write-Host ('  ' + (T 'tokens.multiple2')) -ForegroundColor Yellow
+        Write-Host ('  ' + (T 'tokens.multiple3')) -ForegroundColor Yellow
     } elseif ($Reader) {
         Write-Host ''
-        Write-Host ('  Narrowed to one token by -Reader "{0}".' -f $Reader) -ForegroundColor Gray
+        Write-Host ('  ' + (T 'session.narrowed' @($Reader))) -ForegroundColor Gray
     }
 }
 
 # ---- 3. certificates -----------------------------------------------------
 
-Write-Section 'Card certificates and key containers'
+Write-Section (T 'sec.certificates')
 
 $cardContainers = @{}
 if ($card.Available) { $cardContainers = Get-CardContainer -RawScInfo $card.Raw }
@@ -1891,9 +2913,9 @@ if ($UseOpenSC) {
     foreach ($e in $extra) {
         $known = @($candidates | Where-Object { $_.Thumbprint -eq $e.Thumbprint })
         if (@($known).Count -gt 0) {
-            Write-Host ('  OpenSC agrees with certutil on {0} ({1})' -f $e.Thumbprint, $e.Reader) -ForegroundColor DarkGray
+            Write-Host ('  ' + (T 'opensc.agrees' @($e.Thumbprint, $e.Reader))) -ForegroundColor DarkGray
         } else {
-            Write-Host ('  OpenSC found a certificate certutil did not report: {0} ({1})' -f $e.Thumbprint, $e.Reader) -ForegroundColor Yellow
+            Write-Host ('  ' + (T 'opensc.extra' @($e.Thumbprint, $e.Reader))) -ForegroundColor Yellow
             $candidates += [pscustomobject]@{
                 Thumbprint    = $e.Thumbprint
                 Reader        = $e.Reader
@@ -1907,9 +2929,13 @@ if ($UseOpenSC) {
     }
 }
 
-if ($Reader) {
-    $candidates = @($candidates | Where-Object { $_.Reader -and $_.Reader -like ('*' + $Reader + '*') })
-    Write-Host ('  Filtered to readers matching "{0}": {1} candidate(s)' -f $Reader, @($candidates).Count) -ForegroundColor Gray
+if ($readerFilterApplied) {
+    # Against the reader list the token section settled on, not against $Reader
+    # again. Announced only when the narrowing really happened: saying
+    # 'filtered to readers matching "X"' when nothing matched X describes a
+    # filter that was not applied.
+    $candidates = @($candidates | Where-Object { $_.Reader -and (@($readerList) -contains $_.Reader) })
+    Write-Host ('  ' + (T 'cert.filtered' @($Reader, @($candidates).Count))) -ForegroundColor Gray
 }
 if ($Thumbprint) {
     $wanted = ($Thumbprint -replace '[^0-9a-fA-F]', '').ToUpper()
@@ -1925,26 +2951,26 @@ if ($Thumbprint) {
 $usable = @()
 
 if (@($candidates).Count -eq 0) {
-    Write-Finding -Status 'FAIL' -Check 'A usable card certificate was found' `
-        -Detail 'no certificate could be read from any card' `
-        -Remedy 'the card may not be provisioned, or its minidriver may be missing -- see below'
+    Write-Finding -Status 'FAIL' -Check (T 'chk.cert.none') `
+        -Detail (T 'chk.cert.none.detail') `
+        -Remedy (T 'chk.cert.none.remedy')
 } else {
     foreach ($c in $candidates) {
         Write-Host ''
-        Write-Host ('  Certificate {0}' -f $c.Thumbprint) -ForegroundColor White
-        Write-Host ('    reader:         {0}' -f $c.Reader) -ForegroundColor Gray
-        Write-Host ('    read from:      {0}' -f $c.Source) -ForegroundColor Gray
+        Write-Host ('  ' + (T 'cert.heading' @($c.Thumbprint))) -ForegroundColor White
+        Write-Host ('    ' + (T 'cert.reader' @($c.Reader))) -ForegroundColor Gray
+        Write-Host ('    ' + (T 'cert.source' @($c.Source))) -ForegroundColor Gray
         if ($c.CardContainer) {
-            Write-Host ('    container on card:  {0}' -f $c.CardContainer) -ForegroundColor Gray
+            Write-Host ('    ' + (T 'cert.containercard' @($c.CardContainer))) -ForegroundColor Gray
         } else {
-            Write-Host '    container on card:  unknown' -ForegroundColor Gray
+            Write-Host ('    ' + (T 'cert.containercard.unknown')) -ForegroundColor Gray
         }
 
         $store = Get-StoreKeyContainer -Thumb $c.Thumbprint
         if ($store.Container) {
-            Write-Host ('    container in store: {0}' -f $store.Container) -ForegroundColor Gray
+            Write-Host ('    ' + (T 'cert.containerstore' @($store.Container))) -ForegroundColor Gray
         } else {
-            Write-Host '    container in store: unknown' -ForegroundColor Gray
+            Write-Host ('    ' + (T 'cert.containerstore.unknown')) -ForegroundColor Gray
         }
 
         # The CSP for -repairstore, taken from what -scinfo actually reported
@@ -1957,22 +2983,22 @@ if (@($candidates).Count -eq 0) {
         if (-not $csp) { $csp = '<the Provider that -scinfo names for this card>' }
 
         if (-not $store.InStore) {
-            Write-Finding -Status 'FAIL' -Check ('{0}: present in the user certificate store' -f $c.Thumbprint) `
-                -Detail 'the certificate is on the card but not in Cert:\CurrentUser\My' `
-                -Remedy 'CAPI: addressing reads the store, so the certificate has to be registered there' `
-                -FixLabel ('Re-insert the token, then re-run -- certificate {0} is on the card but not in the store' -f $c.Thumbprint) `
+            Write-Finding -Status 'FAIL' -Check (T 'chk.cert.instore' @($c.Thumbprint)) `
+                -Detail (T 'chk.cert.instore.detail') `
+                -Remedy (T 'chk.cert.instore.remedy') `
+                -FixLabel (T 'fix.cert.reinsert' @($c.Thumbprint)) `
                 -FixOrder $script:OrderRegister `
-                -FixNote 'The propagation service only registers card certificates on an insertion event, so a certificate written to a card that was already in the reader is never seen. Unplug the token, plug it back in, and run this script again. The two steps that follow are only needed if that does not fix it.'
+                -FixNote (T 'fix.cert.reinsert.note')
 
             # Two genuinely separate commands, run in order, so they are two
             # numbered steps rather than one step with two lines.
             Add-Step -Order $script:OrderRegister `
-                -Label ('Only if re-inserting did not work: add certificate {0} to the store' -f $c.Thumbprint) `
-                -Note 'Read the certificate off the card first -- see -UseOpenSC, which prints the pkcs11-tool command that writes it to a .der file.' `
+                -Label (T 'fix.cert.addstore' @($c.Thumbprint)) `
+                -Note (T 'fix.cert.addstore.note') `
                 -Commands @('certutil -user -addstore My <cert.der>')
             Add-Step -Order $script:OrderRegister `
-                -Label ('Only if re-inserting did not work: bind {0} to the key on the card' -f $c.Thumbprint) `
-                -Note '"Encryption test passed" in the output means the binding took. The CSP below is the one -scinfo reported for this card; a wrong CSP fails in a way that looks like a bad card.' `
+                -Label (T 'fix.cert.repair' @($c.Thumbprint)) `
+                -Note (T 'fix.cert.repair.note') `
                 -Commands @(('certutil -user -csp "{0}" -repairstore My {1}' -f $csp, $c.Thumbprint))
             Write-Host '         Re-inserting the token is worth trying first: the propagation' -ForegroundColor Yellow
             Write-Host '         service registers card certificates on an insertion event, so a' -ForegroundColor Yellow
@@ -2002,25 +3028,25 @@ if (@($candidates).Count -eq 0) {
         }
 
         if ($store.MissingKeyset) {
-            Write-Finding -Status 'FAIL' -Check ('{0}: key container resolves' -f $c.Thumbprint) `
-                -Detail 'certutil reports "Missing stored keyset" -- the store entry names a key container that cannot be opened' `
-                -Remedy 'this certificate is unusable; pick another, or delete the stale store entry and re-register the card certificate' `
-                -FixLabel ('Re-bind store entry {0} to the key on the card' -f $c.Thumbprint) `
+            Write-Finding -Status 'FAIL' -Check (T 'chk.cert.keyset' @($c.Thumbprint)) `
+                -Detail (T 'chk.cert.keyset.detail') `
+                -Remedy (T 'chk.cert.keyset.remedy') `
+                -FixLabel (T 'fix.cert.rebind' @($c.Thumbprint)) `
                 -FixOrder $script:OrderRegister `
-                -FixNote '"Encryption test passed" in the output means the binding took. If it still fails the certificate belongs to a card that is not here -- pick another, or delete the entry with "certutil -user -delstore My <thumbprint>".' `
+                -FixNote (T 'fix.cert.rebind.note') `
                 -Fix @(('certutil -user -csp "{0}" -repairstore My {1}' -f $csp, $c.Thumbprint))
         } elseif (-not $store.Container -or @($onCard).Count -eq 0) {
-            Write-Finding -Status 'WARN' -Check ('{0}: key container matches the card' -f $c.Thumbprint) `
-                -Detail 'could not read one or both container GUIDs, so the comparison is unknown' `
-                -Remedy 'run "certutil -scinfo -silent" and "certutil -silent -user -store My <thumbprint>" by hand and compare the Key Container lines'
+            Write-Finding -Status 'WARN' -Check (T 'chk.cert.container' @($c.Thumbprint)) `
+                -Detail (T 'chk.cert.container.unknown') `
+                -Remedy (T 'chk.cert.container.unknown.remedy')
         } elseif ($onCard -contains $store.Container) {
-            Write-Finding -Status 'PASS' -Check ('{0}: key container matches the card' -f $c.Thumbprint) `
-                -Detail ('store and card both name {0}' -f $store.Container)
+            Write-Finding -Status 'PASS' -Check (T 'chk.cert.container' @($c.Thumbprint)) `
+                -Detail (T 'chk.cert.container.ok' @($store.Container))
             $usable += $c
         } else {
-            Write-Finding -Status 'FAIL' -Check ('{0}: key container matches the card' -f $c.Thumbprint) `
-                -Detail ('store names {0}, but the card holds {1}' -f $store.Container, (@($onCard) -join ', ')) `
-                -Remedy 'this store entry belongs to a different (probably older) card; Windows will say the smart card cannot perform the requested operation. Delete the stale entry or pick the certificate whose container is on this card'
+            Write-Finding -Status 'FAIL' -Check (T 'chk.cert.container' @($c.Thumbprint)) `
+                -Detail (T 'chk.cert.container.bad' @($store.Container, (@($onCard) -join ', '))) `
+                -Remedy (T 'chk.cert.container.bad.remedy')
         }
     }
 }
@@ -2031,9 +3057,9 @@ try {
     $storeAll = @(Get-ChildItem Cert:\CurrentUser\My -ErrorAction Stop)
     if (@($storeAll).Count -gt 0) {
         Write-Host ''
-        Write-Host ('  The user certificate store holds {0} entr(y/ies).' -f @($storeAll).Count) -ForegroundColor Gray
-        Write-Host '  Stale smart card entries are normal and harmless until one is picked' -ForegroundColor Gray
-        Write-Host '  by mistake; always take the thumbprint from the card, as above.' -ForegroundColor Gray
+        Write-Host ('  ' + (T 'store.count1' @(@($storeAll).Count))) -ForegroundColor Gray
+        Write-Host ('  ' + (T 'store.count2')) -ForegroundColor Gray
+        Write-Host ('  ' + (T 'store.count3')) -ForegroundColor Gray
     }
 } catch {
     Write-Verbose 'could not enumerate Cert:\CurrentUser\My'
@@ -2041,10 +3067,10 @@ try {
 
 # ---- 4. the command ------------------------------------------------------
 
-Write-Section 'Result'
+Write-Section (T 'sec.result')
 
 if (@($usable).Count -eq 0) {
-    Write-Host '  No usable card certificate, so no command is emitted.' -ForegroundColor Red
+    Write-Host ('  ' + (T 'result.nocert')) -ForegroundColor Red
 
     $family = 'Unknown'
     $tokenName = 'unknown token'
@@ -2052,7 +3078,7 @@ if (@($usable).Count -eq 0) {
         $family = $tokens[0].Family; $tokenName = $tokens[0].Reader
     } elseif (@($tokens).Count -gt 1) {
         Write-Host ''
-        Write-Host '  More than one token is attached, so the advice below is given per token.' -ForegroundColor Yellow
+        Write-Host ('  ' + (T 'result.pertoken')) -ForegroundColor Yellow
         foreach ($t in $tokens) { Show-MinidriverAdvice -Family $t.Family -TokenName $t.Reader }
         $family = $null
     }
@@ -2065,19 +3091,19 @@ if (@($usable).Count -eq 0) {
     foreach ($t in $tokens) { Add-MinidriverStep -Family $t.Family -TokenName $t.Reader }
     if (-not ($opensc.Pkcs11Tool -and $opensc.OpenScTool)) {
         Add-Step -Order $script:OrderInstall `
-            -Label 'Install OpenSC, to read the certificate off the card' `
+            -Label (T 'fix.opensc.install') `
             -Commands @('winget install --id OpenSC.OpenSC')
     }
 
     if ($opensc.Pkcs11Tool -and $opensc.Module -and -not $UseOpenSC) {
         Write-Host ''
-        Write-Host '  To read the certificates straight off the card, independently of the' -ForegroundColor Gray
-        Write-Host '  Windows store, re-run this script with -UseOpenSC, or by hand:' -ForegroundColor Gray
+        Write-Host ('  ' + (T 'result.readoff1')) -ForegroundColor Gray
+        Write-Host ('  ' + (T 'result.readoff2')) -ForegroundColor Gray
         Write-Host ('    & "{0}" --module "{1}" --list-token-slots' -f $opensc.Pkcs11Tool, $opensc.Module) -ForegroundColor Gray
     }
 
     Add-Step -Order $script:OrderConnect `
-        -Label 'Re-run this script once the steps above are done' `
+        -Label (T 'fix.rerun') `
         -Commands @((Get-SelfInvocation))
 
     Show-CommandBlock
@@ -2085,20 +3111,20 @@ if (@($usable).Count -eq 0) {
 }
 
 if (@($usable).Count -gt 1) {
-    Write-Host ('  {0} usable certificates were found. Choose one -- the script will not' -f @($usable).Count) -ForegroundColor Yellow
-    Write-Host '  choose for you:' -ForegroundColor Yellow
+    Write-Host ('  ' + (T 'result.ambiguous1' @(@($usable).Count))) -ForegroundColor Yellow
+    Write-Host ('  ' + (T 'result.ambiguous2')) -ForegroundColor Yellow
     Write-Host ''
     foreach ($u in $usable) {
-        Write-Host ('    -Thumbprint {0}    (reader: {1})' -f $u.Thumbprint, $u.Reader) -ForegroundColor White
+        Write-Host ('    ' + (T 'result.ambiguous.reader' @($u.Thumbprint, $u.Reader))) -ForegroundColor White
     }
     Write-Host ''
-    Write-Host '  Re-run with -Thumbprint <sha1>, or -Reader <text> to narrow by reader.' -ForegroundColor Yellow
+    Write-Host ('  ' + (T 'result.ambiguous3')) -ForegroundColor Yellow
     Write-Host ''
 
     Add-Step -Order $script:OrderConnect `
-        -Label 'Re-run naming the certificate you want' `
+        -Label (T 'fix.rerun.named') `
         -Commands @(('{0} -Thumbprint {1}' -f (Get-SelfInvocation), $usable[0].Thumbprint)) `
-        -Note 'The thumbprint above is the first of the usable certificates listed; substitute whichever one you mean.'
+        -Note (T 'fix.rerun.named.note')
 
     Show-CommandBlock
     exit 2
@@ -2169,8 +3195,8 @@ try {
 
 if (-not $startupOk) {
     Add-Step -Order $script:OrderPreload `
-        -Label 'Load the certificate into Pageant at every logon' `
-        -Note 'One line, so it pastes as a single unit. Replaces any existing Pageant shortcut in Startup; -Launch keeps a .bak of the old one.' `
+        -Label (T 'fix.startup.shortcut') `
+        -Note (T 'fix.startup.shortcut.note') `
         -Commands @((Get-ShortcutOneLiner -ShortcutPath $script:StartupLnk -Target $pageantForCmd -Arguments $startupArgs)) `
         -Apply {
             Set-StartupShortcutChecked -ShortcutPath $script:StartupLnk `
@@ -2179,21 +3205,21 @@ if (-not $startupOk) {
 }
 
 if ($Launch) {
-    Write-Host '  All checks passed. -Launch will apply what is needed and then connect.' -ForegroundColor Green
+    Write-Host ('  ' + (T 'result.allpass.launch')) -ForegroundColor Green
 } else {
-    Write-Host '  All checks passed. Run this yourself -- the script does not launch it.' -ForegroundColor Green
+    Write-Host ('  ' + (T 'result.allpass')) -ForegroundColor Green
 }
 Write-Host ''
-Write-Host '  Interactive (PuTTY window):' -ForegroundColor White
+Write-Host ('  ' + (T 'result.interactive')) -ForegroundColor White
 Write-Host ('    {0}' -f $interactive) -ForegroundColor Green
 Write-Host ''
-Write-Host '  Scripted / batch (plink, no interactive prompts):' -ForegroundColor White
+Write-Host ('  ' + (T 'result.scripted')) -ForegroundColor White
 Write-Host ('    {0}' -f $scripted) -ForegroundColor Green
 Write-Host ''
 
 if ($placeholder) {
-    Write-Host '  NOTE: -User and/or -ComputerName were not given, so the command above' -ForegroundColor Yellow
-    Write-Host '  contains example values. Re-run with your own, e.g.' -ForegroundColor Yellow
+    Write-Host ('  ' + (T 'result.placeholder1')) -ForegroundColor Yellow
+    Write-Host ('  ' + (T 'result.placeholder2')) -ForegroundColor Yellow
     Write-Host '    -User someone@ad.example.com -ComputerName linux-host.ad.example.com' -ForegroundColor Yellow
     Write-Host ''
 }
@@ -2282,17 +3308,17 @@ Write-Host ''
 # The consolidated list, last, because that is where a reader looks for "what
 # do I actually run". Everything above is explanation; this is the to-do list.
 Show-CommandBlock -Thumbprint $chosen.Thumbprint `
-    -ConnectLabel 'Connect' -ConnectCommands @($interactive)
+    -ConnectLabel (T 'block.connect') -ConnectCommands @($interactive)
 
 if ($Launch) {
     # Refuse to connect to the documentation's example host. Without -User and
     # -ComputerName the emitted command carries placeholders, and "apply and
     # connect" against ad.example.com is not a useful thing to do by accident.
     if ($placeholder) {
-        Write-Section 'Applying (-Launch)'
-        Write-Host '  -Launch needs -User and -ComputerName: the command above still' -ForegroundColor Red
-        Write-Host '  contains example values, and connecting to those would be pointless.' -ForegroundColor Red
-        Write-Host '  NOTHING HAS BEEN CHANGED.' -ForegroundColor Red
+        Write-Section (T 'sec.applying')
+        Write-Host ('  ' + (T 'launch.needuserhost1')) -ForegroundColor Red
+        Write-Host ('  ' + (T 'launch.needuserhost2')) -ForegroundColor Red
+        Write-Host ('  ' + (T 'launch.nothingchanged')) -ForegroundColor Red
         Write-Host ''
         exit 8
     }

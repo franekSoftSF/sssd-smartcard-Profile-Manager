@@ -1,11 +1,20 @@
 #!/usr/bin/env python3
-"""Render docs/windows-smartcard-ssh.md to docs/windows-smartcard-ssh.pdf.
+"""Render the Windows client guides from Markdown to PDF.
 
-The Markdown file is the source of truth; the PDF is a build artefact that is
-committed so that it can be handed to someone who will not clone the
-repository. Re-run this after editing the Markdown::
+Builds both the English guide and its Polish sibling:
+
+    docs/windows-smartcard-ssh.md     -> docs/windows-smartcard-ssh.pdf
+    docs/windows-smartcard-ssh.pl.md  -> docs/windows-smartcard-ssh.pl.pdf
+
+The Markdown files are the source of truth; the PDFs are build artefacts that
+are committed so they can be handed to someone who will not clone the
+repository. Re-run this after editing either Markdown file::
 
     python packaging/build-windows-guide.py
+
+A single guide can be named explicitly, which is useful while editing one::
+
+    python packaging/build-windows-guide.py docs/windows-smartcard-ssh.pl.md
 
 Needs ReportLab, and nothing else::
 
@@ -31,6 +40,9 @@ try:
     from reportlab.lib.pagesizes import A4
     from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
     from reportlab.lib.units import mm
+    from reportlab.pdfbase import pdfmetrics
+    from reportlab.pdfbase.pdfmetrics import registerFontFamily
+    from reportlab.pdfbase.ttfonts import TTFont
     from reportlab.platypus import (
         HRFlowable,
         ListFlowable,
@@ -50,12 +62,96 @@ except ImportError:  # pragma: no cover - build-time dependency
     raise SystemExit(2)
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
-SOURCE = ROOT / "docs" / "windows-smartcard-ssh.md"
-TARGET = ROOT / "docs" / "windows-smartcard-ssh.pdf"
+
+#: The guides built when no argument is given. The footer text differs per
+#: language so that a printed page says which one it is.
+GUIDES = [
+    (
+        ROOT / "docs" / "windows-smartcard-ssh.md",
+        ROOT / "docs" / "windows-smartcard-ssh.pdf",
+        "SSH from Windows with a PIV smart card",
+        "page %d",
+    ),
+    (
+        ROOT / "docs" / "windows-smartcard-ssh.pl.md",
+        ROOT / "docs" / "windows-smartcard-ssh.pl.pdf",
+        "Logowanie SSH z systemu Windows karta PIV",
+        "strona %d",
+    ),
+]
 
 MONO = "Courier"
 BODY_FONT = "Helvetica"
 BOLD_FONT = "Helvetica-Bold"
+
+#: Candidate TrueType files for a document that needs characters outside
+#: Latin-1. ReportLab's built-in Type 1 fonts (Helvetica, Courier) cover
+#: WinAnsi only, so Polish ą ć ę ł ń ó ś ź ż render as solid black boxes --
+#: which is exactly what the first build of the Polish guide produced. Ordered
+#: so that a Linux build finds DejaVu and a Windows build finds its own fonts.
+UNICODE_FONTS = {
+    "sans": [
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/dejavu/DejaVuSans.ttf",
+        "C:/Windows/Fonts/arial.ttf",
+        "C:/Windows/Fonts/segoeui.ttf",
+        "C:/Windows/Fonts/calibri.ttf",
+    ],
+    "sans-bold": [
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        "/usr/share/fonts/dejavu/DejaVuSans-Bold.ttf",
+        "C:/Windows/Fonts/arialbd.ttf",
+        "C:/Windows/Fonts/segoeuib.ttf",
+        "C:/Windows/Fonts/calibrib.ttf",
+    ],
+    "mono": [
+        "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
+        "/usr/share/fonts/dejavu/DejaVuSansMono.ttf",
+        "C:/Windows/Fonts/consola.ttf",
+        "C:/Windows/Fonts/cour.ttf",
+    ],
+}
+
+
+def needs_unicode_fonts(text: str) -> bool:
+    """True when the source uses anything the built-in fonts cannot draw."""
+    return any(ord(ch) > 0xFF for ch in text)
+
+
+def register_unicode_fonts() -> bool:
+    """Register Unicode faces, returning False when none can be found.
+
+    The caller refuses to build rather than emitting a PDF full of boxes: a
+    document whose every diacritic is a black rectangle is worse than no
+    document, because it looks finished.
+    """
+    global MONO, BODY_FONT, BOLD_FONT
+
+    picked = {}
+    for role, candidates in UNICODE_FONTS.items():
+        for path in candidates:
+            if pathlib.Path(path).is_file():
+                picked[role] = path
+                break
+        if role not in picked:
+            return False
+
+    try:
+        pdfmetrics.registerFont(TTFont("GuideSans", picked["sans"]))
+        pdfmetrics.registerFont(TTFont("GuideSans-Bold", picked["sans-bold"]))
+        pdfmetrics.registerFont(TTFont("GuideMono", picked["mono"]))
+    except Exception as exc:  # pragma: no cover - font file problems
+        sys.stderr.write("could not register fonts: %s\n" % exc)
+        return False
+
+    registerFontFamily(
+        "GuideSans", normal="GuideSans", bold="GuideSans-Bold",
+        italic="GuideSans", boldItalic="GuideSans-Bold",
+    )
+    BODY_FONT = "GuideSans"
+    BOLD_FONT = "GuideSans-Bold"
+    MONO = "GuideMono"
+    return True
 
 
 def build_styles():
@@ -349,38 +445,73 @@ def convert(text: str, styles) -> list:
     return story
 
 
-def footer(canvas, doc):
+def footer(canvas, doc, title: str, page_label: str):
     canvas.saveState()
     canvas.setFont(BODY_FONT, 7.5)
     canvas.setFillColor(colors.HexColor("#777777"))
     canvas.drawString(
-        20 * mm, 12 * mm,
-        "SSSD Smart Card Profile Manager - SSH from Windows with a PIV smart card",
+        20 * mm, 12 * mm, "SSSD Smart Card Profile Manager - %s" % title,
     )
-    canvas.drawRightString(190 * mm, 12 * mm, "page %d" % doc.page)
+    canvas.drawRightString(190 * mm, 12 * mm, page_label % doc.page)
     canvas.restoreState()
 
 
-def main() -> int:
-    if not SOURCE.is_file():
-        sys.stderr.write("missing source: %s\n" % SOURCE)
+def build_one(source: pathlib.Path, target: pathlib.Path,
+              title: str, page_label: str) -> int:
+    if not source.is_file():
+        sys.stderr.write("missing source: %s\n" % source)
+        return 1
+
+    text = source.read_text(encoding="utf-8")
+
+    if needs_unicode_fonts(text) and not register_unicode_fonts():
+        sys.stderr.write(
+            "%s needs characters the built-in PDF fonts cannot draw, and no\n"
+            "Unicode TrueType font was found. Install DejaVu (Linux:\n"
+            "fonts-dejavu-core) or run on a host with Arial/Segoe UI, then\n"
+            "re-run. Refusing to write a PDF of black boxes.\n"
+            % source.name
+        )
         return 1
 
     styles = build_styles()
-    story = convert(SOURCE.read_text(encoding="utf-8"), styles)
+    story = convert(text, styles)
+
+    def page_footer(canvas, doc):
+        footer(canvas, doc, title, page_label)
 
     doc = SimpleDocTemplate(
-        str(TARGET), pagesize=A4,
+        str(target), pagesize=A4,
         leftMargin=20 * mm, rightMargin=20 * mm,
         topMargin=18 * mm, bottomMargin=20 * mm,
-        title="SSH from Windows with a PIV smart card",
+        title=title,
         author="SSSD Smart Card Profile Manager",
         subject="Windows client setup for smart card SSH login",
     )
-    doc.build(story, onFirstPage=footer, onLaterPages=footer)
-    print("wrote %s" % TARGET.relative_to(ROOT))
+    doc.build(story, onFirstPage=page_footer, onLaterPages=page_footer)
+    print("wrote %s" % target.relative_to(ROOT))
     return 0
 
 
+def main(argv: list[str]) -> int:
+    if argv:
+        # One named source. Its target and footer come from the table when the
+        # path is one of the known guides, so a hand-run matches a full build.
+        wanted = pathlib.Path(argv[0]).resolve()
+        for source, target, title, label in GUIDES:
+            if source.resolve() == wanted:
+                return build_one(source, target, title, label)
+        sys.stderr.write(
+            "not one of the known guides: %s\n  known: %s\n"
+            % (wanted, ", ".join(str(g[0].relative_to(ROOT)) for g in GUIDES))
+        )
+        return 2
+
+    failed = 0
+    for source, target, title, label in GUIDES:
+        failed |= build_one(source, target, title, label)
+    return failed
+
+
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(main(sys.argv[1:]))

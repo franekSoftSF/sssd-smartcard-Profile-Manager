@@ -1,3 +1,60 @@
+sssd-smartcard (0.2.10) unstable; urgency=medium
+
+  * The Windows helper gained an ordered action list, -Launch, and Polish.
+    The remedies used to be printed beside each failing check, so a run that
+    found three things left you scrolling back to reassemble them. They are now
+    collected into one block built from the checks themselves -- a PASS
+    contributes nothing, so the list carries exactly what this run found wrong,
+    sorted by dependency rather than by check order. Steps are individually
+    runnable: a multi-command step says whether its lines are one unit or
+    separate commands, and the Startup shortcut is one line rather than four
+    sharing a variable.
+  * -Launch applies that list and connects. It refuses to install anything:
+    winget downloads, installs and usually elevates, which is a different
+    category from configuring what is already present, so a missing dependency
+    stops it before connect with the install command printed and nothing
+    changed. Every apply reads the value back through a fresh handle before it
+    counts as done, and records the command to reverse it.
+  * -Language en|pl, from a catalogue of 206 messages keyed by id. A missing
+    translation falls back to English visibly; an unknown id returns a loud
+    marker rather than a blank. Seven detection diagnostics are deliberately
+    English-only: they are mostly binary symbols and exact option spellings,
+    and they are what gets pasted into a bug report, where translating the few
+    words around identifiers that must stay verbatim makes comparison harder.
+    The file is now UTF-8 with a BOM, because PowerShell 5.1 assumes the ANSI
+    code page without one and renders the diacritics as mojibake.
+  * docs/windows-smartcard-ssh.pl.md and its PDF: the same material in Polish,
+    with the dialogs described in words rather than shown, each description
+    saying what the operator should see if things are right. Where a control
+    label was not legible in the source material it says so instead of naming
+    it.
+  * A separate release artifact for the Windows side,
+    sssd-smartcard-windows-<version>.zip, holding the script, the guide and a
+    README. The person who needs those two files runs Windows and has no use
+    for a Debian package; making them download the whole project to get a
+    PowerShell script is how a script ends up being emailed around instead.
+    The build refuses to write an archive that does not contain exactly those
+    files, because a zip that looks like a release and delivers nothing is
+    worse than no zip.
+  * Three bugs the first HID Crescendo test found, all assumptions carried over
+    from the only vendor previously available: "reader and card present" passed
+    with every reader empty because it counted readers; the key container was
+    parsed as a GUID, which a named container such as the Crescendo's does not
+    match, so the comparison that exists to catch a stale store entry refused a
+    perfectly good card; and the store-side read matched a regex against a whole
+    multi-line blob, where PowerShell leaves $ anchored to the end of the string.
+  * Two more found while verifying that work. The catalogue invariant test
+    could be bypassed by writing an entry on one line: the parser skipped a
+    shape it did not recognise and every test still passed. It now refuses when
+    it finds an entry it did not itself read -- the guard on the guard. And
+    -Reader naming an absent reader made the token section fall back to all
+    readers while the certificate section filtered to zero and reported "no
+    certificate could be read from any card", blaming the card for one it had
+    read perfectly well and suggesting a minidriver install. Both sections now
+    work from the same reader list.
+
+ -- Szymon Frankiewicz <szymonfrankiewicz@gmail.com>  Wed, 21 Oct 2026 21:30:00 +0200
+
 sssd-smartcard (0.2.9) unstable; urgency=medium
 
   * 'sssd-smartcard debug on|off|status|bundle'. Every failure in this project

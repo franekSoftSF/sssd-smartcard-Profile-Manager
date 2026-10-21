@@ -439,10 +439,14 @@ Key Container = 00000000-1111-2222-3333-444444444444
 Provider = Microsoft Smart Card Key Storage Provider
 ```
 
-**If the two `Key Container` GUIDs differ, that certificate is unusable**,
+**If the two `Key Container` names differ, that certificate is unusable**,
 whatever the store says about it. A store entry whose container cannot be
 opened at all reports `Missing stored keyset` instead, which is the same
 problem in a louder voice.
+
+A container name is **not always a GUID.** HID Crescendo cards give their
+containers human-readable names such as `Example 9A`. The comparison still
+holds; it compares strings, not GUIDs.
 
 Note that `certutil -scinfo` returns a non-zero exit code when *any* card in
 *any* reader has a problem, while still printing complete, correct output for
