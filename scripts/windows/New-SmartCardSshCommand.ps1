@@ -97,6 +97,31 @@
     with a dot and a keyword name is parsed as a new help section, which is why
     that word is bare here.)
 
+.PARAMETER Launch
+    Apply the per-user configuration this run found necessary, re-check it by
+    reading it back, and then start PuTTY with the command line below.
+
+    Every change is reported as it is made, together with the command that
+    reverses it, and a summary of those reverse commands is printed at the end.
+
+    What it will apply, all per-user and all reversible: values under
+    HKCU\Software\SimonTatham\PuTTY (AuthX509, AutoloadCerts, SaveCertList), the
+    per-session AgentFwd and TryAgent when -SessionName was given, the Startup
+    shortcut, loading the certificate into Pageant, and registering the card
+    certificate in your own store.
+
+    What it will NOT do, by design:
+
+      * Install software. winget downloads, installs and usually needs
+        elevation, and that is a change to the machine rather than to your
+        configuration. If something is missing, -Launch stops before connecting
+        and prints the install command for you to run.
+      * Anything needing administrator rights. It fails loudly instead of
+        prompting for elevation.
+      * Write a PIN anywhere, or pass -forcepincache.
+
+    Without -Launch nothing is applied and the script only prints.
+
 .PARAMETER SessionName
     A saved PuTTY session name. With -ForwardAgent, the script reads that
     session's AgentFwd and TryAgent registry values and reports them, with the
@@ -169,7 +194,8 @@ param(
     [string] $Reader,
     [switch] $UseOpenSC,
     [switch] $ForwardAgent,
-    [string] $SessionName
+    [string] $SessionName,
+    [switch] $Launch
 )
 
 Set-StrictMode -Version 2.0
@@ -181,12 +207,95 @@ $ErrorActionPreference = 'Continue'
 
 $script:Findings = @()
 
+# The ordered to-do list that the final "Commands to run on this workstation"
+# block is built from. Steps are appended by the checks themselves, via
+# Write-Finding -Fix, so there is exactly one copy of each remedy: the inline
+# one and the summarised one are the same strings. Adding a remedy in one place
+# and forgetting the other is then impossible by construction.
+$script:Steps = @()
+$script:StepSeq = 0
+
+# Captured here, at script scope, while $PSBoundParameters still refers to the
+# script's own arguments. Get-SelfInvocation rebuilds the command line from it.
+$script:InvokedWith = $PSBoundParameters
+$script:SelfPath = $PSCommandPath
+
+# State shared with the -Launch apply blocks and the re-check. Initialised here
+# because Set-StrictMode makes reading an undefined variable an error, and the
+# re-check runs whether or not every one of these was set along the way.
+$script:ChosenThumbprint = $null
+$script:LaunchPageantExe = $null
+$script:LaunchUser       = $null
+$script:LaunchHost       = $null
+$script:LaunchPort       = 22
+$script:LaunchSessionKey = $null
+$script:LaunchNeedAgentFwd = $false
+$script:LaunchNeedTryAgent = $false
+$script:StartupLnk       = $null
+$script:StartupArgs      = $null
+
+# Dependency ordering. The checks do not run in the order the operator must act
+# in -- the certificate-store check happens last but has to be fixed early -- so
+# each step carries an explicit rank and the block is sorted by it.
+$script:OrderInstall  = 10   # get the software on the box
+$script:OrderRegister = 20   # get the card's certificate into the Windows store
+$script:OrderSettings = 30   # PuTTY / session settings
+$script:OrderPreload  = 40   # Pageant's certificate list
+$script:OrderAgent    = 50   # start Pageant with the certificate loaded
+$script:OrderConnect  = 90   # connect
+
+function Add-Step {
+    param(
+        [int] $Order,
+        [string] $Label,
+        [string[]] $Commands = @(),
+        [string] $Note,
+        # -Launch executes this instead of parsing the command strings. Keeping
+        # the action beside the command that documents it is what stops the two
+        # drifting; a step with no Apply is one -Launch cannot perform, and it
+        # says so rather than pretending.
+        [scriptblock] $Apply,
+        [string[]] $Undo = @(),
+        # Installs are deliberately excluded from -Launch. Flagged here rather
+        # than inferred from the order, so the refusal is explicit.
+        [switch] $IsInstall,
+        # The commands of this step are one unit that must be pasted together
+        # (they share state, e.g. a variable). Without this, multiple commands
+        # are rendered as separately runnable lines. Every step has to survive
+        # being pasted on its own into a fresh prompt.
+        [switch] $Unit
+    )
+    $script:StepSeq++
+    $script:Steps += [pscustomobject]@{
+        Order     = $Order
+        Seq       = $script:StepSeq
+        Label     = $Label
+        Commands  = @($Commands)
+        Note      = $Note
+        Apply     = $Apply
+        Undo      = @($Undo)
+        IsInstall = [bool] $IsInstall
+        Unit      = [bool] $Unit
+    }
+}
+
 function Write-Finding {
     param(
         [ValidateSet('PASS', 'WARN', 'FAIL', 'INFO')] [string] $Status,
         [string] $Check,
         [string] $Detail,
-        [string] $Remedy
+        [string] $Remedy,
+        # Machine-runnable commands that fix this finding. Collected into the
+        # final block as well as being available inline. A step with no
+        # commands but a -FixNote is rendered as an instruction (re-inserting a
+        # token is a real step, but it is not a command).
+        [string[]] $Fix = @(),
+        [string] $FixLabel,
+        [string] $FixNote,
+        [int] $FixOrder = 50,
+        [scriptblock] $FixApply,
+        [string[]] $FixUndo = @(),
+        [switch] $FixIsInstall
     )
     $colour = 'Gray'
     if ($Status -eq 'PASS') { $colour = 'Green' }
@@ -199,6 +308,412 @@ function Write-Finding {
     if ($Remedy) { Write-Host ('         -> {0}' -f $Remedy) -ForegroundColor Cyan }
 
     $script:Findings += [pscustomobject]@{ Status = $Status; Check = $Check }
+
+    # Only a finding that actually needs acting on contributes a step. A PASS
+    # never does, so the final block lists what this run found wrong and
+    # nothing else.
+    if (($Status -eq 'FAIL' -or $Status -eq 'WARN') -and (@($Fix).Count -gt 0 -or $FixNote)) {
+        $label = $FixLabel
+        if (-not $label) { $label = $Check }
+        Add-Step -Order $FixOrder -Label $label -Commands $Fix -Note $FixNote `
+            -Apply $FixApply -Undo $FixUndo -IsInstall:$FixIsInstall
+    }
+}
+
+<#
+    Render the consolidated to-do list.
+
+    Steps come from the checks (Write-Finding -Fix), sorted by dependency rank
+    and then by the order they were found, so running the block top to bottom
+    works: install, register the certificate, settings, Pageant, connect.
+
+    Commands may contain the token <THUMBPRINT>, substituted here. That exists
+    because the agent-related checks run before the card is read, so at the
+    moment Pageant is found not to be running the thumbprint is not yet known.
+    Everything else is resolved where it is discovered.
+#>
+function Show-CommandBlock {
+    param(
+        [string[]] $ConnectCommands = @(),
+        [string] $ConnectLabel,
+        [string] $Thumbprint
+    )
+
+    Write-Section 'Commands to run on this workstation'
+
+    $steps = @($script:Steps | Sort-Object Order, Seq)
+
+    if (@($steps).Count -eq 0 -and @($ConnectCommands).Count -gt 0) {
+        Write-Host '  Every check passed: there is nothing to fix on this workstation.' -ForegroundColor Green
+    } else {
+        Write-Host '  Nothing below has been applied. Copy and run these yourself, in order.' -ForegroundColor Gray
+    }
+    Write-Host ''
+
+    $n = 0
+    foreach ($s in $steps) {
+        $n++
+        Write-Host ('  {0}. {1}' -f $n, $s.Label) -ForegroundColor White
+        if ($s.Note) {
+            Write-Host ('       {0}' -f $s.Note) -ForegroundColor Gray
+        }
+
+        $cmds = @($s.Commands)
+        if ($s.Unit -and @($cmds).Count -gt 1) {
+            Write-Host '       (these lines are one unit -- paste them in together)' -ForegroundColor DarkGray
+        } elseif (@($cmds).Count -gt 1) {
+            Write-Host '       (separate commands; run them in this order)' -ForegroundColor DarkGray
+        }
+
+        $i = 0
+        foreach ($c in $cmds) {
+            $i++
+            $line = $c
+            if ($Thumbprint) { $line = $line -replace '<THUMBPRINT>', $Thumbprint }
+            if (@($cmds).Count -gt 1 -and -not $s.Unit) {
+                Write-Host ('       {0}) {1}' -f [char]([int][char]'a' + $i - 1), $line) -ForegroundColor Cyan
+            } else {
+                Write-Host ('       {0}' -f $line) -ForegroundColor Cyan
+            }
+        }
+        Write-Host ''
+    }
+
+    if (@($ConnectCommands).Count -gt 0) {
+        $n++
+        $label = $ConnectLabel
+        if (-not $label) { $label = 'Connect' }
+        Write-Host ('  {0}. {1}' -f $n, $label) -ForegroundColor White
+        foreach ($c in $ConnectCommands) {
+            Write-Host ('       {0}' -f $c) -ForegroundColor Green
+        }
+        Write-Host ''
+    }
+}
+
+# --------------------------------------------------------------------------
+# Applying changes (-Launch only)
+# --------------------------------------------------------------------------
+
+# Every change -Launch makes is recorded here with the command that reverses it,
+# and the list is printed at the end. The Linux half of this project backs up,
+# validates and can roll back; the least the Windows half can do is say exactly
+# what it touched.
+$script:Applied = @()
+
+function Add-ChangeRecord {
+    param([string] $What, [string[]] $Undo = @())
+    $script:Applied += [pscustomobject]@{ What = $What; Undo = @($Undo) }
+}
+
+# All writes below are per-user: HKCU, the user's own certificate store, and the
+# per-user Startup folder. None needs administrator rights. A write that fails
+# for access reasons is reported as a failure rather than retried with
+# elevation -- the script's header promises the checks need no admin, and
+# silently prompting for it would make that a lie.
+function Set-RegDwordChecked {
+    param([string] $SubKey, [string] $Name, [int] $Value)
+
+    $old = $null
+    try {
+        $read = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey($SubKey)
+        if ($read -and (@($read.GetValueNames()) -contains $Name)) { $old = [int] $read.GetValue($Name) }
+    } catch {
+        Write-Verbose ('could not read {0}\{1} before writing' -f $SubKey, $Name)
+    }
+
+    try {
+        $key = [Microsoft.Win32.Registry]::CurrentUser.CreateSubKey($SubKey)
+        if (-not $key) { throw 'CreateSubKey returned nothing' }
+        $key.SetValue($Name, $Value, [Microsoft.Win32.RegistryValueKind]::DWord)
+    } catch {
+        return [pscustomobject]@{ Ok = $false; Error = $_.Exception.Message; Old = $old; ReadBack = $null }
+    }
+
+    # Read back. "I wrote it" is not evidence that it is set.
+    $back = $null
+    try {
+        $verify = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey($SubKey)
+        if ($verify -and (@($verify.GetValueNames()) -contains $Name)) { $back = [int] $verify.GetValue($Name) }
+    } catch {
+        Write-Verbose ('could not read back {0}\{1}' -f $SubKey, $Name)
+    }
+
+    $undo = @()
+    if ($null -eq $old) {
+        $undo = @(('reg delete "HKCU\{0}" /v {1} /f' -f $SubKey, $Name))
+    } else {
+        $undo = @(('reg add "HKCU\{0}" /v {1} /t REG_DWORD /d {2} /f' -f $SubKey, $Name, $old))
+    }
+
+    return [pscustomobject]@{
+        Ok       = ($back -eq $Value)
+        Error    = $(if ($back -eq $Value) { $null } else { ('read back {0}, expected {1}' -f $back, $Value) })
+        Old      = $old
+        ReadBack = $back
+        Undo     = $undo
+    }
+}
+
+# The shortcut command as ONE pasteable line. The three-statement form shares
+# the $s variable between lines, so pasting it a line at a time into a fresh
+# prompt fails on the second line. Semicolons keep it a single unit.
+function Get-ShortcutOneLiner {
+    param([string] $ShortcutPath, [string] $Target, [string] $Arguments)
+    return ('$s=(New-Object -ComObject WScript.Shell).CreateShortcut("{0}"); $s.TargetPath="{1}"; $s.Arguments="{2}"; $s.Save()' -f `
+        $ShortcutPath, $Target, $Arguments)
+}
+
+function Set-StartupShortcutChecked {
+    param([string] $ShortcutPath, [string] $Target, [string] $Arguments)
+
+    $existed = Test-Path -LiteralPath $ShortcutPath
+    $backup = $null
+    if ($existed) {
+        $backup = $ShortcutPath + '.bak'
+        try { Copy-Item -LiteralPath $ShortcutPath -Destination $backup -Force } catch { $backup = $null }
+    }
+
+    try {
+        $shell = New-Object -ComObject WScript.Shell
+        $sc = $shell.CreateShortcut($ShortcutPath)
+        $sc.TargetPath = $Target
+        $sc.Arguments = $Arguments
+        $sc.Save()
+    } catch {
+        return [pscustomobject]@{ Ok = $false; Error = $_.Exception.Message; Undo = @() }
+    }
+
+    # Read it back through a fresh COM object, not from what we just set.
+    $ok = $false
+    $detail = $null
+    try {
+        $shell2 = New-Object -ComObject WScript.Shell
+        $check = $shell2.CreateShortcut($ShortcutPath)
+        $ok = ($check.TargetPath -eq $Target -and $check.Arguments.Trim() -eq $Arguments.Trim())
+        $detail = ('target={0} args={1}' -f $check.TargetPath, $check.Arguments)
+    } catch {
+        $detail = 'could not read the shortcut back'
+    }
+
+    $undo = @()
+    if ($existed -and $backup) {
+        $undo = @(('Move-Item -LiteralPath "{0}" -Destination "{1}" -Force' -f $backup, $ShortcutPath))
+    } else {
+        $undo = @(('Remove-Item -LiteralPath "{0}"' -f $ShortcutPath))
+    }
+
+    return [pscustomobject]@{
+        Ok     = $ok
+        Error  = $(if ($ok) { $null } else { $detail })
+        Undo   = $undo
+    }
+}
+
+<#
+    -Launch: apply, verify, connect.
+
+    Order of business, and none of it is negotiable:
+
+      1. If anything has to be INSTALLED, stop. Installing is a change to the
+         machine, usually needs elevation, and is not what "configure what is
+         already here" means. Print the command, change nothing, exit.
+      2. Apply the steps that carry an Apply block, in dependency order.
+         A step without one is reported as "cannot be applied automatically"
+         rather than skipped in silence.
+      3. Re-read what was written. Every apply helper verifies by reading the
+         value back, not by trusting that SetValue returned. Connecting on the
+         strength of "I just wrote it" is the false-PASS pattern this whole
+         project exists to avoid.
+      4. Connect only if the re-check passed.
+      5. Print what changed and how to reverse it.
+#>
+function Invoke-Launch {
+    param([string] $ConnectCommand, [string] $PuttyExe)
+
+    Write-Section 'Applying (-Launch)'
+
+    $steps = @($script:Steps | Sort-Object Order, Seq)
+    $installs = @($steps | Where-Object { $_.IsInstall })
+
+    if (@($installs).Count -gt 0) {
+        Write-Host '  Stopping before any change: something has to be installed first.' -ForegroundColor Red
+        Write-Host '  -Launch configures what is already on this machine; it does not install' -ForegroundColor Yellow
+        Write-Host '  software, because that downloads, usually needs elevation, and changes' -ForegroundColor Yellow
+        Write-Host '  the machine rather than your configuration.' -ForegroundColor Yellow
+        Write-Host ''
+        foreach ($s in $installs) {
+            Write-Host ('    {0}' -f $s.Label) -ForegroundColor White
+            foreach ($c in @($s.Commands)) { Write-Host ('      {0}' -f $c) -ForegroundColor Cyan }
+            if ($s.Note) { Write-Host ('      {0}' -f $s.Note) -ForegroundColor Gray }
+        }
+        Write-Host ''
+        Write-Host '  Install the above, then re-run. NOTHING HAS BEEN CHANGED.' -ForegroundColor Red
+        Write-Host ''
+        return 3
+    }
+
+    $actionable = @($steps | Where-Object { -not $_.IsInstall })
+    $failed = 0
+
+    if (@($actionable).Count -eq 0) {
+        Write-Host '  Nothing to apply: this workstation is already configured.' -ForegroundColor Green
+    }
+
+    foreach ($s in $actionable) {
+        if (-not $s.Apply) {
+            Write-Host ('  [SKIP] {0}' -f $s.Label) -ForegroundColor Yellow
+            Write-Host '         Cannot be applied automatically -- it needs a decision or a' -ForegroundColor Gray
+            Write-Host '         file this script will not invent. Run it yourself:' -ForegroundColor Gray
+            foreach ($c in @($s.Commands)) {
+                $line = $c -replace '<THUMBPRINT>', $script:ChosenThumbprint
+                Write-Host ('           {0}' -f $line) -ForegroundColor Cyan
+            }
+            $failed++
+            continue
+        }
+
+        $result = $null
+        try {
+            $result = & $s.Apply
+        } catch {
+            Write-Host ('  [FAIL] {0}' -f $s.Label) -ForegroundColor Red
+            Write-Host ('         {0}' -f $_.Exception.Message) -ForegroundColor Red
+            $failed++
+            continue
+        }
+
+        if ($result -and $result.Ok) {
+            Write-Host ('  [DONE] {0}' -f $s.Label) -ForegroundColor Green
+            $undo = @()
+            if ($result.PSObject.Properties.Name -contains 'Undo') { $undo = @($result.Undo) }
+            if (@($undo).Count -eq 0) { $undo = @($s.Undo) }
+            Add-ChangeRecord -What $s.Label -Undo $undo
+            foreach ($u in $undo) {
+                Write-Host ('         undo: {0}' -f $u) -ForegroundColor DarkGray
+            }
+        } else {
+            $msg = 'no result returned'
+            if ($result -and $result.PSObject.Properties.Name -contains 'Error' -and $result.Error) { $msg = $result.Error }
+            Write-Host ('  [FAIL] {0}' -f $s.Label) -ForegroundColor Red
+            Write-Host ('         {0}' -f $msg) -ForegroundColor Red
+            Write-Host '         If this says access is denied, it needs rights the checks do not' -ForegroundColor Gray
+            Write-Host '         assume. Nothing is retried with elevation.' -ForegroundColor Gray
+            $failed++
+        }
+    }
+
+    Write-Host ''
+    Show-AppliedSummary
+
+    if ($failed -gt 0) {
+        Write-Host ('  {0} step(s) did not complete, so no connection is started.' -f $failed) -ForegroundColor Red
+        Write-Host '  Fix those and re-run, or run the printed commands yourself.' -ForegroundColor Yellow
+        Write-Host ''
+        return 4
+    }
+
+    # Re-check: read the state back rather than assume the writes took.
+    Write-Host '  Re-checking the applied state by reading it back...' -ForegroundColor White
+    $recheck = Test-LaunchPreconditions
+    foreach ($line in $recheck.Lines) {
+        Write-Host ('    {0}' -f $line) -ForegroundColor Gray
+    }
+    if (-not $recheck.Ok) {
+        Write-Host ''
+        Write-Host '  The re-check did not pass, so no connection is started.' -ForegroundColor Red
+        Write-Host ''
+        return 5
+    }
+    Write-Host '  Re-check passed.' -ForegroundColor Green
+    Write-Host ''
+
+    if (-not $PuttyExe -or -not (Test-Path -LiteralPath $PuttyExe)) {
+        Write-Host '  PuTTY was not found, so there is nothing to start.' -ForegroundColor Red
+        return 6
+    }
+
+    Write-Host ('  Starting: {0}' -f $ConnectCommand) -ForegroundColor Green
+    Write-Host '  PuTTY will ask for the card PIN. This script never sees it.' -ForegroundColor Gray
+    Write-Host ''
+    try {
+        # Argument array rather than a command string, so a path with spaces
+        # needs no quoting games.
+        $argList = @('-x509off')
+        if ($ForwardAgent) { $argList += '-A' }
+        $argList += @('-i', ('CAPI:' + $script:ChosenThumbprint), '-l', $script:LaunchUser)
+        if ($script:LaunchPort -ne 22) { $argList += @('-P', "$($script:LaunchPort)") }
+        $argList += $script:LaunchHost
+        Start-Process -FilePath $PuttyExe -ArgumentList $argList | Out-Null
+    } catch {
+        Write-Host ('  Could not start PuTTY: {0}' -f $_.Exception.Message) -ForegroundColor Red
+        return 7
+    }
+    return 0
+}
+
+# Read back the handful of things -Launch may have changed. Deliberately a
+# fresh read of the registry and the filesystem, sharing no state with the
+# apply step.
+function Test-LaunchPreconditions {
+    $lines = @()
+    $ok = $true
+
+    $x = Get-PuttyGlobalX509
+    if ($null -eq $x -or $x -eq 0) {
+        $lines += 'AuthX509 = 0 or unset (X.509 mode off): ok'
+    } else {
+        $lines += ('AuthX509 = {0}: still on' -f $x); $ok = $false
+    }
+
+    $pre = Get-PageantPreloadConfig
+    if ($pre.AutoloadCerts -eq 1) {
+        $lines += 'AutoloadCerts = 1: still enumerating the whole store'; $ok = $false
+    } else {
+        $lines += 'AutoloadCerts = 0 or unset: ok'
+    }
+
+    if ($script:LaunchSessionKey) {
+        $s = Get-PuttySessionAgentSetting -Name $script:LaunchSessionKey
+        if ($s.Found -and $s.AgentFwd -eq 1 -and $s.TryAgent -eq 1) {
+            $lines += ('session "{0}": AgentFwd=1, TryAgent=1: ok' -f $s.KeyName)
+        } elseif ($s.Found) {
+            $lines += ('session "{0}": AgentFwd={1}, TryAgent={2}: not both 1' -f $s.KeyName, $s.AgentFwd, $s.TryAgent)
+            $ok = $false
+        }
+    }
+
+    if ($script:StartupLnk -and (Test-Path -LiteralPath $script:StartupLnk)) {
+        try {
+            $sc = (New-Object -ComObject WScript.Shell).CreateShortcut($script:StartupLnk)
+            if ($sc.Arguments.Trim() -ieq $script:StartupArgs) {
+                $lines += 'Startup shortcut arguments match the chosen certificate: ok'
+            } else {
+                $lines += ('Startup shortcut arguments are "{0}": not the chosen certificate' -f $sc.Arguments.Trim())
+                $ok = $false
+            }
+        } catch {
+            $lines += 'Startup shortcut could not be read back'; $ok = $false
+        }
+    }
+
+    return [pscustomobject]@{ Ok = $ok; Lines = $lines }
+}
+
+function Show-AppliedSummary {
+    if (@($script:Applied).Count -eq 0) {
+        Write-Host '  No changes were made.' -ForegroundColor Gray
+        Write-Host ''
+        return
+    }
+    Write-Host ('  {0} change(s) made. To reverse them:' -f @($script:Applied).Count) -ForegroundColor White
+    foreach ($a in $script:Applied) {
+        Write-Host ('    {0}' -f $a.What) -ForegroundColor Gray
+        foreach ($u in @($a.Undo)) {
+            Write-Host ('      {0}' -f $u) -ForegroundColor Cyan
+        }
+    }
+    Write-Host ''
 }
 
 function Write-Section {
@@ -228,6 +743,15 @@ function Invoke-Capture {
         return [pscustomobject]@{ Ok = $false; Text = ''; ExitCode = $null; Error = $_.Exception.Message }
     }
     return [pscustomobject]@{ Ok = $true; Text = $text; ExitCode = $code; Error = $null }
+}
+
+# Quote a path for a command line if it contains spaces. Defined here with the
+# other helpers rather than beside the connection command, because the Pageant
+# check builds a command line long before that point.
+function Format-Exe {
+    param([string] $Path)
+    if ($Path -match '\s') { return '"' + $Path + '"' }
+    return $Path
 }
 
 function Get-FirstExistingPath {
@@ -653,6 +1177,12 @@ function Get-CardCertificate {
     $currentCard = $null
     $pendingContainer = $null
     $pendingSubject = $null
+    # The CSP that -scinfo names for this card. It is per card, and it is the
+    # value "certutil -repairstore -csp" needs: a Crescendo reported
+    # "Microsoft Base Smart Card Crypto Provider" where a YubiKey reported
+    # "Microsoft Smart Card Key Storage Provider". Guessing it is how the
+    # repair silently fails, so it is read rather than assumed.
+    $pendingProvider = $null
 
     foreach ($line in ($run.Text -split "`r?`n")) {
 
@@ -681,6 +1211,9 @@ function Get-CardCertificate {
         if ($line -match 'Key Container\s*=\s*(.+?)\s*(?:\[Default Container\])?\s*$') {
             $pendingContainer = $Matches[1].Trim(); continue
         }
+        if ($line -match '^\s*Provider\s*=\s*(\S.*?)\s*$') {
+            $pendingProvider = $Matches[1].Trim(); continue
+        }
         if ($line -match '^\s*Subject:\s*(\S.*?)\s*$') {
             $pendingSubject = $Matches[1]; continue
         }
@@ -690,6 +1223,7 @@ function Get-CardCertificate {
                 Reader        = $currentReader
                 Card          = $currentCard
                 CardContainer = $pendingContainer
+                CardProvider  = $pendingProvider
                 Subject       = $pendingSubject
                 Source        = 'certutil -scinfo'
             })
@@ -1001,6 +1535,52 @@ function Show-MinidriverAdvice {
     }
 }
 
+# Add the vendor minidriver install to the to-do list. Only Yubico has a winget
+# package -- verified against the live catalogue, as were the other ids used in
+# this script. HID ship no package at all, so that step is a note pointing at
+# their documented download location rather than a command that does not exist.
+function Add-MinidriverStep {
+    param([string] $Family, [string] $TokenName)
+
+    if ($Family -eq 'Yubico') {
+        Add-Step -Order $script:OrderInstall `
+            -Label 'Install the YubiKey Smart Card Minidriver (for provisioning/management)' `
+            -Commands @('winget install --id Yubico.YubiKeySmartCardMinidriver')
+    }
+    elseif ($Family -eq 'HIDCrescendo') {
+        Add-Step -Order $script:OrderInstall `
+            -Label 'Install the HID Crescendo Minidriver (no winget package exists)' `
+            -Note 'Download it from www.hidglobal.com/drivers -- HID''s own documentation names that as the location, and the portal refuses automated clients, so open it in a browser or ask your HID representative. Install docs: https://docs.hidglobal.com/crescendo-md-v1.3/MiniDriver/install_minidriver.htm'
+    }
+    else {
+        Add-Step -Order $script:OrderInstall `
+            -Label ('Find the minidriver for this token: {0}' -f $TokenName) `
+            -Note 'This vendor is not one the script recognises, so it cannot name the driver. Check the vendor''s own support site. Windows'' inbox PIV minidriver (msclmd.inf) is often enough on its own for an already-provisioned card, so this may not be the problem at all.'
+    }
+}
+
+# How to re-run this script, for the "then re-run" step. Rebuilt from the real
+# invocation so that the operator's own switches survive the round trip.
+#
+# NB: it reads $script:InvokedWith, captured at script scope, NOT
+# $PSBoundParameters. Inside a function that automatic variable holds the
+# *function's* own bound parameters, which here is always empty -- the first
+# version of this printed the script path with every argument silently dropped.
+function Get-SelfInvocation {
+    $self = $script:SelfPath
+    if (-not $self) { $self = '.\New-SmartCardSshCommand.ps1' }
+    $parts = @((Format-Exe $self))
+    foreach ($kv in $script:InvokedWith.GetEnumerator()) {
+        $v = $kv.Value
+        if ($v -is [switch]) {
+            if ($v.IsPresent) { $parts += ('-{0}' -f $kv.Key) }
+        } else {
+            $parts += ('-{0} {1}' -f $kv.Key, (Format-Exe ([string] $v)))
+        }
+    }
+    return ($parts -join ' ')
+}
+
 # --------------------------------------------------------------------------
 # Main
 # --------------------------------------------------------------------------
@@ -1024,7 +1604,10 @@ $cac = $null
 if (-not $puttyExe) {
     Write-Finding -Status 'FAIL' -Check 'PuTTY-CAC present' `
         -Detail 'no putty.exe found in the usual install locations or on PATH' `
-        -Remedy 'install PuTTY-CAC: winget install --id NoMoreFood.PuTTY-CAC (releases: https://github.com/NoMoreFood/putty-cac/releases)'
+        -Remedy 'install PuTTY-CAC: winget install --id NoMoreFood.PuTTY-CAC (releases: https://github.com/NoMoreFood/putty-cac/releases)' `
+        -FixLabel 'Install PuTTY-CAC (stock PuTTY cannot do CAPI: at all)' `
+        -FixOrder $script:OrderInstall -FixIsInstall `
+        -Fix @('winget install --id NoMoreFood.PuTTY-CAC')
 } else {
     $cac = Test-PuttyCac -PuttyExe $puttyExe
     $detail = '{0}  [version: {1}]' -f $puttyExe, $cac.FileVersion
@@ -1036,7 +1619,10 @@ if (-not $puttyExe) {
     } else {
         Write-Finding -Status 'FAIL' -Check 'PuTTY-CAC present' `
             -Detail ('this looks like stock PuTTY, which has no CAPI: support -- {0}' -f $detail) `
-            -Remedy 'install PuTTY-CAC: winget install --id NoMoreFood.PuTTY-CAC   (or pass -PuttyPath to point at an existing PuTTY-CAC install)'
+            -Remedy 'install PuTTY-CAC: winget install --id NoMoreFood.PuTTY-CAC   (or pass -PuttyPath to point at an existing PuTTY-CAC install)' `
+            -FixLabel 'Install PuTTY-CAC (what is installed is stock PuTTY, which has no CAPI: support)' `
+            -FixOrder $script:OrderInstall -FixIsInstall `
+            -Fix @('winget install --id NoMoreFood.PuTTY-CAC')
         Write-Host ('         plink -x509off probe: {0}' -f $cac.ProbeResult) -ForegroundColor DarkGray
     }
 }
@@ -1070,7 +1656,10 @@ if ($ForwardAgent -or $SessionName) {
         if ($puttyExe) { $pageantExe = Join-Path (Split-Path -Parent $puttyExe) 'pageant.exe' }
         Write-Finding -Status 'FAIL' -Check 'Pageant is running and serving' `
             -Detail $pageant.HowDetected `
-            -Remedy ('start Pageant and load the card certificate into it before connecting: "{0}"' -f $pageantExe)
+            -Remedy ('start Pageant and load the card certificate into it before connecting: "{0}"' -f $pageantExe) `
+            -FixLabel 'Start Pageant with the card certificate loaded' `
+            -FixOrder $script:OrderAgent `
+            -Fix @(('{0} CAPI:<THUMBPRINT>' -f (Format-Exe $pageantExe)))
     }
 
     Write-Host '         Pageant must already be running with the certificate loaded' -ForegroundColor DarkGray
@@ -1093,6 +1682,9 @@ if ($ForwardAgent -or $SessionName) {
         } else {
             $fwd = $sess.AgentFwd
             $try = $sess.TryAgent
+            $script:LaunchSessionKey = $sess.KeyName
+            $script:LaunchNeedAgentFwd = ($fwd -ne 1)
+            $script:LaunchNeedTryAgent = ($try -ne 1)
             $fwdText = 'absent (treated as off)'
             if ($null -ne $fwd) { $fwdText = "$fwd" }
 
@@ -1103,17 +1695,41 @@ if ($ForwardAgent -or $SessionName) {
                 $why = @()
                 if ($fwd -ne 1) { $why += ('AgentFwd={0} (agent forwarding off)' -f $fwdText) }
                 if ($try -ne 1) { $why += ('TryAgent={0} (Pageant not consulted at all)' -f $try) }
+                # Built as a plain array first. Writing the filter as a pipe
+                # inside the @( ... ) argument parses on PowerShell 7 but is
+                # "An empty pipe element is not allowed" on 5.1, which is the
+                # version this has to work on.
+                $sessionFix = @()
+                if ($fwd -ne 1) { $sessionFix += ('reg add "{0}" /v AgentFwd /t REG_DWORD /d 1 /f' -f $sess.RegPath) }
+                if ($try -ne 1) { $sessionFix += ('reg add "{0}" /v TryAgent /t REG_DWORD /d 1 /f' -f $sess.RegPath) }
+
                 Write-Finding -Status 'FAIL' -Check 'Saved session has agent forwarding enabled' `
                     -Detail ('session "{0}": {1}' -f $sess.KeyName, ($why -join '; ')) `
-                    -Remedy 'either tick Connection > SSH > Auth > "Allow agent forwarding" and re-save the session, or set the values directly (commands below)'
+                    -Remedy 'either tick Connection > SSH > Auth > "Allow agent forwarding" and re-save the session, or set the values directly (commands below)' `
+                    -FixLabel ('Enable agent forwarding on the saved session "{0}"' -f $sess.KeyName) `
+                    -FixOrder $script:OrderSettings `
+                    -Fix $sessionFix `
+                    -FixApply {
+                        $path = 'Software\SimonTatham\PuTTY\Sessions\' + $script:LaunchSessionKey
+                        $r1 = $null; $r2 = $null
+                        if ($script:LaunchNeedAgentFwd) { $r1 = Set-RegDwordChecked -SubKey $path -Name 'AgentFwd' -Value 1 }
+                        if ($script:LaunchNeedTryAgent) { $r2 = Set-RegDwordChecked -SubKey $path -Name 'TryAgent' -Value 1 }
+                        $done = @(@($r1, $r2) | Where-Object { $_ })
+                        $bad = @($done | Where-Object { -not $_.Ok })
+                        $undo = @($done | ForEach-Object { $_.Undo })
+                        if (@($bad).Count -gt 0) {
+                            [pscustomobject]@{ Ok = $false; Error = (@($bad | ForEach-Object { $_.Error }) -join '; '); Undo = $undo }
+                        } else {
+                            [pscustomobject]@{ Ok = $true; Error = $null; Undo = $undo }
+                        }
+                    }
+                # Printed from the same array the fix was built from, so the
+                # inline advice and the summarised step cannot disagree.
                 Write-Host ''
-                if ($fwd -ne 1) {
-                    Write-Host ('         reg add "{0}" /v AgentFwd /t REG_DWORD /d 1 /f' -f $sess.RegPath) -ForegroundColor Cyan
+                foreach ($line in $sessionFix) {
+                    Write-Host ('         {0}' -f $line) -ForegroundColor Cyan
                 }
-                if ($try -ne 1) {
-                    Write-Host ('         reg add "{0}" /v TryAgent /t REG_DWORD /d 1 /f' -f $sess.RegPath) -ForegroundColor Cyan
-                }
-                Write-Host '         (the script changes nothing itself -- run these yourself if you want them)' -ForegroundColor DarkGray
+                Write-Host '         (the script changes nothing unless -Launch is given)' -ForegroundColor DarkGray
             }
             Write-Host ('         Note: -A on the command line covers this run regardless of AgentFwd;' ) -ForegroundColor DarkGray
             Write-Host  '         the saved value matters when the session is launched from the UI.' -ForegroundColor DarkGray
@@ -1146,7 +1762,11 @@ if (-not $preload.Readable) {
     if ($preload.AutoloadCerts -eq 1) {
         Write-Finding -Status 'WARN' -Check 'Pageant preloads one certificate, not the whole store' `
             -Detail ('AutoloadCerts = 1: Pageant re-enumerates the ENTIRE Windows certificate store at every start and rewrites SaveCertList (currently {0}), dead key containers included' -f $countText) `
-            -Remedy 'set AutoloadCerts = 0 and preload the one certificate instead (commands printed below). Trimming SaveCertList by hand does nothing while this is 1 -- it is rebuilt on the next start'
+            -Remedy 'set AutoloadCerts = 0 and preload the one certificate instead (commands printed below). Trimming SaveCertList by hand does nothing while this is 1 -- it is rebuilt on the next start' `
+            -FixLabel 'Stop Pageant enumerating the whole certificate store (MaxAuthTries)' `
+            -FixOrder $script:OrderPreload `
+            -Fix @('reg add "HKCU\Software\SimonTatham\PuTTY" /v AutoloadCerts /t REG_DWORD /d 0 /f') `
+            -FixApply { Set-RegDwordChecked -SubKey 'Software\SimonTatham\PuTTY' -Name 'AutoloadCerts' -Value 0 }
         Write-Host '         Why it matters: the agent offers keys ONE AT A TIME and OpenSSH''s' -ForegroundColor Yellow
         Write-Host '         default MaxAuthTries is 6. With a full store the card''s key may' -ForegroundColor Yellow
         Write-Host '         never be reached, and you get "Server refused our key" -- the same' -ForegroundColor Yellow
@@ -1279,6 +1899,7 @@ if ($UseOpenSC) {
                 Reader        = $e.Reader
                 Card          = $null
                 CardContainer = $null
+                CardProvider  = $null
                 Subject       = $null
                 Source        = $e.Source
             }
@@ -1296,7 +1917,7 @@ if ($Thumbprint) {
     if (@($candidates).Count -eq 0) {
         $candidates = @([pscustomobject]@{
             Thumbprint = $wanted; Reader = '(supplied by -Thumbprint)'; Card = $null
-            CardContainer = $null; Subject = $null; Source = '-Thumbprint'
+            CardContainer = $null; CardProvider = $null; Subject = $null; Source = '-Thumbprint'
         })
     }
 }
@@ -1326,10 +1947,33 @@ if (@($candidates).Count -eq 0) {
             Write-Host '    container in store: unknown' -ForegroundColor Gray
         }
 
+        # The CSP for -repairstore, taken from what -scinfo actually reported
+        # for this card. Falls back to the store's own Provider, then to a
+        # placeholder -- never to a guessed provider name, because the wrong
+        # CSP makes -repairstore fail in a way that looks like a bad card.
+        # Computed after $store is read, since that is one of the sources.
+        $csp = $c.CardProvider
+        if (-not $csp) { $csp = $store.Provider }
+        if (-not $csp) { $csp = '<the Provider that -scinfo names for this card>' }
+
         if (-not $store.InStore) {
             Write-Finding -Status 'FAIL' -Check ('{0}: present in the user certificate store' -f $c.Thumbprint) `
                 -Detail 'the certificate is on the card but not in Cert:\CurrentUser\My' `
-                -Remedy 'CAPI: addressing reads the store, so the certificate has to be registered there'
+                -Remedy 'CAPI: addressing reads the store, so the certificate has to be registered there' `
+                -FixLabel ('Re-insert the token, then re-run -- certificate {0} is on the card but not in the store' -f $c.Thumbprint) `
+                -FixOrder $script:OrderRegister `
+                -FixNote 'The propagation service only registers card certificates on an insertion event, so a certificate written to a card that was already in the reader is never seen. Unplug the token, plug it back in, and run this script again. The two steps that follow are only needed if that does not fix it.'
+
+            # Two genuinely separate commands, run in order, so they are two
+            # numbered steps rather than one step with two lines.
+            Add-Step -Order $script:OrderRegister `
+                -Label ('Only if re-inserting did not work: add certificate {0} to the store' -f $c.Thumbprint) `
+                -Note 'Read the certificate off the card first -- see -UseOpenSC, which prints the pkcs11-tool command that writes it to a .der file.' `
+                -Commands @('certutil -user -addstore My <cert.der>')
+            Add-Step -Order $script:OrderRegister `
+                -Label ('Only if re-inserting did not work: bind {0} to the key on the card' -f $c.Thumbprint) `
+                -Note '"Encryption test passed" in the output means the binding took. The CSP below is the one -scinfo reported for this card; a wrong CSP fails in a way that looks like a bad card.' `
+                -Commands @(('certutil -user -csp "{0}" -repairstore My {1}' -f $csp, $c.Thumbprint))
             Write-Host '         Re-inserting the token is worth trying first: the propagation' -ForegroundColor Yellow
             Write-Host '         service registers card certificates on an insertion event, so a' -ForegroundColor Yellow
             Write-Host '         certificate written to a card that was already in the reader is' -ForegroundColor Yellow
@@ -1360,7 +2004,11 @@ if (@($candidates).Count -eq 0) {
         if ($store.MissingKeyset) {
             Write-Finding -Status 'FAIL' -Check ('{0}: key container resolves' -f $c.Thumbprint) `
                 -Detail 'certutil reports "Missing stored keyset" -- the store entry names a key container that cannot be opened' `
-                -Remedy 'this certificate is unusable; pick another, or delete the stale store entry and re-register the card certificate'
+                -Remedy 'this certificate is unusable; pick another, or delete the stale store entry and re-register the card certificate' `
+                -FixLabel ('Re-bind store entry {0} to the key on the card' -f $c.Thumbprint) `
+                -FixOrder $script:OrderRegister `
+                -FixNote '"Encryption test passed" in the output means the binding took. If it still fails the certificate belongs to a card that is not here -- pick another, or delete the entry with "certutil -user -delstore My <thumbprint>".' `
+                -Fix @(('certutil -user -csp "{0}" -repairstore My {1}' -f $csp, $c.Thumbprint))
         } elseif (-not $store.Container -or @($onCard).Count -eq 0) {
             Write-Finding -Status 'WARN' -Check ('{0}: key container matches the card' -f $c.Thumbprint) `
                 -Detail 'could not read one or both container GUIDs, so the comparison is unknown' `
@@ -1410,13 +2058,29 @@ if (@($usable).Count -eq 0) {
     }
     if ($family) { Show-MinidriverAdvice -Family $family -TokenName $tokenName }
 
+    # With no certificate to work from, the minidriver and OpenSC installs are
+    # the steps that might actually produce one, so they join the list here
+    # rather than at their own checks -- where they would be noise on a machine
+    # whose card reads fine.
+    foreach ($t in $tokens) { Add-MinidriverStep -Family $t.Family -TokenName $t.Reader }
+    if (-not ($opensc.Pkcs11Tool -and $opensc.OpenScTool)) {
+        Add-Step -Order $script:OrderInstall `
+            -Label 'Install OpenSC, to read the certificate off the card' `
+            -Commands @('winget install --id OpenSC.OpenSC')
+    }
+
     if ($opensc.Pkcs11Tool -and $opensc.Module -and -not $UseOpenSC) {
         Write-Host ''
         Write-Host '  To read the certificates straight off the card, independently of the' -ForegroundColor Gray
         Write-Host '  Windows store, re-run this script with -UseOpenSC, or by hand:' -ForegroundColor Gray
         Write-Host ('    & "{0}" --module "{1}" --list-token-slots' -f $opensc.Pkcs11Tool, $opensc.Module) -ForegroundColor Gray
     }
-    Write-Host ''
+
+    Add-Step -Order $script:OrderConnect `
+        -Label 'Re-run this script once the steps above are done' `
+        -Commands @((Get-SelfInvocation))
+
+    Show-CommandBlock
     exit 1
 }
 
@@ -1430,10 +2094,22 @@ if (@($usable).Count -gt 1) {
     Write-Host ''
     Write-Host '  Re-run with -Thumbprint <sha1>, or -Reader <text> to narrow by reader.' -ForegroundColor Yellow
     Write-Host ''
+
+    Add-Step -Order $script:OrderConnect `
+        -Label 'Re-run naming the certificate you want' `
+        -Commands @(('{0} -Thumbprint {1}' -f (Get-SelfInvocation), $usable[0].Thumbprint)) `
+        -Note 'The thumbprint above is the first of the usable certificates listed; substitute whichever one you mean.'
+
+    Show-CommandBlock
     exit 2
 }
 
 $chosen = $usable[0]
+
+$thumbLower = $chosen.Thumbprint.ToLower()
+$pageantForCmd = 'pageant.exe'
+if ($puttyExe) { $pageantForCmd = Join-Path (Split-Path -Parent $puttyExe) 'pageant.exe' }
+$startupDir = Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs\Startup'
 
 $effUser = $User
 $effHost = $ComputerName
@@ -1441,12 +2117,14 @@ $placeholder = $false
 if (-not $effUser) { $effUser = 'someone@ad.example.com'; $placeholder = $true }
 if (-not $effHost) { $effHost = 'linux-host.ad.example.com'; $placeholder = $true }
 
+$script:LaunchUser = $effUser
+$script:LaunchHost = $effHost
+$script:LaunchPort = $Port
+
 $puttyForCmd = $puttyExe
 if (-not $puttyForCmd) { $puttyForCmd = 'putty.exe' }
 $plinkForCmd = 'plink.exe'
 if ($cac -and $cac.PlinkPath) { $plinkForCmd = $cac.PlinkPath }
-
-function Format-Exe { param([string] $Path) if ($Path -match '\s') { return '"' + $Path + '"' } return $Path }
 
 $portArgs = ''
 if ($Port -ne 22) { $portArgs = ' -P {0}' -f $Port }
@@ -1470,7 +2148,41 @@ $interactive = '{0} -x509off{1} -i CAPI:{2} -l {3}{4} {5}' -f `
 $scripted = '{0} -x509off{1} -batch -i CAPI:{2} -l {3}{4} {5}' -f `
     (Format-Exe $plinkForCmd), $agentArgs, $chosen.Thumbprint, $effUser, $portArgs, $effHost
 
-Write-Host '  All checks passed. Run this yourself -- the script does not launch it.' -ForegroundColor Green
+$script:ChosenThumbprint = $chosen.Thumbprint
+$script:LaunchPageantExe = $pageantForCmd
+
+# Steps that need the chosen thumbprint are added here, where it is known, and
+# only when the machine is not already set up that way.
+$script:StartupLnk = Join-Path $startupDir 'Pageant.lnk'
+$startupArgs = 'CAPI:' + $thumbLower
+$script:StartupArgs = $startupArgs
+
+$startupOk = $false
+try {
+    if (Test-Path -LiteralPath $script:StartupLnk) {
+        $probe = (New-Object -ComObject WScript.Shell).CreateShortcut($script:StartupLnk)
+        $startupOk = ($probe.Arguments.Trim() -ieq $startupArgs)
+    }
+} catch {
+    Write-Verbose 'could not inspect the existing Startup shortcut'
+}
+
+if (-not $startupOk) {
+    Add-Step -Order $script:OrderPreload `
+        -Label 'Load the certificate into Pageant at every logon' `
+        -Note 'One line, so it pastes as a single unit. Replaces any existing Pageant shortcut in Startup; -Launch keeps a .bak of the old one.' `
+        -Commands @((Get-ShortcutOneLiner -ShortcutPath $script:StartupLnk -Target $pageantForCmd -Arguments $startupArgs)) `
+        -Apply {
+            Set-StartupShortcutChecked -ShortcutPath $script:StartupLnk `
+                -Target $script:LaunchPageantExe -Arguments $script:StartupArgs
+        }
+}
+
+if ($Launch) {
+    Write-Host '  All checks passed. -Launch will apply what is needed and then connect.' -ForegroundColor Green
+} else {
+    Write-Host '  All checks passed. Run this yourself -- the script does not launch it.' -ForegroundColor Green
+}
 Write-Host ''
 Write-Host '  Interactive (PuTTY window):' -ForegroundColor White
 Write-Host ('    {0}' -f $interactive) -ForegroundColor Green
@@ -1534,10 +2246,6 @@ if ($ForwardAgent) {
 # and the upstream README example differ in case, which is nothing to worry
 # about, but matching what Pageant writes keeps the list from gaining a
 # duplicate entry.
-$thumbLower = $chosen.Thumbprint.ToLower()
-$pageantForCmd = 'pageant.exe'
-if ($puttyExe) { $pageantForCmd = Join-Path (Split-Path -Parent $puttyExe) 'pageant.exe' }
-$startupDir = Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs\Startup'
 
 Write-Host '  To have Pageant come up at logon with just this certificate loaded,' -ForegroundColor White
 Write-Host '  so that no "Add CAPI Cert" is needed before each session:' -ForegroundColor White
@@ -1551,11 +2259,8 @@ Write-Host '       Pageant adds it to that agent rather than starting a second o
 Write-Host ('       {0} CAPI:{1}' -f (Format-Exe $pageantForCmd), $thumbLower) -ForegroundColor Cyan
 Write-Host ''
 Write-Host '    3. Make it happen at logon, via a Startup shortcut whose Arguments' -ForegroundColor Gray
-Write-Host '       are the CAPI: thumbprint:' -ForegroundColor Gray
-Write-Host ('       $s = (New-Object -ComObject WScript.Shell).CreateShortcut("{0}\Pageant.lnk")' -f $startupDir) -ForegroundColor Cyan
-Write-Host ('       $s.TargetPath = "{0}"' -f $pageantForCmd) -ForegroundColor Cyan
-Write-Host ('       $s.Arguments  = "CAPI:{0}"' -f $thumbLower) -ForegroundColor Cyan
-Write-Host '       $s.Save()' -ForegroundColor Cyan
+Write-Host '       are the CAPI: thumbprint (one line, so it pastes as a unit):' -ForegroundColor Gray
+Write-Host ('       {0}' -f (Get-ShortcutOneLiner -ShortcutPath (Join-Path $startupDir 'Pageant.lnk') -Target $pageantForCmd -Arguments ('CAPI:' + $thumbLower))) -ForegroundColor Cyan
 Write-Host ''
 Write-Host '    None of the above is applied by this script. Run it yourself.' -ForegroundColor DarkGray
 Write-Host '    Afterwards SaveCertList should stay at one entry across restarts,' -ForegroundColor DarkGray
@@ -1573,5 +2278,25 @@ Write-Host '  the certificate and sshd fetches it through' -ForegroundColor Gray
 Write-Host '  AuthorizedKeysCommand /usr/bin/sss_ssh_authorizedkeys, so revoking the' -ForegroundColor Gray
 Write-Host '  certificate revokes SSH access too.' -ForegroundColor Gray
 Write-Host ''
+
+# The consolidated list, last, because that is where a reader looks for "what
+# do I actually run". Everything above is explanation; this is the to-do list.
+Show-CommandBlock -Thumbprint $chosen.Thumbprint `
+    -ConnectLabel 'Connect' -ConnectCommands @($interactive)
+
+if ($Launch) {
+    # Refuse to connect to the documentation's example host. Without -User and
+    # -ComputerName the emitted command carries placeholders, and "apply and
+    # connect" against ad.example.com is not a useful thing to do by accident.
+    if ($placeholder) {
+        Write-Section 'Applying (-Launch)'
+        Write-Host '  -Launch needs -User and -ComputerName: the command above still' -ForegroundColor Red
+        Write-Host '  contains example values, and connecting to those would be pointless.' -ForegroundColor Red
+        Write-Host '  NOTHING HAS BEEN CHANGED.' -ForegroundColor Red
+        Write-Host ''
+        exit 8
+    }
+    exit (Invoke-Launch -ConnectCommand $interactive -PuttyExe $puttyForCmd)
+}
 
 exit 0
