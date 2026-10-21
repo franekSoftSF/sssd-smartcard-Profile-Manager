@@ -678,8 +678,8 @@ function Get-CardCertificate {
             }
             continue
         }
-        if ($line -match 'Key Container\s*=\s*([0-9a-fA-F-]{36})') {
-            $pendingContainer = $Matches[1].ToLower(); continue
+        if ($line -match 'Key Container\s*=\s*(.+?)\s*(?:\[Default Container\])?\s*$') {
+            $pendingContainer = $Matches[1].Trim(); continue
         }
         if ($line -match '^\s*Subject:\s*(\S.*?)\s*$') {
             $pendingSubject = $Matches[1]; continue
@@ -729,8 +729,8 @@ function Get-CardContainer {
             if (-not $map.ContainsKey($reader)) { $map[$reader] = @() }
             continue
         }
-        if ($line -match 'Key Container\s*=\s*([0-9a-fA-F-]{36})') {
-            $guid = $Matches[1].ToLower()
+        if ($line -match 'Key Container\s*=\s*(.+?)\s*(?:\[Default Container\])?\s*$') {
+            $guid = $Matches[1].Trim()
             if ($reader) {
                 if ($map[$reader] -notcontains $guid) { $map[$reader] += $guid }
             }
@@ -764,14 +764,21 @@ function Get-StoreKeyContainer {
     if ($run.Text -match 'Cert Hash\(sha1\):\s*([0-9a-fA-F]{40})') {
         if ($Matches[1].ToUpper() -eq $Thumb.ToUpper()) { $result.InStore = $true }
     }
-    if ($run.Text -match 'Key Container\s*=\s*([0-9a-fA-F-]{36})') {
-        $result.Container = $Matches[1].ToLower()
+    # Per line, not against the whole blob: PowerShell's -match leaves $
+    # anchored at the end of the string unless (?m) is given, so a pattern
+    # ending in \s*$ silently fails to see anything but the last line.
+    foreach ($line in ($run.Text -split "`r?`n")) {
+        if ($line -match 'Key Container\s*=\s*(.+?)\s*(?:\[Default Container\])?\s*$') {
+            $result.Container = $Matches[1].Trim(); break
+        }
     }
     # "Missing stored keyset" is certutil's own wording and came back in English
     # even under a localised console; the container comparison below does not
     # depend on it, it is a corroborating signal only.
     if ($run.Text -match 'Missing stored keyset') { $result.MissingKeyset = $true }
-    if ($run.Text -match 'Provider\s*=\s*(\S.*?)\s*$') { $result.Provider = $Matches[1] }
+    foreach ($line in ($run.Text -split "`r?`n")) {
+        if ($line -match 'Provider\s*=\s*(\S.*?)\s*$') { $result.Provider = $Matches[1].Trim(); break }
+    }
 
     return $result
 }
@@ -1322,7 +1329,21 @@ if (@($candidates).Count -eq 0) {
         if (-not $store.InStore) {
             Write-Finding -Status 'FAIL' -Check ('{0}: present in the user certificate store' -f $c.Thumbprint) `
                 -Detail 'the certificate is on the card but not in Cert:\CurrentUser\My' `
-                -Remedy 'CAPI: addressing reads the store, so let Windows register the card certificate (re-insert the token, or use the vendor minidriver tooling), or address the card directly with -i PKCS:<id>=<path-to-pkcs11.dll>'
+                -Remedy 'CAPI: addressing reads the store, so the certificate has to be registered there'
+            Write-Host '         Re-inserting the token is worth trying first: the propagation' -ForegroundColor Yellow
+            Write-Host '         service registers card certificates on an insertion event, so a' -ForegroundColor Yellow
+            Write-Host '         certificate written to a card that was already in the reader is' -ForegroundColor Yellow
+            Write-Host '         never seen.' -ForegroundColor Yellow
+            Write-Host '         If that does not do it, register it by hand. Measured on an HID' -ForegroundColor Yellow
+            Write-Host '         Crescendo whose certificate certutil could read but had not' -ForegroundColor Yellow
+            Write-Host '         propagated -- read the certificate off the card first, then:' -ForegroundColor Yellow
+            Write-Host ('           certutil -user -addstore My <cert.der>') -ForegroundColor Gray
+            Write-Host ('           certutil -user -csp "<the Provider from -scinfo>" -repairstore My {0}' -f $c.Thumbprint) -ForegroundColor Gray
+            Write-Host '         The CSP must be the one -scinfo names for that card: a Crescendo' -ForegroundColor Yellow
+            Write-Host '         reported "Microsoft Base Smart Card Crypto Provider" where a' -ForegroundColor Yellow
+            Write-Host '         YubiKey reported the Key Storage Provider. "Encryption test' -ForegroundColor Yellow
+            Write-Host '         passed" in the output means the binding took.' -ForegroundColor Yellow
+            Write-Host '         Or skip the store entirely: -i PKCS:<id>=<path-to-pkcs11.dll>' -ForegroundColor Yellow
             continue
         }
 
