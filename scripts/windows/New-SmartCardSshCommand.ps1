@@ -644,6 +644,10 @@ function Get-CardCertificate {
 
     $readers = New-Object System.Collections.ArrayList
     $certs = New-Object System.Collections.ArrayList
+    # Readers that actually hold a card. A reader is not a card: an empty
+    # reader is still enumerated, and counting readers reported "card present"
+    # on a workstation with both tokens unplugged.
+    $withCard = New-Object System.Collections.ArrayList
 
     $currentReader = $null
     $currentCard = $null
@@ -665,6 +669,14 @@ function Get-CardCertificate {
         }
         if ($line -match '^---\s+Card:\s*(\S.*?)\s*$') {
             $currentCard = $Matches[1]; continue
+        }
+        # SCARD_STATE_* are API constants, so they are not translated; the
+        # human-readable "No card." beside them is. Match the constant.
+        if ($line -match 'SCARD_STATE_PRESENT') {
+            if ($currentReader -and -not $withCard.Contains($currentReader)) {
+                $null = $withCard.Add($currentReader)
+            }
+            continue
         }
         if ($line -match 'Key Container\s*=\s*([0-9a-fA-F-]{36})') {
             $pendingContainer = $Matches[1].ToLower(); continue
@@ -696,10 +708,11 @@ function Get-CardCertificate {
     }
 
     return [pscustomobject]@{
-        Available    = $true
-        Readers      = @($readers)
-        Certificates = @($unique)
-        Raw          = $run.Text
+        Available     = $true
+        Readers       = @($readers)
+        ReadersWithCard = @($withCard)
+        Certificates  = @($unique)
+        Raw           = $run.Text
     }
 }
 
@@ -1154,9 +1167,23 @@ if (-not $card.Available) {
     Write-Finding -Status 'FAIL' -Check 'Reader and card present' `
         -Detail 'no smart card readers reported' `
         -Remedy 'attach a reader or token, then re-run'
+} elseif (@($card.ReadersWithCard).Count -eq 0) {
+    # A reader is not a card. Counting readers alone reported "card present"
+    # on a workstation with both tokens unplugged, which is the kind of green
+    # result that sends someone looking at the server.
+    Write-Finding -Status 'FAIL' -Check 'Reader and card present' `
+        -Detail ('{0} reader(s) attached, none holding a card' -f @($card.Readers).Count) `
+        -Remedy 'insert the card or plug the token in, then re-run'
+    Write-Host ('         readers: {0}' -f (@($card.Readers) -join ', ')) -ForegroundColor Gray
 } else {
     Write-Finding -Status 'PASS' -Check 'Reader and card present' `
-        -Detail ('{0} reader(s): {1}' -f @($card.Readers).Count, (@($card.Readers) -join ', '))
+        -Detail ('{0} of {1} reader(s) hold a card: {2}' -f `
+            @($card.ReadersWithCard).Count, @($card.Readers).Count,
+            (@($card.ReadersWithCard) -join ', '))
+    $empty = @($card.Readers | Where-Object { @($card.ReadersWithCard) -notcontains $_ })
+    if ($empty.Count -gt 0) {
+        Write-Host ('         empty: {0}' -f ($empty -join ', ')) -ForegroundColor Gray
+    }
 }
 
 # ---- 2. tokens -----------------------------------------------------------
@@ -1196,6 +1223,7 @@ foreach ($r in $readerList) {
         Family       = $fam.Family
         Display      = $fam.Display
         Certificates = $certsHere
+        HasCard      = (@($card.ReadersWithCard) -contains $r)
     }
 }
 
@@ -1204,11 +1232,16 @@ if (@($tokens).Count -eq 0) {
 } else {
     Write-Host ''
     foreach ($t in $tokens) {
-        Write-Host ('  {0,-46} {1}' -f $t.Reader, $t.Display) -ForegroundColor Gray
+        $suffix = if ($t.HasCard) { '' } else { '   (reader empty)' }
+        Write-Host ('  {0,-46} {1}{2}' -f $t.Reader, $t.Display, $suffix) -ForegroundColor Gray
     }
-    if (@($tokens).Count -gt 1) {
+    # Count cards, not readers. An empty reader is still enumerated, and
+    # announcing "2 tokens are attached" with one card in makes the operator
+    # look for an ambiguity that is not there.
+    $withCards = @($tokens | Where-Object { $_.HasCard })
+    if (@($withCards).Count -gt 1) {
         Write-Host ''
-        Write-Host ('  {0} tokens are attached at once. The script will not pick one for you.' -f @($tokens).Count) -ForegroundColor Yellow
+        Write-Host ('  {0} tokens are attached at once. The script will not pick one for you.' -f @($withCards).Count) -ForegroundColor Yellow
         Write-Host '  Narrow the choice with -Reader <text> or -Thumbprint <sha1> if the' -ForegroundColor Yellow
         Write-Host '  checks below leave more than one usable certificate.' -ForegroundColor Yellow
     } elseif ($Reader) {
