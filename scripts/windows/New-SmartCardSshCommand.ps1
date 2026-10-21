@@ -423,8 +423,8 @@ $script:Messages = @{
 
     # ---- checks: session agent forwarding --------------------------------
     'chk.session' = @{
-        en = 'Saved session has agent forwarding enabled'
-        pl = 'Zapisana sesja ma włączone przekazywanie agenta'
+        en = 'Saved session: agent forwarding'
+        pl = 'Zapisana sesja: przekazywanie agenta'
     }
     'chk.session.nonamegiven' = @{
         en = 'no -SessionName given, so the per-session AgentFwd/TryAgent values cannot be read'
@@ -497,8 +497,8 @@ $script:Messages = @{
         pl = 'globalne AuthX509 = {0} (tryb X.509 WŁĄCZONY globalnie -- -x509off wyłącza go na jedno uruchomienie)'
     }
     'chk.preload' = @{
-        en = 'Pageant preloads one certificate, not the whole store'
-        pl = 'Pageant wczytuje jeden certyfikat, a nie cały magazyn'
+        en = 'Pageant certificate preload'
+        pl = 'Wczytywanie certyfikatu przez Pageanta'
     }
     'chk.preload.unknown' = @{
         en = 'Pageant preload configuration: unknown (PuTTY registry key unreadable)'
