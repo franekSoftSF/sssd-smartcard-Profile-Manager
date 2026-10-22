@@ -89,7 +89,8 @@ fi
 ok "src/sssd_smartcard/__init__.py agrees ($PY_VERSION)"
 
 for script in scripts/sssd-smartcard-setup.sh scripts/ad-prepare.sh \
-              scripts/install-desktop.sh scripts/ad-reset.sh; do
+              scripts/install-desktop.sh scripts/ad-reset.sh \
+              scripts/sssd-smartcard-capture.sh; do
     script_version=$(awk -F'"' '/^VERSION=/ {print $2; exit}' "$ROOT/$script")
     [[ "$script_version" == "$VERSION" ]]         || die "$script reports $script_version, expected $VERSION"
 done
@@ -198,11 +199,17 @@ ok "desktop installer -> /usr/sbin/sssd-smartcard-install-desktop"
 install -D -m 0755 "$ROOT/scripts/ad-reset.sh" "$STAGE/usr/sbin/ad-reset"
 ok "domain reset -> /usr/sbin/ad-reset"
 
+install -D -m 0755 "$ROOT/scripts/sssd-smartcard-capture.sh" \
+    "$STAGE/usr/sbin/sssd-smartcard-capture"
+ok "capture/replay -> /usr/sbin/sssd-smartcard-capture"
+
 # Shared environment-file helpers the scripts source at runtime.
 install -D -m 0644 "$ROOT/scripts/lib/env.sh" \
     "$STAGE/usr/share/sssd-smartcard/lib/env.sh"
 install -D -m 0755 "$ROOT/scripts/lib/env.py" \
     "$STAGE/usr/share/sssd-smartcard/lib/env.py"
+install -D -m 0755 "$ROOT/scripts/lib/capture.py" \
+    "$STAGE/usr/share/sssd-smartcard/lib/capture.py"
 ok "environment helpers -> /usr/share/sssd-smartcard/lib"
 
 # Examples under /usr/share, not /etc: no conffiles means dpkg never prompts
@@ -231,6 +238,8 @@ install -m 0644 "$ROOT/docs/sssd-reference.md" "$DOC/sssd-reference.md"
 install -m 0644 "$ROOT/DEPLOY.md" "$DOC/DEPLOY.md"
 install -m 0644 "$ROOT/docs/COMMANDS.md" "$DOC/COMMANDS.md"
 install -m 0644 "$ROOT/docs/HOW-IT-WORKS.md" "$DOC/HOW-IT-WORKS.md"
+install -m 0644 "$ROOT/docs/STEP-BY-STEP.md" "$DOC/STEP-BY-STEP.md"
+install -m 0644 "$ROOT/docs/STEP-BY-STEP.pl.md" "$DOC/STEP-BY-STEP.pl.md"
 install -m 0644 "$ROOT/debian/copyright" "$DOC/copyright"
 gzip -9nc "$CHANGELOG" >"$DOC/changelog.Debian.gz"
 chmod 0644 "$DOC/changelog.Debian.gz"

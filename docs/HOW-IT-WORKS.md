@@ -419,8 +419,9 @@ sudo sssd-smartcard-setup --yes    --test-user testuser@ad.example.com
 sudo pam-auth-update --enable sss-smart-card-optional
 ```
 
-The setup script runs nine stages (preflight, packages, join, identity gate, CA,
-card, certmap, GPO, PAM) and then verifies. The **identity gate** is the one
+The setup script runs twelve stages (preflight, packages, join, identity gate,
+CA, revocation, card, certmap, GPO, SSH, sudo, PAM) and then verifies; the
+revocation, SSH and sudo stages act only when asked for. The **identity gate** is the one
 that matters: it refuses to continue until the test user resolves by name,
 because Smart Card authentication cannot work before plain identity lookup does,
 and a broken trust otherwise gets misdiagnosed as a certificate problem.

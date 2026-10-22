@@ -25,9 +25,9 @@ ENV_DEFAULT_PATH="/etc/sssd-smartcard/environment.json"
 
 #: Keys the file may contain. Anything else is refused rather than ignored.
 ENV_SCALAR_KEYS=(domain realm hostname join_user test_user account_domain
-                 sssd_domain desktop_package crl_file role notes)
+                 sssd_domain desktop_package crl_file role notes sudo_group)
 ENV_LIST_KEYS=(dns search ca)
-ENV_BOOL_KEYS=(desktop gpo adsys crl ocsp smartcard_required)
+ENV_BOOL_KEYS=(desktop gpo adsys crl ocsp smartcard_required ssh sudo_agent mkhomedir)
 
 env_default_path() { printf '%s' "$ENV_DEFAULT_PATH"; }
 

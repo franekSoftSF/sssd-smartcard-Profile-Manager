@@ -29,7 +29,7 @@ if (( BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 4) ))
     exit 1
 fi
 
-VERSION="0.2.10"
+VERSION="0.3.0"
 PROGRAM="${0##*/}"
 
 # ---------------------------------------------------------------------------
@@ -47,6 +47,12 @@ DO_ADSYS=0
 DO_AUTOENROLL=0
 DO_PAM=0
 DO_VERIFY=1
+# -1 = not said on the command line: the environment file decides ("crl").
+DO_CRL=-1
+DO_SSH=0
+DO_SUDO_AGENT=0
+DO_MKHOMEDIR=0
+SUDO_GROUP=""
 REQUIRE_SMARTCARD=0
 CHECK_ONLY=0
 FORCE=0
@@ -65,6 +71,11 @@ PKCS11_MODULE=""
 GPO_ACCESS_CONTROL="permissive"
 SSSD_CONF="/etc/sssd/sssd.conf"
 CA_DB="/etc/sssd/pki/sssd_auth_ca_db.pem"
+CRL_FILE=""         # empty: the CLI's default, /etc/sssd/pki/revocation.crl.pem
+SSHD_DROPIN="/etc/ssh/sshd_config.d/60-sssd-smartcard.conf"
+SSS_SSH_HELPER="/usr/bin/sss_ssh_authorizedkeys"
+SUDOERS_GROUP_FILE="/etc/sudoers.d/90-sssd-smartcard-admins"
+SUDOERS_AGENT_FILE="/etc/sudoers.d/91-sssd-smartcard-ssh-agent"
 STATE_DIR="/var/lib/sssd-smartcard"
 BACKUP_ROOT="$STATE_DIR/backups"
 LOG_FILE=""
@@ -287,8 +298,16 @@ detect_distro() {
     return 0
 }
 
-# Ubuntu >= 23.10 ships the sss-smart-card-* pam-auth-update profiles.
-ubuntu_has_pam_profiles() {
+# Ubuntu >= 23.10 and Debian >= 13 ship the sss-smart-card-* pam-auth-update
+# profiles (Debian 13: measured in a debian:13 container, libpam-sss 2.10.1).
+# Their presence on disk settles it either way once libpam-sss is installed.
+has_smartcard_pam_profiles() {
+    [[ -f /usr/share/pam-configs/sss-smart-card-optional ]] && return 0
+    if [[ "$DISTRO_ID" == "debian" ]]; then
+        local major="${DISTRO_VERSION%%.*}"
+        [[ "$major" =~ ^[0-9]+$ ]] && (( major >= 13 )) && return 0
+        return 1
+    fi
     [[ "$DISTRO_ID" == "ubuntu" ]] || return 1
     local major minor
     major="${DISTRO_VERSION%%.*}"
@@ -302,7 +321,7 @@ ubuntu_has_pam_profiles() {
 pam_strategy() {
     case "$DISTRO_FAMILY" in
         rhel) echo authselect ;;
-        debian) ubuntu_has_pam_profiles && echo pam-auth-update || echo manual ;;
+        debian) has_smartcard_pam_profiles && echo pam-auth-update || echo manual ;;
         *) echo unknown ;;
     esac
 }
@@ -320,6 +339,8 @@ packages_for() {
         debian:gpo)        echo "adsys" ;;
         debian:autoenroll) echo "certmonger cepces" ;;
         debian:diagnostics) echo "pamtester openssl" ;;
+        debian:sudo)       echo "sudo" ;;
+        debian:sudo_agent) echo "libpam-ssh-agent-auth" ;;
         rhel:core)         echo "sssd sssd-ad sssd-tools authselect oddjob oddjob-mkhomedir" ;;
         rhel:join)         echo "realmd adcli samba-common-tools" ;;
         rhel:smartcard)    echo "opensc pcsc-lite pcsc-lite-ccid p11-kit" ;;
@@ -327,6 +348,8 @@ packages_for() {
         rhel:gpo)          echo "" ;;
         rhel:autoenroll)   echo "certmonger cepces" ;;
         rhel:diagnostics)  echo "pamtester openssl" ;;
+        rhel:sudo)         echo "sudo" ;;
+        rhel:sudo_agent)   echo "pam_ssh_agent_auth" ;;
         suse:core)         echo "sssd sssd-ad sssd-tools pam_sss" ;;
         suse:join)         echo "realmd adcli samba-client" ;;
         suse:smartcard)    echo "opensc pcsc-lite p11-kit" ;;
@@ -441,7 +464,7 @@ stage_enabled() {
 
 stage_preflight() {
     FAILED_STAGE="preflight"
-    stage_header "Stage 1/9: preflight"
+    stage_header "Stage 1/12: preflight"
 
     if [[ "$(id -u)" != "0" ]]; then
         die "this script configures system services and must run as root (try: sudo $PROGRAM ...)"
@@ -486,7 +509,7 @@ stage_preflight() {
 
 stage_packages() {
     FAILED_STAGE="packages"
-    stage_header "Stage 2/9: packages"
+    stage_header "Stage 2/12: packages"
     if (( ! DO_PACKAGES )); then skip "package installation disabled (--no-packages)"; return 0; fi
     if [[ "$DISTRO_FAMILY" == "unknown" ]]; then skip "unknown distribution"; return 0; fi
 
@@ -508,7 +531,7 @@ stage_packages() {
 
 stage_join() {
     FAILED_STAGE="join"
-    stage_header "Stage 3/9: domain membership"
+    stage_header "Stage 3/12: domain membership"
 
     local joined=""
     joined="$(capture realm list --name-only)"
@@ -557,7 +580,7 @@ stage_join() {
 
 stage_identity() {
     FAILED_STAGE="identity"
-    stage_header "Stage 4/9: identity lookup through the domain (hard gate)"
+    stage_header "Stage 4/12: identity lookup through the domain (hard gate)"
 
     if ! systemctl is-active --quiet sssd.service; then
         run "start sssd" systemctl start sssd.service || true
@@ -607,7 +630,7 @@ stage_identity() {
 
 stage_ca() {
     FAILED_STAGE="ca"
-    stage_header "Stage 5/9: CA trust bundle"
+    stage_header "Stage 5/12: CA trust bundle"
     if (( ! DO_CA )); then skip "CA import disabled (--no-ca)"; return 0; fi
 
     if (( ${#CA_FILES[@]} == 0 )); then
@@ -644,7 +667,7 @@ stage_ca() {
 
 stage_card() {
     FAILED_STAGE="card"
-    stage_header "Stage 6/9: Smart Card and certificate"
+    stage_header "Stage 7/12: Smart Card and certificate"
 
     local module_arg=()
     [[ -n "$PKCS11_MODULE" ]] && module_arg=(--module "$PKCS11_MODULE")
@@ -655,6 +678,14 @@ stage_card() {
             || die "could not read $CERT_FILE"
     else
         if ! cli card detect "${module_arg[@]}" 2>&1 | sed 's/^/       /'; then
+            if [[ -n "$PROFILE_PATH" ]]; then
+                # A given profile (e.g. from sssd-smartcard-capture --replay)
+                # needs no certificate to derive it; the card is only proof.
+                warn "no usable Smart Card found; continuing with the given profile $PROFILE_PATH"
+                note "Prove the card path later: sssd-smartcard doctor --user <user>"
+                mark_done card
+                return 0
+            fi
             fail "no usable Smart Card found"
             note "Check: systemctl status pcscd; opensc-tool --list-readers"
             note "Or work from an exported certificate instead: --cert-file user.pem"
@@ -685,7 +716,7 @@ stage_card() {
 
 stage_certmap() {
     FAILED_STAGE="certmap"
-    stage_header "Stage 7/9: certmap rule and sssd.conf"
+    stage_header "Stage 8/12: certmap rule and sssd.conf"
     if (( ! DO_CERTMAP )); then skip "certmap configuration disabled (--no-certmap)"; return 0; fi
 
     if [[ -z "$PROFILE_PATH" ]]; then
@@ -795,7 +826,7 @@ PY
 
 stage_gpo() {
     FAILED_STAGE="gpo"
-    stage_header "Stage 8/9: Group Policy"
+    stage_header "Stage 9/12: Group Policy"
     if (( ! DO_GPO )); then skip "GPO configuration disabled (pass --gpo to enable)"; return 0; fi
 
     # ad_gpo_access_control was already written by stage_certmap through the
@@ -852,9 +883,264 @@ stage_gpo() {
     mark_done gpo
 }
 
+# Revocation: one current CRL per CA in the bundle, and a timer that keeps it
+# current. Before the card and certmap stages, so a profile that names crl_file
+# never goes live pointing at a file that is not there yet (SSSD fails closed).
+stage_revocation() {
+    FAILED_STAGE="revocation"
+    stage_header "Stage 6/12: revocation (CRL and refresh timer)"
+    if (( DO_CRL != 1 )); then
+        skip "CRL not managed (pass --crl, or set \"crl\": true in the environment file)"
+        return 0
+    fi
+    if [[ ! -s "$CA_DB" ]]; then
+        (( DRY_RUN )) && { skip "dry run: no CA bundle yet, so no CRL set can be built"; return 0; }
+        fail "no CA bundle at $CA_DB: a CRL is needed for every CA in it"
+        return 1
+    fi
+
+    local crl_path="${CRL_FILE:-/etc/sssd/pki/revocation.crl.pem}"
+    local -a upd=(ca crl update --bundle "$CA_DB" --crl-file "$crl_path")
+    # A CA's CRL URL is advertised only by the certificates it signed, so the
+    # first run needs an end-entity certificate. Later runs (and the timer) use
+    # the URLs remembered in $STATE_DIR/crl-sources.json.
+    if [[ -n "$CERT_FILE" ]]; then
+        upd+=(--file "$CERT_FILE")
+    elif [[ -s "$STATE_DIR/crl-sources.json" ]]; then
+        info "CRL URLs remembered in $STATE_DIR/crl-sources.json"
+    else
+        upd+=(--from-card)
+        [[ -n "$PKCS11_MODULE" ]] && upd+=(--module "$PKCS11_MODULE")
+    fi
+
+    if (( DRY_RUN )); then
+        cli "${upd[@]}" --dry-run 2>&1 | sed 's/^/       /' || warn "the CRL set is not complete yet"
+        say "${C_DIM}  would run:${C_RESET} $CLI ca crl timer --install --bundle $CA_DB --crl-file $crl_path"
+        return 0
+    fi
+
+    backup_file "$crl_path"
+    backup_file /etc/systemd/system/sssd-smartcard-crl.service
+    backup_file /etc/systemd/system/sssd-smartcard-crl.timer
+    cli "${upd[@]}" --backup-dir "$BACKUP_DIR" 2>&1 | sed 's/^/       /' \
+        || { fail "no complete, current CRL set -- SSSD would reject every card"; return 1; }
+    pass "CRL set installed: $crl_path"
+    cli ca crl timer --install --bundle "$CA_DB" --crl-file "$crl_path" \
+        --backup-dir "$BACKUP_DIR" 2>&1 | sed 's/^/       /' \
+        || { fail "could not install the CRL refresh timer"; return 1; }
+    pass "sssd-smartcard-crl.timer refreshes it"
+    mark_done revocation
+}
+
+# The reload command for whichever unit name this distribution gives sshd.
+sshd_reload() {
+    local unit
+    for unit in ssh.service sshd.service; do
+        if systemctl list-unit-files "$unit" 2>/dev/null | grep -q "^$unit"; then
+            run "reload $unit" systemctl reload "$unit" && return 0
+            run "restart $unit" systemctl restart "$unit" && return 0
+            return 1
+        fi
+    done
+    warn "no ssh.service or sshd.service unit found; reload sshd by hand"
+    return 0
+}
+
+# SSH with the card: sshd asks SSSD for the public key derived from the
+# certificate in AD, so the same CA bundle, CRL and certmap rule decide -- and
+# one revocation closes console, SSH and sudo together.
+stage_ssh() {
+    FAILED_STAGE="ssh"
+    stage_header "Stage 10/12: SSH with the card (AuthorizedKeysCommand)"
+    if (( ! DO_SSH )); then
+        skip "sshd not configured (pass --ssh, or set \"ssh\": true in the environment file)"
+        return 0
+    fi
+
+    local sshd_bin
+    sshd_bin="$(command -v sshd 2>/dev/null || true)"
+    [[ -z "$sshd_bin" && -x /usr/sbin/sshd ]] && sshd_bin=/usr/sbin/sshd
+    if [[ -z "$sshd_bin" ]]; then
+        warn "OpenSSH server is not installed; nothing to configure (apt-get install openssh-server)"
+        return 0
+    fi
+    if [[ ! -x "$SSS_SSH_HELPER" ]]; then
+        (( DRY_RUN )) && { skip "dry run: $SSS_SSH_HELPER is not installed yet"; return 0; }
+        fail "$SSS_SSH_HELPER is missing (it ships with SSSD itself: sssd-common / sssd)"
+        return 1
+    fi
+    if ! grep -Eqi '^[[:space:]]*Include[[:space:]]+/etc/ssh/sshd_config\.d/' /etc/ssh/sshd_config 2>/dev/null; then
+        fail "/etc/ssh/sshd_config does not include /etc/ssh/sshd_config.d/; a drop-in would be ignored"
+        note "Add near the top:  Include /etc/ssh/sshd_config.d/*.conf"
+        return 1
+    fi
+
+    # sshd takes the FIRST value it reads, so a command already set elsewhere
+    # would silently win over a new drop-in.
+    local current
+    current="$("$sshd_bin" -T 2>/dev/null | awk '$1 == "authorizedkeyscommand" {print $2}' | head -1)"
+    if [[ "$current" == "$SSS_SSH_HELPER" ]]; then
+        pass "sshd already asks SSSD for keys ($SSS_SSH_HELPER)"
+    elif [[ -n "$current" && "$current" != "none" ]]; then
+        fail "sshd already uses AuthorizedKeysCommand $current"
+        note "Only one command is allowed; decide which one stays, then re-run."
+        return 1
+    else
+        local body
+        body="# Written by sssd-smartcard-setup: SSH keys come from the certificate in AD,
+# derived by SSSD -- the same CA bundle, CRL and certmap rule as the console.
+AuthorizedKeysCommand $SSS_SSH_HELPER
+AuthorizedKeysCommandUser nobody"
+        if (( DRY_RUN )); then
+            say "${C_DIM}  would write:${C_RESET} $SSHD_DROPIN"
+            printf '%s\n' "$body" | sed 's/^/         /'
+            say "${C_DIM}  would run:${C_RESET} $sshd_bin -t && systemctl reload ssh"
+        else
+            backup_file "$SSHD_DROPIN"
+            printf '%s\n' "$body" >"$SSHD_DROPIN"
+            chmod 0644 "$SSHD_DROPIN"
+            # Never leave sshd holding a file it cannot parse.
+            "$sshd_bin" -t >>"$LOG_FILE" 2>&1 \
+                || { fail "sshd -t rejected the configuration (see $LOG_FILE)"; return 1; }
+            current="$("$sshd_bin" -T 2>/dev/null | awk '$1 == "authorizedkeyscommand" {print $2}' | head -1)"
+            [[ "$current" == "$SSS_SSH_HELPER" ]] \
+                || { fail "sshd -T reports AuthorizedKeysCommand '${current:-none}' -- another file wins"; return 1; }
+            sshd_reload || { fail "sshd could not be reloaded"; return 1; }
+            pass "sshd asks SSSD for the keys: $SSHD_DROPIN"
+        fi
+    fi
+
+    # The SSH responder is socket-activated unless sssd.conf lists it in
+    # services= (then sssd itself starts it and the socket must stay off).
+    if grep -Eq '^[[:space:]]*services[[:space:]]*=.*\bssh\b' "$SSSD_CONF" 2>/dev/null; then
+        pass "SSSD ssh responder listed in services="
+    elif systemctl list-unit-files sssd-ssh.socket >/dev/null 2>&1; then
+        run "enable sssd-ssh.socket" systemctl enable --now sssd-ssh.socket \
+            || warn "could not enable sssd-ssh.socket; sss_ssh_authorizedkeys will return nothing"
+    fi
+    NEXT_STEPS+=("Keys SSSD derives for a user: $SSS_SSH_HELPER ${TEST_USER:-<user>}")
+    mark_done ssh
+}
+
+# write_sudoers <file> <content>
+# Through a staging file whose name contains a dot (sudo skips those), checked
+# with visudo before it goes live.
+write_sudoers() {
+    local dest="$1" body="$2" staging
+    staging="$(dirname "$dest")/.$(basename "$dest").new"
+    if [[ -f "$dest" ]] && [[ "$(cat "$dest")" == "$body" ]]; then
+        pass "$dest already in place"
+        return 0
+    fi
+    if (( DRY_RUN )); then
+        say "${C_DIM}  would write:${C_RESET} $dest (mode 0440, checked with visudo first)"
+        printf '%s\n' "$body" | sed 's/^/         /'
+        return 0
+    fi
+    backup_file "$dest"
+    printf '%s\n' "$body" >"$staging"
+    chmod 0440 "$staging"
+    if ! visudo -c -f "$staging" >>"$LOG_FILE" 2>&1; then
+        rm -f "$staging"
+        fail "visudo rejected the rule for $dest (see $LOG_FILE)"
+        return 1
+    fi
+    install -m 0440 -o root -g root "$staging" "$dest"
+    rm -f "$staging"
+    pass "wrote $dest"
+}
+
+# Where the PAM module for sudo over a forwarded agent is, if installed.
+pam_ssh_agent_module() {
+    local dir
+    for dir in /lib/x86_64-linux-gnu/security /usr/lib/x86_64-linux-gnu/security \
+               /lib/aarch64-linux-gnu/security /usr/lib/aarch64-linux-gnu/security \
+               /usr/lib64/security /lib64/security /lib/security /usr/lib/security; do
+        [[ -f "$dir/pam_ssh_agent_auth.so" ]] && { printf '%s\n' "$dir/pam_ssh_agent_auth.so"; return 0; }
+    done
+    return 1
+}
+
+# sudo: WHO in Active Directory (one group), WHAT on the host. Optionally the
+# card over SSH, through the forwarded agent and the same key SSSD derives.
+stage_sudo() {
+    FAILED_STAGE="sudo"
+    stage_header "Stage 11/12: sudo (AD group, card over SSH)"
+    if [[ -z "$SUDO_GROUP" ]] && (( ! DO_SUDO_AGENT )); then
+        skip "sudo not configured (pass --sudo-group G and/or --sudo-agent, or set sudo_group / sudo_agent)"
+        return 0
+    fi
+    (( DO_PACKAGES )) && install_packages sudo
+    if ! command -v visudo >/dev/null 2>&1; then
+        (( DRY_RUN )) && { skip "dry run: sudo is not installed yet"; return 0; }
+        fail "sudo is not installed"
+        return 1
+    fi
+
+    if [[ -n "$SUDO_GROUP" ]]; then
+        # A group SSSD cannot resolve gives a rule that matches nobody -- and
+        # sudo still asks for a password first, so it looks like it works.
+        if getent group "$SUDO_GROUP" >/dev/null 2>&1; then
+            pass "group resolves: $(getent group "$SUDO_GROUP" | cut -d: -f1,3)"
+        elif (( FORCE )); then
+            warn "group $SUDO_GROUP does not resolve; writing the rule anyway (--force)"
+        else
+            fail "group $SUDO_GROUP does not resolve (getent group). Check the name and domain."
+            note "With use_fully_qualified_names the name is group@domain, unquoted."
+            return 1
+        fi
+        # No quotes: %"group@domain" is rejected as 'empty group' (measured).
+        # Only a space needs escaping.
+        write_sudoers "$SUDOERS_GROUP_FILE" "%${SUDO_GROUP// /\\ } ALL=(ALL:ALL) ALL"
+    fi
+
+    if (( DO_SUDO_AGENT )); then
+        (( DO_PACKAGES )) && install_packages sudo_agent
+        # Without it, env_reset strips the variable, the module finds no agent
+        # and sudo falls through to a password with nothing said.
+        write_sudoers "$SUDOERS_AGENT_FILE" 'Defaults env_keep += "SSH_AUTH_SOCK"'
+
+        local line="auth    sufficient  pam_ssh_agent_auth.so authorized_keys_command=$SSS_SSH_HELPER"
+        if grep -q 'pam_ssh_agent_auth\.so' /etc/pam.d/sudo 2>/dev/null; then
+            pass "/etc/pam.d/sudo already uses pam_ssh_agent_auth"
+            grep -q 'authorized_keys_command=' /etc/pam.d/sudo \
+                || warn "/etc/pam.d/sudo uses pam_ssh_agent_auth without authorized_keys_command: a key file outlives revoking the certificate"
+        elif (( ! DO_PAM )); then
+            skip "/etc/pam.d/sudo not modified (pass --pam to apply)"
+            NEXT_STEPS+=("In /etc/pam.d/sudo, before '@include common-auth': $line")
+        elif ! pam_ssh_agent_module >/dev/null && (( ! DRY_RUN )); then
+            fail "pam_ssh_agent_auth.so is not installed (package libpam-ssh-agent-auth)"
+            return 1
+        elif (( DRY_RUN )); then
+            say "${C_DIM}  would insert into /etc/pam.d/sudo, before the first auth line:${C_RESET}"
+            say "         $line"
+        else
+            backup_file /etc/pam.d/sudo
+            # Before the first auth entry (Debian: '@include common-auth'),
+            # so 'sufficient' can short-circuit the password prompt.
+            awk -v line="$line" '
+                !done && ($0 ~ /^@include[ \t]+common-auth/ || $1 == "auth") { print line; done = 1 }
+                { print }
+                END { if (!done) print line }
+            ' /etc/pam.d/sudo >/etc/pam.d/.sudo.sssd-smartcard.new
+            chmod --reference=/etc/pam.d/sudo /etc/pam.d/.sudo.sssd-smartcard.new
+            mv -f /etc/pam.d/.sudo.sssd-smartcard.new /etc/pam.d/sudo
+            pass "/etc/pam.d/sudo: sudo accepts the card through the forwarded agent"
+        fi
+        NEXT_STEPS+=("Over SSH with agent forwarding: sudo -k && sudo -l  (no prompt = the card was used)")
+    fi
+
+    if (( ! DRY_RUN )); then
+        visudo -c >>"$LOG_FILE" 2>&1 || { fail "visudo -c reports an error in the sudoers files"; return 1; }
+        pass "visudo -c: all sudoers files parse"
+    fi
+    [[ -n "$TEST_USER" ]] && NEXT_STEPS+=("Rules for the test user, without authenticating: sudo -l -U $TEST_USER")
+    mark_done sudo
+}
+
 stage_pam() {
     FAILED_STAGE="pam"
-    stage_header "Stage 9/9: PAM"
+    stage_header "Stage 12/12: PAM"
 
     local strategy mode
     strategy="$(pam_strategy)"
@@ -865,6 +1151,7 @@ stage_pam() {
         authselect)
             commands=("authselect enable-feature with-smartcard")
             (( REQUIRE_SMARTCARD )) && commands+=("authselect enable-feature with-smartcard-required")
+            (( DO_MKHOMEDIR )) && commands+=("authselect enable-feature with-mkhomedir")
             ;;
         pam-auth-update)
             if (( REQUIRE_SMARTCARD )); then
@@ -872,6 +1159,9 @@ stage_pam() {
             else
                 commands=("pam-auth-update --disable sss-smart-card-required --enable sss-smart-card-optional")
             fi
+            # A first card login otherwise lands in a home that does not exist
+            # (GNOME: a black screen).
+            (( DO_MKHOMEDIR )) && commands+=("pam-auth-update --enable mkhomedir")
             ;;
         manual)
             local line
@@ -924,7 +1214,7 @@ stage_pam() {
         if (( DRY_RUN )); then
             say "${C_DIM}  would run:${C_RESET} $c"
         else
-            run "$c" $c || die "'$c' failed. PAM was not fully configured; check $LOG_FILE"
+            run "$c" env DEBIAN_FRONTEND=noninteractive $c || die "'$c' failed. PAM was not fully configured; check $LOG_FILE"
         fi
     done
     (( DRY_RUN )) || pass "PAM configured for Smart Card ($mode)"
@@ -1079,9 +1369,21 @@ GROUP POLICY
   --cert-autoenroll      Install certmonger + cepces for AD CS auto-enrolment.
                          Implies --adsys.
 
+REVOCATION, SSH AND SUDO
+  --crl / --no-crl       Install one current CRL per CA and the refresh timer.
+                         Default: "crl" in the environment file.
+  --crl-file PATH        Where the CRL goes (default /etc/sssd/pki/revocation.crl.pem).
+  --ssh                  sshd takes keys from SSSD (AuthorizedKeysCommand
+                         $SSS_SSH_HELPER).
+  --sudo-group GROUP     sudo for this AD group: %GROUP ALL=(ALL:ALL) ALL,
+                         e.g. linux-admins@ad.example.com. Must resolve.
+  --sudo-agent           sudo with the card over SSH: pam_ssh_agent_auth
+                         against the same SSSD key (PAM part needs --pam).
+
 PAM
   --pam                  Actually apply the PAM change. Without it, the correct
                          command for this distribution is only printed.
+  --mkhomedir            Also create home directories at first login.
 
 SKIPPING
   --no-packages          Do not install anything.
@@ -1089,7 +1391,7 @@ SKIPPING
   --no-certmap           Do not touch sssd.conf.
   --no-verify            Skip the verification stage.
   --only STAGES          Comma separated: preflight,packages,join,identity,ca,
-                         card,certmap,gpo,pam,verify
+                         revocation,card,certmap,gpo,ssh,sudo,pam,verify
   --skip STAGES          Same list, but skipped.
 
 OTHER
@@ -1111,6 +1413,10 @@ EXAMPLES
   # Full Ubuntu deployment including GPO and auto-enrolment
   sudo $PROGRAM --realm DOMAIN-B.LOCAL --test-user jan.kowalski@domain-a.local \\
        --ca /root/pki/chain.pem --gpo --adsys --cert-autoenroll --pam --yes
+
+  # Everything, from the environment file (Debian 13 / Ubuntu 24.04):
+  sudo $PROGRAM --crl --ssh --sudo-group linux-admins@ad.example.com \\
+       --sudo-agent --mkhomedir --pam --yes
 
   # Diagnose an existing installation
   sudo $PROGRAM --check --test-user jan.kowalski@domain-a.local
@@ -1143,6 +1449,13 @@ while (( $# )); do
         --adsys) DO_GPO=1; DO_ADSYS=1 ;;
         --cert-autoenroll) DO_GPO=1; DO_ADSYS=1; DO_AUTOENROLL=1 ;;
         --pam) DO_PAM=1 ;;
+        --mkhomedir) DO_MKHOMEDIR=1 ;;
+        --crl) DO_CRL=1 ;;
+        --no-crl) DO_CRL=0 ;;
+        --crl-file) CRL_FILE="${2:?--crl-file needs a path}"; shift ;;
+        --ssh) DO_SSH=1 ;;
+        --sudo-group) SUDO_GROUP="${2:?--sudo-group needs a group}"; shift ;;
+        --sudo-agent) DO_SUDO_AGENT=1 ;;
         --no-packages) DO_PACKAGES=0 ;;
         --no-ca) DO_CA=0 ;;
         --no-certmap) DO_CERTMAP=0 ;;
@@ -1198,6 +1511,12 @@ if declare -F env_default_path >/dev/null; then
     (( DO_ADSYS ))           || DO_ADSYS=${ENV_ADSYS:-0}
     (( DO_ADSYS ))           && DO_GPO=1
     (( REQUIRE_SMARTCARD ))  || REQUIRE_SMARTCARD=${ENV_SMARTCARD_REQUIRED:-0}
+    (( DO_CRL >= 0 ))        || DO_CRL=${ENV_CRL:-0}
+    [[ -n "$CRL_FILE" ]]     || CRL_FILE=${ENV_CRL_FILE:-}
+    (( DO_SSH ))             || DO_SSH=${ENV_SSH:-0}
+    [[ -n "$SUDO_GROUP" ]]   || SUDO_GROUP=${ENV_SUDO_GROUP:-}
+    (( DO_SUDO_AGENT ))      || DO_SUDO_AGENT=${ENV_SUDO_AGENT:-0}
+    (( DO_MKHOMEDIR ))       || DO_MKHOMEDIR=${ENV_MKHOMEDIR:-0}
 
     # Values the file still carries from the template would be applied
     # verbatim: a join against AD.EXAMPLE.COM as administrator. Only the
@@ -1226,6 +1545,9 @@ if declare -F env_default_path >/dev/null; then
     fi
 fi
 
+# No environment file and no --crl/--no-crl: revocation stays off.
+(( DO_CRL >= 0 )) || DO_CRL=0
+
 stage_preflight
 
 if (( CHECK_ONLY )); then
@@ -1251,11 +1573,14 @@ run_stage() {
 run_stage packages stage_packages
 run_stage join     stage_join
 run_stage identity stage_identity
-run_stage ca       stage_ca
-run_stage card     stage_card
-run_stage certmap  stage_certmap
-run_stage gpo      stage_gpo
-run_stage pam      stage_pam
+run_stage ca         stage_ca
+run_stage revocation stage_revocation
+run_stage card       stage_card
+run_stage certmap    stage_certmap
+run_stage gpo        stage_gpo
+run_stage ssh        stage_ssh
+run_stage sudo       stage_sudo
+run_stage pam        stage_pam
 
 VERIFY_RC=0
 if stage_enabled verify; then

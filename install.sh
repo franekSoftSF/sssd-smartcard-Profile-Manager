@@ -16,6 +16,7 @@ LIB_DIR="/opt/sssd-smartcard"
 CONF_DIR="/etc/sssd-smartcard"
 DOC_DIR=""
 STATE_DIR="/var/lib/sssd-smartcard"
+SHARE_DIR="/usr/share/sssd-smartcard"
 DO_DEPS=1
 UNINSTALL=0
 DRY_RUN=0
@@ -55,12 +56,17 @@ OPTIONS
   --uninstall      Remove everything this script installed
   -h, --help       This text
 
-WHAT IT INSTALLS
-  \$PREFIX/bin/sssd-smartcard          the CLI
-  \$PREFIX/sbin/sssd-smartcard-setup   the guided setup script
-  \$LIB_DIR/src/sssd_smartcard/        the Python package
-  \$CONF_DIR/profiles/                 example profiles
-  \$STATE_DIR/                         generated profiles and backups (mode 0700)
+WHAT IT INSTALLS (the same programs as the .deb)
+  \$PREFIX/bin/sssd-smartcard                      the CLI
+  \$PREFIX/sbin/sssd-smartcard-setup               guided setup, in stages
+  \$PREFIX/sbin/sssd-smartcard-capture             capture a working host, replay it here
+  \$PREFIX/sbin/ad-prepare                         DNS and hostname before a join
+  \$PREFIX/sbin/ad-reset                           remove one domain from the host
+  \$PREFIX/sbin/sssd-smartcard-install-desktop     minimal desktop for greeter tests
+  $SHARE_DIR/lib/                 helpers the scripts share
+  \$LIB_DIR/src/sssd_smartcard/                    the Python package
+  \$CONF_DIR/profiles/                             example profiles
+  \$STATE_DIR/                                     generated profiles and backups (mode 0700)
 EOF
 }
 
@@ -80,7 +86,17 @@ done
 
 DOC_DIR="$PREFIX/share/doc/sssd-smartcard"
 BIN="$PREFIX/bin/sssd-smartcard"
-SBIN="$PREFIX/sbin/sssd-smartcard-setup"
+
+# The shell programs, source -> name. Installed under $PREFIX/sbin like the
+# package installs them under /usr/sbin; every one of them finds lib/ in
+# $SHARE_DIR (a fixed path the scripts search, whatever the prefix).
+declare -A PROGRAMS=(
+    [scripts/sssd-smartcard-setup.sh]=sssd-smartcard-setup
+    [scripts/sssd-smartcard-capture.sh]=sssd-smartcard-capture
+    [scripts/ad-prepare.sh]=ad-prepare
+    [scripts/ad-reset.sh]=ad-reset
+    [scripts/install-desktop.sh]=sssd-smartcard-install-desktop
+)
 
 [[ "$(id -u)" == "0" ]] || die "run this as root (sudo ./$PROGRAM)"
 
@@ -89,7 +105,7 @@ SBIN="$PREFIX/sbin/sssd-smartcard-setup"
 # ---------------------------------------------------------------------------
 if (( UNINSTALL )); then
     printf '%s%s: uninstalling%s\n' "$C_BOLD" "$PROGRAM" "$C_RESET"
-    for path in "$BIN" "$SBIN" "$LIB_DIR" "$DOC_DIR"; do
+    for path in "$BIN" "${PROGRAMS[@]/#/$PREFIX/sbin/}" "$LIB_DIR" "$DOC_DIR" "$SHARE_DIR/lib"; do
         if [[ -e "$path" ]]; then
             run rm -rf "$path"
             pass "removed $path"
@@ -213,10 +229,22 @@ EOF
 fi
 pass "CLI -> $BIN"
 
-run install -m 0755 "$SOURCE_DIR/scripts/sssd-smartcard-setup.sh" "$SBIN"
-pass "setup script -> $SBIN"
+for src in "${!PROGRAMS[@]}"; do
+    if [[ -f "$SOURCE_DIR/$src" ]]; then
+        run install -m 0755 "$SOURCE_DIR/$src" "$PREFIX/sbin/${PROGRAMS[$src]}"
+        pass "${PROGRAMS[$src]} -> $PREFIX/sbin/${PROGRAMS[$src]}"
+    else
+        warn "missing from the archive: $src"
+    fi
+done
+run install -d -m 0755 "$SHARE_DIR/lib"
+for f in env.sh env.py capture.py; do
+    mode=0644; [[ "$f" == *.py ]] && mode=0755
+    [[ -f "$SOURCE_DIR/scripts/lib/$f" ]] && run install -m "$mode" "$SOURCE_DIR/scripts/lib/$f" "$SHARE_DIR/lib/$f"
+done
+pass "shared helpers -> $SHARE_DIR/lib"
 
-for f in README.md docs/sssd-reference.md; do
+for f in README.md DEPLOY.md docs/STEP-BY-STEP.md docs/STEP-BY-STEP.pl.md docs/sssd-reference.md docs/COMMANDS.md; do
     [[ -f "$SOURCE_DIR/$f" ]] && run install -m 0644 "$SOURCE_DIR/$f" "$DOC_DIR/$(basename "$f")"
 done
 [[ -d "$SOURCE_DIR/lab" ]] && run cp -a "$SOURCE_DIR/lab" "$DOC_DIR/lab" || true

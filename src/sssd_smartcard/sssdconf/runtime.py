@@ -1128,7 +1128,7 @@ def pam_report(config_path: str | Path = DEFAULT_CONFIG) -> PamReport:
                 "WARN",
                 "no try_cert_auth or require_cert_auth in the PAM stack: card login "
                 "is not switched on",
-                hint="On Ubuntu 23.10+: pam-auth-update --enable "
+                hint="On Debian 13+ / Ubuntu 23.10+: pam-auth-update --enable "
                 "sss-smart-card-optional. Note that pam_sss.so being present is not "
                 "enough -- the plain password profile installs it too.",
             )

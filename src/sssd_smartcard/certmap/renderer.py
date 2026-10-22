@@ -700,7 +700,7 @@ class SSSD2xRenderer(CertMapRenderer):
                     + (
                         "-required" if required else ""
                     )
-                    + "\n  Ubuntu 23.10+: pam-auth-update --enable sss-smart-card-"
+                    + "\n  Debian 13+ / Ubuntu 23.10+: pam-auth-update --enable sss-smart-card-"
                     + ("required" if required else "optional")
                     + ("\n" + lockout_warning if required else ""),
                 )

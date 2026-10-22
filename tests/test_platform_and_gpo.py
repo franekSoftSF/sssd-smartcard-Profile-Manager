@@ -45,6 +45,13 @@ ID=debian
 VERSION_ID="12"
 """
 
+DEBIAN_13 = """\
+PRETTY_NAME="Debian GNU/Linux 13 (trixie)"
+NAME="Debian GNU/Linux"
+VERSION_ID="13"
+ID=debian
+"""
+
 ROCKY_9 = """\
 NAME="Rocky Linux"
 VERSION_ID="9.4"
@@ -114,8 +121,17 @@ class TestPamPlan:
         assert "try_cert_auth" in plan.manual_lines["optional"]
         assert "require_cert_auth" in plan.manual_lines["required"]
 
-    def test_debian_is_manual(self):
+    def test_debian_12_is_manual(self):
         assert parse_os_release(DEBIAN_12).pam_plan().kind == "manual"
+
+    def test_debian_13_has_the_profiles(self):
+        # sssd 2.10 in trixie ships sss-smart-card-optional/-required
+        # (measured in a debian:13 container); bookworm's 2.8 does not.
+        plan = parse_os_release(DEBIAN_13).pam_plan()
+        assert plan.kind == "pam-auth-update"
+        joined = " ".join(plan.commands(require_smartcard=False))
+        assert "--enable sss-smart-card-optional" in joined
+        assert "Debian GNU/Linux 13" in plan.detail
 
     def test_manual_lines_carry_allow_missing_name(self):
         plan = parse_os_release(DEBIAN_12).pam_plan()

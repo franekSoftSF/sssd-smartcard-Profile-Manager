@@ -33,6 +33,11 @@ override_dh_auto_install:
 		$(PKGDIR)/usr/sbin/sssd-smartcard-install-desktop
 	# Removes one domain so the machine can be reused for another.
 	install -D -m 0755 scripts/ad-reset.sh $(PKGDIR)/usr/sbin/ad-reset
+	# Captures a working host's configuration and replays it on a new one.
+	install -D -m 0755 scripts/sssd-smartcard-capture.sh \
+		$(PKGDIR)/usr/sbin/sssd-smartcard-capture
+	install -D -m 0755 scripts/lib/capture.py \
+		$(PKGDIR)/usr/share/sssd-smartcard/lib/capture.py
 	# Shared environment-file helpers.
 	install -D -m 0644 scripts/lib/env.sh \
 		$(PKGDIR)/usr/share/sssd-smartcard/lib/env.sh

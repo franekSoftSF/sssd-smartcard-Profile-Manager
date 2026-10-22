@@ -46,8 +46,13 @@ _FAMILY_BY_ID = {
     "sles": FAMILY_SUSE,
 }
 
-#: ``pam-auth-update`` gained the sss-smart-card-* profiles in Ubuntu 23.10.
+#: ``pam-auth-update`` gained the sss-smart-card-* profiles in Ubuntu 23.10 ...
 PAM_AUTH_UPDATE_SINCE = (23, 10)
+
+#: ... and in Debian 13 (trixie, sssd 2.10); Debian 12 (sssd 2.8) has none.
+#: Measured in a debian:13 container: /usr/share/pam-configs/ holds
+#: sss-smart-card-optional and sss-smart-card-required after libpam-sss.
+PAM_AUTH_UPDATE_SINCE_DEBIAN = (13,)
 
 #: Where each family keeps SSSD's PKCS#11 helper.
 P11_CHILD_PATHS = {
@@ -119,6 +124,15 @@ class DistroInfo:
     @property
     def is_ubuntu(self) -> bool:
         return self.id == "ubuntu"
+
+    @property
+    def has_smartcard_pam_profiles(self) -> bool:
+        """Whether libpam-sss ships the sss-smart-card-* pam-auth-update profiles."""
+        if self.is_ubuntu:
+            return self.version_tuple >= PAM_AUTH_UPDATE_SINCE
+        if self.id == "debian":
+            return self.version_tuple >= PAM_AUTH_UPDATE_SINCE_DEBIAN
+        return False
 
     @property
     def package_manager(self) -> str:
@@ -214,7 +228,7 @@ class DistroInfo:
             )
 
         if self.family == FAMILY_DEBIAN:
-            if self.is_ubuntu and self.version_tuple >= PAM_AUTH_UPDATE_SINCE:
+            if self.has_smartcard_pam_profiles:
                 return PamPlan(
                     kind="pam-auth-update",
                     optional=[
@@ -227,9 +241,10 @@ class DistroInfo:
                     ],
                     inspect=["pam-auth-update --list"],
                     detail=(
-                        f"Ubuntu {self.version_id} ships the sss-smart-card-optional and "
-                        "sss-smart-card-required pam-auth-update profiles. Ubuntu has no "
-                        "authselect -- do not use it here."
+                        f"{self.pretty_name or (self.id + ' ' + self.version_id)} ships "
+                        "the sss-smart-card-optional and sss-smart-card-required "
+                        "pam-auth-update profiles. Debian and Ubuntu have no authselect "
+                        "-- do not use it here."
                     ),
                 )
             return PamPlan(

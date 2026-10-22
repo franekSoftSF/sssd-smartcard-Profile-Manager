@@ -37,7 +37,7 @@ The command printed is the correct one for this distribution:
 .B authselect
 on the Red Hat family,
 .B pam-auth-update
-on Ubuntu 23.10 and later, and an exact
+on Debian 13 and Ubuntu 23.10 and later, and an exact
 .I /etc/pam.d/common-auth
 line on older releases, which the script will not write for you.
 .TP
@@ -65,21 +65,45 @@ prompts for the password; the script never reads or stores it.
 .B ca
 \(em review and merge the CA chain into the trust bundle.
 .IP 6. 4
+.B revocation
+\(em with
+.BR \-\-crl :
+one current CRL per CA in the bundle, and the systemd timer that refreshes it.
+.IP 7. 4
 .B card
 \(em detect the card, then have SSSD's own
 .B p11_child
 read and verify it, which is the exact code path used at login.
-.IP 7. 4
+.IP 8. 4
 .B certmap
 \(em derive a profile from the certificate, show the diff, apply it.
-.IP 8. 4
+.IP 9. 4
 .B gpo
 \(em
 .BR ad_gpo_access_control ,
 and optionally
 .B adsys
 and certificate auto\-enrolment.
-.IP 9. 4
+.IP 10. 4
+.B ssh
+\(em with
+.BR \-\-ssh :
+sshd takes keys from
+.BR sss_ssh_authorizedkeys ,
+validated with
+.B sshd \-t
+before the reload.
+.IP 11. 4
+.B sudo
+\(em with
+.BR \-\-sudo\-group :
+a sudoers rule for an AD group that must resolve, checked with
+.BR visudo ;
+with
+.BR \-\-sudo\-agent ,
+sudo over SSH with the card through
+.BR pam_ssh_agent_auth .
+.IP 12. 4
 .B pam
 \(em print, or with
 .B \-\-pam
@@ -191,10 +215,33 @@ and
 .B cepces
 for certificate auto\-enrolment from AD CS. Implies
 .BR \-\-adsys .
+.SS Revocation, SSH and sudo
+.TP
+.BR \-\-crl ", " \-\-no\-crl
+Install the CRL set and its refresh timer, or not. Default: the environment
+file's
+.BR crl .
+.TP
+.BI \-\-crl\-file " PATH"
+Where the CRL goes (default
+.IR /etc/sssd/pki/revocation.crl.pem ).
+.TP
+.B \-\-ssh
+Configure sshd's AuthorizedKeysCommand.
+.TP
+.BI \-\-sudo\-group " GROUP"
+sudo for this AD group, e.g. linux\-admins@ad.example.com.
+.TP
+.B \-\-sudo\-agent
+sudo with the card over SSH (the PAM line needs
+.BR \-\-pam ).
 .SS PAM
 .TP
 .B \-\-pam
 Actually apply the PAM change. Without it the correct command is only printed.
+.TP
+.B \-\-mkhomedir
+Also create home directories at first login.
 .SS Skipping
 .TP
 .B \-\-no\-packages

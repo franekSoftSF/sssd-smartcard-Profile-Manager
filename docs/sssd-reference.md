@@ -275,14 +275,14 @@ ignore_authinfo_unavail`.
 
 Source: [Configuring smart card authentication using authselect (RHEL 9)](https://docs.redhat.com/en/documentation/red_hat_enterprise_linux/9/html/managing_smart_card_authentication/configuring-smart-cards-using-authselect_managing-smart-card-authentication)
 
-### Ubuntu 23.10 and later — pam-auth-update
+### Debian 13 and later, Ubuntu 23.10 and later — pam-auth-update
 
 ```bash
 sudo pam-auth-update --disable sss-smart-card-required --enable sss-smart-card-optional
 sudo pam-auth-update --disable sss-smart-card-optional --enable sss-smart-card-required
 ```
 
-### Ubuntu 23.04 and earlier, and Debian — by hand
+### Debian 12, Ubuntu 23.04 and earlier — by hand
 
 No `sss-smart-card-*` profile exists, so the line goes into
 `/etc/pam.d/common-auth` manually:

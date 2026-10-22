@@ -46,6 +46,8 @@ a YubiKey PIV certificate — see [docs/HOW-IT-WORKS.md](docs/HOW-IT-WORKS.md) f
 the mechanism as it actually runs, and [DEPLOY.md](DEPLOY.md) for
 the step-by-step walkthrough that produced it.
 
+**New here? Start with the step-by-step guide:** [docs/STEP-BY-STEP.md](docs/STEP-BY-STEP.md) (English) · [docs/STEP-BY-STEP.pl.md](docs/STEP-BY-STEP.pl.md) (polski).
+
 ## Documentation
 
 | Document | For |
@@ -96,6 +98,9 @@ every host wants Group Policy, auto-enrolment or the test tooling.
 |---|---|
 | `/usr/bin/sssd-smartcard` | the CLI |
 | `/usr/sbin/sssd-smartcard-setup` | the guided setup script |
+| `/usr/sbin/sssd-smartcard-capture` | capture a working host, replay it on a new one |
+| `/usr/sbin/ad-prepare`, `/usr/sbin/ad-reset` | DNS and hostname before a join; removing a domain |
+| `/usr/share/sssd-smartcard/lib/` | helpers the scripts share |
 | `/usr/lib/python3/dist-packages/sssd_smartcard/` | the Python package |
 | `/etc/sssd-smartcard/profiles/` | your profiles, searched first |
 | `/usr/share/sssd-smartcard/profiles/` | the packaged examples |
@@ -203,6 +208,15 @@ sudo sssd-smartcard-setup --yes                      # the Smart Card configurat
 sudo sssd-smartcard doctor --user someone@ad.example.com
 ```
 
+`--crl --ssh --sudo-group <group> --sudo-agent --mkhomedir --pam` add the CRL
+timer, SSH and sudo with the card and home directories (or set `crl`, `ssh`,
+`sudo_group`, `sudo_agent`, `mkhomedir` in the environment file).
+
+A host that already works can be copied instead: `sssd-smartcard-capture
+--from admin@old-host` collects its configuration over SSH without secrets, and
+`sssd-smartcard-capture --replay` reproduces it on the new host through the
+same setup script. DEPLOY.md, *Moving a working setup to a new machine*.
+
 Every one of those shows what it would do and stops; `--yes` applies. Reusing
 the machine for a second domain starts with `sudo ad-reset --check`.
 
@@ -215,8 +229,8 @@ other family's command:
 | | PAM mechanism | Smart Card optional | Smart Card only |
 |---|---|---|---|
 | RHEL / Fedora / Rocky / Alma | `authselect` | `enable-feature with-smartcard` | `+ with-smartcard-required` |
-| Ubuntu 23.10+ | `pam-auth-update` | `--enable sss-smart-card-optional` | `--enable sss-smart-card-required` |
-| Ubuntu 23.04 and older, Debian | by hand | `pam_sss.so … try_cert_auth` | `pam_sss.so … require_cert_auth` |
+| Debian 13+, Ubuntu 23.10+ | `pam-auth-update` | `--enable sss-smart-card-optional` | `--enable sss-smart-card-required` |
+| Debian 12, Ubuntu 23.04 and older | by hand | `pam_sss.so … try_cert_auth` | `pam_sss.so … require_cert_auth` |
 
 On the older releases there is no profile to enable, so the tool prints the exact
 `/etc/pam.d/common-auth` line and refuses to edit it.

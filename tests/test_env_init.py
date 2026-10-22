@@ -20,6 +20,22 @@ import sys
 import pytest
 
 ENV_PY = pathlib.Path(__file__).resolve().parent.parent / "scripts" / "lib" / "env.py"
+ENV_SH = ENV_PY.with_name("env.sh")
+
+
+def _loader_keys(name: str) -> str:
+    """The key list env.sh hands the loader, so these tests cannot drift from it."""
+    import re
+
+    text = ENV_SH.read_text(encoding="utf-8")
+    match = re.search(rf"^{name}=\((.*?)\)", text, re.S | re.M)
+    assert match, name
+    return " ".join(match.group(1).split())
+
+
+SCALARS = _loader_keys("ENV_SCALAR_KEYS")
+LISTS = _loader_keys("ENV_LIST_KEYS")
+BOOLS = _loader_keys("ENV_BOOL_KEYS")
 
 #: Decoding the child's output with locale.getpreferredencoding() measures the
 #: console code page rather than the loader: on a pl-PL Windows that is cp1250
@@ -61,7 +77,8 @@ class TestTemplate:
         for key in (
             "domain", "realm", "dns", "search", "hostname", "role",
             "join_user", "test_user", "ca", "crl", "ocsp", "desktop",
-            "smartcard_required", "notes",
+            "smartcard_required", "ssh", "sudo_group", "sudo_agent",
+            "mkhomedir", "notes",
         ):
             assert key in data, key
 
@@ -141,10 +158,9 @@ class TestLoaderAgreement:
         path = tmp_path / "environment.json"
         path.write_text(json.dumps(data), encoding="utf-8")
 
-        scalars = ("domain realm hostname join_user test_user account_domain "
-                   "sssd_domain desktop_package crl_file role notes")
-        lists = "dns search ca"
-        bools = "desktop gpo adsys crl ocsp smartcard_required"
+        scalars = SCALARS
+        lists = LISTS
+        bools = BOOLS
         result = subprocess.run(
             [sys.executable, str(ENV_PY), str(path), scalars, lists, bools],
             capture_output=True, check=False, **UTF8,
@@ -161,11 +177,9 @@ class TestLoaderAgreement:
         data = init("domain=ad.corp.test")
         path = tmp_path / "environment.json"
         path.write_text(json.dumps(data), encoding="utf-8")
-        scalars = ("domain realm hostname join_user test_user account_domain "
-                   "sssd_domain desktop_package crl_file role notes")
+        scalars = SCALARS
         result = subprocess.run(
-            [sys.executable, str(ENV_PY), str(path), scalars, "dns search ca",
-             "desktop gpo adsys crl ocsp smartcard_required"],
+            [sys.executable, str(ENV_PY), str(path), scalars, LISTS, BOOLS],
             capture_output=True, check=False, **UTF8,
         )
         assert result.returncode == 0, result.stderr
@@ -196,9 +210,7 @@ class TestCaIsEmptyByDefault:
         path.write_text(json.dumps(init("domain=ad.corp.test")), encoding="utf-8")
         result = subprocess.run(
             [sys.executable, str(ENV_PY), str(path),
-             "domain realm hostname join_user test_user account_domain "
-             "sssd_domain desktop_package crl_file role notes",
-             "dns search ca", "desktop gpo adsys crl ocsp smartcard_required"],
+             SCALARS, LISTS, BOOLS],
             capture_output=True, check=False, **UTF8,
         )
         assert result.returncode == 0, result.stderr

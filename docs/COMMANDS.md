@@ -10,6 +10,7 @@ prepare, reset, install and set up a machine.
 | `ad-reset` | remove one domain so the machine can be reused |
 | `sssd-smartcard-install-desktop` | minimal desktop for greeter testing |
 | `sssd-smartcard-setup` | guided end-to-end setup, in stages |
+| `sssd-smartcard-capture` | capture a working host's configuration, replay it on a new one |
 
 Flags shared by every `sssd-smartcard` subcommand: `--json`, `--no-color`,
 `--sssd-version X.Y.Z`, `--config PATH`. They work before or after the
@@ -318,6 +319,8 @@ ip -4 addr show <iface> && nmcli device status
 sssd-smartcard-setup [--env FILE] [--realm R] [--join-user U] [--test-user UPN]
                      [--ca FILE]... [--sssd-domain D] [--account-domain D]
                      [--gpo] [--adsys] [--cert-autoenroll] [--pam]
+                     [--crl|--no-crl] [--crl-file F] [--ssh]
+                     [--sudo-group G] [--sudo-agent] [--mkhomedir]
                      [--only STAGES] [--skip STAGES] [--no-verify]
                      [--check] [--dry-run] [--yes] [--force]
 ```
@@ -335,8 +338,21 @@ example values is refused rather than used — but only for the fields the
 **selected stages** consume. `--only packages,join,identity` therefore does not
 care that `ca` is unset; the CA files are fetched later by `ca discover`.
 
-Nine stages: `preflight, packages, join, identity, ca, card, certmap, gpo, pam`,
-then verification. `--only` and `--skip` take comma-separated stage names, so
+Twelve stages: `preflight, packages, join, identity, ca, revocation, card,
+certmap, gpo, ssh, sudo, pam`, then verification. `revocation`, `ssh` and `sudo`
+do nothing unless asked -- `--crl`, `--ssh`, `--sudo-group`/`--sudo-agent`, or
+`crl`, `ssh`, `sudo_group`, `sudo_agent` in the environment file:
+
+| Stage | What it does |
+|---|---|
+| `revocation` | `ca crl update` (card, `--cert-file` or the remembered URLs) and `ca crl timer --install`; before `certmap`, so `crl_file` never points at nothing |
+| `ssh` | `AuthorizedKeysCommand /usr/bin/sss_ssh_authorizedkeys` in `sshd_config.d`, `sshd -t`, `sshd -T` to confirm no other file wins, reload; enables `sssd-ssh.socket` |
+| `sudo` | `%group ALL=(ALL:ALL) ALL` for a group that must resolve, through `visudo -c`; with `--sudo-agent` also `env_keep SSH_AUTH_SOCK` and, with `--pam`, `pam_ssh_agent_auth.so authorized_keys_command=...` in `/etc/pam.d/sudo` |
+
+`--mkhomedir` adds `pam-auth-update --enable mkhomedir` (or authselect's
+`with-mkhomedir`) to the PAM stage. On Debian 13 and Ubuntu 23.10+ the PAM stage
+uses the `sss-smart-card-*` pam-auth-update profiles; Debian 12 gets the line
+to add by hand. `--only` and `--skip` take comma-separated stage names, so
 joining and nothing else is:
 
 ```bash
@@ -352,6 +368,35 @@ problem.
 
 PAM is only ever **reported on** unless `--pam` is given, because a bad PAM file
 locks the administrator out of the machine.
+
+---
+
+## `sssd-smartcard-capture`
+
+```
+sssd-smartcard-capture --from [user@]host [-p PORT] [-i KEY] [--out FILE]
+sssd-smartcard-capture --local [--out FILE]
+sssd-smartcard-capture --show CAPTURE
+sssd-smartcard-capture --replay CAPTURE [--yes] [--pam] [--force]
+```
+
+`--from` collects on another host over SSH: one login, reused through an SSH
+control socket for every step; sudo there asks once; the source needs bash,
+tar and sudo, not this tool. `--local` collects here, as root. The archive is
+written mode 0600.
+
+Read-only on the source. Never collected: keytabs, `/var/lib/sss`, `*.key`,
+SSH host keys, `/etc/shadow`; secret-named `sssd.conf` options are blanked.
+`MANIFEST.txt` records the SHA-256 of every file and what was refused;
+`--show` and `--replay` refuse a capture that no longer matches it.
+
+`--replay` (root, on the new host) writes the environment file from the capture
+with this host's name if none exists, stops with exit 3 until the host has
+joined the domain itself, refuses a different domain without `--force`, copies
+the remembered CRL URLs (with `--yes`), and runs `sssd-smartcard-setup --skip
+join` with the captured profile, CA bundle and switches -- `--dry-run` unless
+`--yes`. It then lists every captured file missing or different here, and the
+`sssd.conf` options that still differ.
 
 ---
 

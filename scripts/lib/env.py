@@ -31,7 +31,7 @@ import sys
 TEMPLATE_ORDER = [
     "domain", "realm", "dns", "search", "hostname", "role",
     "join_user", "test_user", "ca", "crl", "ocsp", "desktop",
-    "smartcard_required", "notes",
+    "smartcard_required", "ssh", "sudo_group", "sudo_agent", "mkhomedir", "notes",
 ]
 
 TEMPLATE_DEFAULTS: dict[str, object] = {
@@ -53,11 +53,17 @@ TEMPLATE_DEFAULTS: dict[str, object] = {
     "ocsp": False,
     "desktop": False,
     "smartcard_required": False,
+    # SSH and sudo with the card (sssd-smartcard-setup stages ssh and sudo).
+    # Empty sudo_group = no sudo rule is written.
+    "ssh": False,
+    "sudo_group": "",
+    "sudo_agent": False,
+    "mkhomedir": False,
     "notes": "describe this environment so a later run is unambiguous",
 }
 
 LIST_FIELDS = {"dns", "search", "ca"}
-BOOL_FIELDS = {"crl", "ocsp", "desktop", "smartcard_required"}
+BOOL_FIELDS = {"crl", "ocsp", "desktop", "smartcard_required", "ssh", "sudo_agent", "mkhomedir"}
 
 
 def init(pairs: list[str]) -> int:

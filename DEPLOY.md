@@ -1,5 +1,9 @@
 # Deploying to a test machine
 
+For a plain, numbered walk-through (also in Polish) see
+[docs/STEP-BY-STEP.md](docs/STEP-BY-STEP.md) and [docs/STEP-BY-STEP.pl.md](docs/STEP-BY-STEP.pl.md).
+This document is the detailed reference behind it.
+
 Copy-paste reference. Replace `sysadmin@10.0.0.50` with the target and
 `ad.example.com` / `10.0.0.10` with the domain and its DNS server.
 
@@ -589,6 +593,9 @@ Run it once with the card inserted: the issuing CA's CRL URL is only advertised
 by end-entity certificates, and the URL is then remembered so the timer can
 refresh with no card present.
 
+`sssd-smartcard-setup --crl` (or `"crl": true` in the environment file) does
+both, before the certmap stage.
+
 ## Step 6 — the account phase, which refuses cards that authenticated
 
 Test **both** PAM phases. `authenticate` alone passes on a host where every
@@ -653,7 +660,9 @@ sudo sshd -t && sudo systemctl reload ssh
 ```
 
 Validate before reloading, as with `sssctl config-check` — never leave a
-service holding a file it cannot parse. The SSH responder itself needs no
+service holding a file it cannot parse. `sssd-smartcard-setup --ssh` writes the
+same drop-in, runs `sshd -t`, confirms with `sshd -T` that no other file wins,
+and reloads. The SSH responder itself needs no
 `services =` change on Ubuntu 24.04; `sssd-ssh.socket` is socket-activated.
 
 On the client:
@@ -748,7 +757,10 @@ EOF
 sudo visudo -c -f /etc/sudoers.d/.90-ad-admins.new   && sudo install -m 0440 -o root -g root        /etc/sudoers.d/.90-ad-admins.new /etc/sudoers.d/90-ad-admins   && sudo rm -f /etc/sudoers.d/.90-ad-admins.new && sudo visudo -c
 ```
 
-The final `visudo -c` covers every file, not just the new one. Check the result
+The final `visudo -c` covers every file, not just the new one.
+`sssd-smartcard-setup --sudo-group linux-admins@ad.example.com` does exactly
+this, and refuses a group that does not resolve; `--sudo-agent` adds the two
+pieces below (the `/etc/pam.d/sudo` line only with `--pam`). Check the result
 with `sudo -l -U someone@ad.example.com`, which lists without authenticating.
 
 **A password prompt is not evidence of having sudo rights.** sudo authenticates
@@ -846,6 +858,115 @@ sudo sssd-smartcard doctor --user someone@ad.example.com
 One command covering every layer: SSSD, the certificate, the mapping, the CA
 bundle, PAM, `local_auth_policy`, GPO access control, the home directory,
 Kerberos, the CRL and SSH.
+
+# Moving a working setup to a new machine
+
+When one host works -- card login, SSH, sudo, CRL timer -- the fastest way to
+the same state on a new one (for example a fresh **Debian 13**) is to take the
+configuration from the working host instead of re-deriving it.
+
+## 1. Capture the working host
+
+From any machine with `ssh` (the new host, or a workstation). The source needs
+`bash`, `tar` and `sudo` only, not this tool:
+
+```bash
+sssd-smartcard-capture --from sysadmin@old-host --out old-host.tar.gz
+```
+
+One SSH login is reused for every step, sudo on the source asks for its
+password once, and the temporary directory there is removed afterwards. The
+download is checked against the remote file's SHA-256.
+
+What it contains: `sssd.conf` and `conf.d`, the CA bundle and the CRL,
+`/etc/sssd-smartcard`, the generated profiles and `crl-sources.json`,
+`krb5.conf`, the PAM files, sudoers, `sshd_config` and its drop-ins, the CRL
+timer, PKCS#11/OpenSC, polkit and the GDM dconf settings, plus the output of
+`sshd -T`, `realm list`, `sssctl domain-list` and the package versions.
+
+What it never contains: `/etc/krb5.keytab`, `/var/lib/sss` (the cache holds
+credential material), any `*.key`, the SSH host keys, `/etc/shadow`. Options
+in `sssd.conf` whose names say *password*, *authtok* or *secret* keep their
+name and lose their value, so a replay can tell a secret was there.
+
+On the working host itself, `sudo sssd-smartcard-capture --local` does the same.
+
+## 2. Read it
+
+```bash
+sssd-smartcard-capture --show old-host.tar.gz
+```
+
+One page: domain and realm, DNS, CA bundle, `certificate_verification`, the
+CRL and its timer, the certmap rules, `local_auth_policy`,
+`ad_gpo_access_control`, the card mode in PAM, the SSH key source, the sudo
+groups and whether sudo takes the card over SSH -- and the setup arguments the
+replay will use. Every file is checked against the manifest written at
+collection; a capture that was changed afterwards is refused.
+
+## 3. Replay on the new host
+
+Install the package first (Section 1 above). Then:
+
+```bash
+sudo sssd-smartcard-capture --replay old-host.tar.gz
+```
+
+The first run writes `/etc/sssd-smartcard/environment.json` from the capture
+with **this** host's name, and stops: the domain join is not copied, because a
+keytab belongs to one machine. Check `hostname` and `join_user` in that file,
+then join:
+
+```bash
+sudo ad-prepare --yes
+sudo sssd-smartcard-setup --only packages,join,identity --yes
+```
+
+Run the replay again. Without `--yes` it is a plan: `sssd-smartcard-setup`
+runs with `--dry-run` and the captured choices (profile, CA bundle, CRL file,
+SSH, sudo group, sudo over the agent, mkhomedir, card-only or optional):
+
+```bash
+sudo sssd-smartcard-capture --replay old-host.tar.gz
+```
+
+```bash
+sudo sssd-smartcard-capture --replay old-host.tar.gz --yes --pam
+```
+
+`--pam` lets setup run `pam-auth-update` and add the `pam_ssh_agent_auth` line
+to `/etc/pam.d/sudo`; without it those commands are only printed. Keep a second
+root session open, as for any PAM change.
+
+At the end it lists what it did **not** reproduce: every captured file that is
+missing or different here (a hand-edited `krb5.conf`, a polkit rule, a second
+sudo group), each with the `diff -u` command to compare it, and the `sssd.conf`
+options that still differ, key by key, leaving out host-specific ones
+(`ad_hostname`, `krb5_keytab`, ...) and `debug_*`. Those are decisions, not
+copies: `ad_gpo_access_control = permissive`, for example, is a diagnostic on
+the old host that the new one may not need.
+
+Then prove it the usual way:
+
+```bash
+pamtester -v login someone@ad.example.com authenticate acct_mgmt
+sudo sssd-smartcard doctor --user someone@ad.example.com
+```
+
+## Debian 13 notes
+
+Measured in a `debian:13` container (sssd 2.10.1):
+
+* `libpam-sss` ships the `sss-smart-card-optional` and `sss-smart-card-required`
+  pam-auth-update profiles, as Ubuntu 23.10+ does. `sssd-smartcard-setup --pam`
+  uses them; Debian 12 still needs the line by hand.
+* `libpam-ssh-agent-auth` is in the archive (0.10.3), so sudo over SSH with the
+  card needs no third-party package.
+* SSSD responders are socket-activated (`sssd-ssh.socket` and friends); the
+  ssh stage enables the socket unless `services =` already lists `ssh`.
+* A minimal Debian install has neither `sudo` nor `python3`; install `python3`
+  before the package if it is not pulled in, and the sudo stage installs
+  `sudo` itself.
 
 ---
 

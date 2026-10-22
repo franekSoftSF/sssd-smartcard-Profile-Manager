@@ -37,6 +37,7 @@ DECLARATIONS: list[tuple[str, str]] = [
     ("scripts/ad-prepare.sh", r'^VERSION="([0-9][^"]*)"$'),
     ("scripts/ad-reset.sh", r'^VERSION="([0-9][^"]*)"$'),
     ("scripts/install-desktop.sh", r'^VERSION="([0-9][^"]*)"$'),
+    ("scripts/sssd-smartcard-capture.sh", r'^VERSION="([0-9][^"]*)"$'),
 ]
 
 CHANGELOG = "debian/changelog"

@@ -1,3 +1,44 @@
+sssd-smartcard (0.3.0) unstable; urgency=medium
+
+  * sssd-smartcard-capture: take a working host's configuration and reproduce
+    it on a new one. --from user@host collects over SSH (one login reused for
+    every step, sudo there, nothing installed on the source); --local collects
+    here; --show summarises; --replay drives sssd-smartcard-setup with what
+    was captured -- a plan by default, --yes applies, --pam lets it change PAM.
+    Never collected: keytabs, the SSSD cache, private keys, SSH host keys,
+    /etc/shadow; sssd.conf options named *password*/*authtok*/*secret* keep
+    their name and lose their value. Every file is checksummed at collection
+    and a changed capture is refused. The domain join is deliberately not
+    copied: the new host joins under its own name. What the replay does not
+    reproduce is listed with the diff command for each file, and sssd.conf is
+    compared key by key without host-specific and debug options.
+  * Debian 13: libpam-sss 2.10 ships the sss-smart-card-optional/-required
+    pam-auth-update profiles (measured in a debian:13 container), so the PAM
+    plan is pam-auth-update there instead of a line to add by hand. Debian 12
+    keeps the manual line. The setup script also trusts the profile files on
+    disk when present.
+  * sssd-smartcard-setup covers the rest of DEPLOY.md: stage revocation (one
+    current CRL per CA and the refresh timer, before certmap so a profile that
+    names crl_file never goes live without the file), stage ssh
+    (AuthorizedKeysCommand sss_ssh_authorizedkeys, sshd -t before reload,
+    sshd -T confirms no other file wins, sssd-ssh.socket), stage sudo (an AD
+    group that must resolve, written through visudo; with --sudo-agent the
+    env_keep line and pam_ssh_agent_auth with authorized_keys_command, the PAM
+    part only with --pam), and --mkhomedir. Each takes its switch from the
+    environment file too: crl, ssh, sudo_group, sudo_agent, mkhomedir.
+  * With a profile given, the card stage no longer stops when no card is
+    present: the profile needs no certificate to derive it.
+  * docs/STEP-BY-STEP.md and docs/STEP-BY-STEP.pl.md: a plain, numbered guide
+    in English and Polish -- copy a working host or start from scratch, where
+    every file goes (the package, the capture, CA files, and on a Horizon
+    image the agent archives), testing, and undo.
+  * install.sh installs everything the .deb does: ad-prepare, ad-reset,
+    sssd-smartcard-install-desktop, sssd-smartcard-capture and the shared
+    helpers in /usr/share/sssd-smartcard/lib. Before, only the CLI and the
+    setup script were installed, and the others could not find env.sh.
+
+ -- Szymon Frankiewicz <szymonfrankiewicz@gmail.com>  Thu, 22 Oct 2026 20:00:00 +0200
+
 sssd-smartcard (0.2.10) unstable; urgency=medium
 
   * The Windows helper gained an ordered action list, -Launch, and Polish.
