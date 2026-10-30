@@ -521,11 +521,23 @@ Measured on a host where card login, SSH and `sudo` all worked:
 
 ```
 $ klist
-klist: No credentials cache found (filename: /tmp/krb5cc_827800000)
+klist: No credentials cache found (filename: /tmp/krb5cc_<uid>)
 ```
 
-Nothing was wrong. The two statements are independent, and which paths yield a
-ticket is worth knowing before someone discovers it at the worst moment.
+Both paths were observed, not inferred from one another. The same result came
+from an SSH session, and separately from a local graphical session logged in
+with the card — `loginctl` confirming it was the local one rather than a remote
+shell:
+
+```
+SESSION 2: someone@ad.example.com   Seat: seat0   Type: wayland   Remote: no
+/tmp/krb5cc_*: no such file
+```
+
+That distinction matters because the two have *different* causes, so a single
+observation would not have covered both. Nothing was wrong in either case. The
+two statements are independent, and which paths yield a ticket is worth knowing
+before someone discovers it at the worst moment.
 
 | Path | Authenticates with | Kerberos ticket |
 |---|---|---|
