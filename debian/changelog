@@ -1,3 +1,31 @@
+sssd-smartcard (0.3.2) unstable; urgency=medium
+
+  * doctor says which login paths end with a Kerberos ticket, and which do not.
+    "I logged in with the card" and "I have a Kerberos identity" are different
+    statements, and a working Smart Card setup says nothing about the gap.
+    Measured on a host where card login, SSH and sudo all worked: klist inside
+    the session reported "No credentials cache found", and the host held no
+    credential cache at all.
+  * Two separate causes, neither a fault, so both are INFO. local_auth_policy =
+    enable:smartcard is *local* authentication: SSSD verifies the certificate
+    against the CA bundle and the certmap rule without contacting the KDC, so
+    there is nothing to put in a cache -- a ticket needs PKINIT, which needs
+    the MIT plugin, and on that host krb5-pkinit was not installed. Separately,
+    SSH public-key authentication skips the PAM auth stack altogether, so
+    pam_sss never runs and nothing obtains credentials either.
+  * The hint names the password route as the alternative, because a password
+    login does obtain a ticket through SSSD's Kerberos auth provider -- which
+    is almost certainly what someone has already seen when they report that
+    tickets sometimes appear. It also names klist as the way to confirm, and
+    GSSAPI with credential delegation as the route if an SSH session genuinely
+    needs one, with the caveat that delegation forwards a ticket the client
+    must already hold.
+  * Nothing here is reported as a failure. These are consequences of the chosen
+    mechanisms, and the only reason to state them is that the consequence
+    surprises people after everything else works.
+
+ -- Szymon Frankiewicz <szymonfrankiewicz@gmail.com>  Fri, 30 Oct 2026 19:15:00 +0100
+
 sssd-smartcard (0.3.1) unstable; urgency=medium
 
   * The Windows helper reports the PIV slot's PIN and touch policy, and

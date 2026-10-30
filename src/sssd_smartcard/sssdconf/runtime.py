@@ -786,6 +786,111 @@ def _sudoers_env_keep() -> list[str] | None:
     return names
 
 
+
+# ---------------------------------------------------------------------------
+# Which login paths end with a Kerberos ticket, and which do not
+
+#: The MIT plugin without which no amount of configuration produces PKINIT.
+PKINIT_PLUGIN_NAMES = ("pkinit.so",)
+PKINIT_PLUGIN_DIRS = (
+    "/usr/lib/x86_64-linux-gnu/krb5/plugins/preauth",
+    "/usr/lib64/krb5/plugins/preauth",
+    "/usr/lib/krb5/plugins/preauth",
+)
+
+
+def pkinit_plugin_present() -> bool:
+    for directory in PKINIT_PLUGIN_DIRS:
+        for name in PKINIT_PLUGIN_NAMES:
+            if (Path(directory) / name).exists():
+                return True
+    return False
+
+
+def kerberos_ticket_checks(
+    config_path: str | Path = DEFAULT_CONFIG,
+    *,
+    sshd: "dict[str, str] | None" = None,
+) -> list[Check]:
+    """Say plainly which configured paths end with a TGT, and which do not.
+
+    "I logged in with the card" and "I have a Kerberos identity" are different
+    statements, and nothing in a working Smart Card setup says so.  Measured on
+    a host where card login, SSH and sudo all worked: ``klist`` inside the
+    session reported *No credentials cache found*.
+
+    Two separate reasons, neither of them a fault:
+
+    * ``local_auth_policy = enable:smartcard`` is **local** authentication.
+      SSSD verifies the certificate against the CA bundle and the certmap rule
+      and never contacts the KDC, so there is nothing to put in a cache.  A
+      ticket needs PKINIT, which needs the MIT plugin.
+    * SSH public-key authentication skips the PAM ``auth`` stack altogether, so
+      ``pam_sss`` never runs and nothing obtains credentials either.
+
+    A password login *does* yield a ticket, through SSSD's Kerberos auth
+    provider -- which is usually what someone has seen when they report that
+    tickets "sometimes" appear.
+
+    Reported as INFO throughout.  None of this is misconfiguration; it is what
+    the chosen mechanisms do, and the only reason to say it is that the
+    consequence surprises people after everything else works.
+    """
+    from .conf import SssdConfig
+
+    checks: list[Check] = []
+    if not is_linux():
+        return checks
+    try:
+        config = SssdConfig.load(config_path)
+    except OSError:
+        return checks
+
+    local_card = False
+    for name in config.domain_sections():
+        policy = config.get(f"domain/{name}", "local_auth_policy") or ""
+        if "smartcard" in policy:
+            local_card = True
+            break
+
+    if local_card and not pkinit_plugin_present():
+        checks.append(
+            Check(
+                "Kerberos ticket on card login",
+                "INFO",
+                "none: local_auth_policy authenticates the card locally and "
+                "the MIT PKINIT plugin is not installed",
+                hint="The card is verified against the CA bundle and the "
+                "certmap rule without the KDC being contacted, so no ticket "
+                "is issued. Logging in with the card and holding a Kerberos "
+                "identity are different things. Install krb5-pkinit and "
+                "configure pkinit_anchors if the session needs a ticket; a "
+                "password login obtains one either way.",
+            )
+        )
+
+    if sshd is None:
+        from .runtime import sshd_effective_config  # noqa: PLC0415  (same module)
+
+        sshd = sshd_effective_config()
+
+    if sshd and SSH_KEYS_COMMAND in sshd.get("authorizedkeyscommand", ""):
+        if sshd.get("gssapiauthentication", "no").lower() == "no":
+            checks.append(
+                Check(
+                    "Kerberos ticket over SSH",
+                    "INFO",
+                    "none: public-key authentication does not contact the KDC, "
+                    "and GSSAPIAuthentication is off",
+                    hint="Public-key authentication skips the PAM auth stack "
+                    "entirely, so nothing obtains credentials. Confirm with "
+                    "klist inside a session. If a session needs a ticket, the "
+                    "route is GSSAPIAuthentication with credential delegation, "
+                    "which requires the client to already hold one.",
+                )
+            )
+    return checks
+
 def home_provisioning() -> tuple[str, str]:
     """``(module, file)`` that creates missing home directories, or ``("", "")``.
 

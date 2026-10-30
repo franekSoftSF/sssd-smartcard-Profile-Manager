@@ -849,6 +849,17 @@ Two misleading messages, both measured, both of which cost us an evening:
 Add `debug` to the module's options while diagnosing, and take it out
 afterwards - it logs a dozen lines per `sudo`.
 
+## A note before you go looking for Kerberos tickets
+
+A card login does not give the session a Kerberos ticket, and neither does SSH.
+`local_auth_policy = enable:smartcard` verifies the certificate locally and
+never contacts the KDC; SSH public-key authentication skips the PAM `auth`
+stack altogether. A password login does obtain one, which is why tickets seem
+to appear "sometimes".
+
+`doctor` reports both as INFO. `docs/sssd-reference.md` has the full table and
+what to do if a session genuinely needs a ticket.
+
 ## Checking the result, at any point
 
 ```bash

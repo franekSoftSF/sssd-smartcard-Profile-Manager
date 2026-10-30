@@ -515,6 +515,57 @@ Host server.example.com
 The PIN is requested locally by the client to use the private key; it is never
 sent to the server, and the key never leaves the token.
 
+## Logging in with the card is not holding a Kerberos identity
+
+Measured on a host where card login, SSH and `sudo` all worked:
+
+```
+$ klist
+klist: No credentials cache found (filename: /tmp/krb5cc_827800000)
+```
+
+Nothing was wrong. The two statements are independent, and which paths yield a
+ticket is worth knowing before someone discovers it at the worst moment.
+
+| Path | Authenticates with | Kerberos ticket |
+|---|---|---|
+| console or greeter, card | SSSD, **locally** (`local_auth_policy = enable:smartcard`) | **no** |
+| SSH, key derived from the certificate | sshd, public key | **no** |
+| any path, password | `pam_sss` -> SSSD's Kerberos auth provider | **yes** |
+| card + PKINIT | `krb5-pkinit` with `pkinit_anchors` | yes |
+
+Two separate reasons, neither of them a fault:
+
+* **`local_auth_policy = enable:smartcard` is local authentication.** SSSD
+  verifies the certificate against the CA bundle and the certmap rule and never
+  contacts the KDC, so there is nothing to put in a cache. A ticket needs
+  PKINIT, which needs the MIT plugin -- without `krb5-pkinit` installed, no
+  amount of configuration produces one.
+* **SSH public-key authentication skips the PAM `auth` stack altogether.**
+  `pam_sss` never runs, so nothing obtains credentials. This is true however
+  the key was derived.
+
+A password login does obtain a ticket, which is usually what someone has
+already seen when they report that tickets "sometimes" appear.
+
+`doctor` reports both as INFO. They are consequences of the chosen mechanisms,
+not misconfiguration, and flagging them as problems would be wrong.
+
+### If a session genuinely needs a ticket
+
+For the console: install `krb5-pkinit`, set `pkinit_anchors`, and add the
+`includedir` line so SSSD's own snippets are not inert. `krb5 test --from-card
+--pkinit` confirms it, and confirms it by the preauth type in `KRB5_TRACE`
+rather than by `kinit` returning zero -- a TGT obtained with a password looks
+identical from the outside.
+
+For SSH: `GSSAPIAuthentication` with credential delegation. Note what that
+means -- delegation forwards a ticket the **client already holds**, so the
+client must have obtained one first, which on a Windows workstation means being
+domain-joined and signing in with the card. Measured on one that was not: zero
+cached tickets, nothing to delegate. The authentication is then Kerberos rather
+than the card; the card's part happens one step earlier, at the Windows logon.
+
 ## CRL revocation: four measured rules
 
 Where there is no OCSP responder, CRLs are the only revocation mechanism. SSSD

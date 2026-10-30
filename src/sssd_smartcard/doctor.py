@@ -499,6 +499,12 @@ def run_doctor(
 
     report.add(*debug_state_checks(config_path))
 
+    # "I logged in with the card" and "I have a Kerberos identity" are
+    # different statements, and a working setup says nothing about the gap.
+    from .sssdconf.runtime import kerberos_ticket_checks
+
+    report.add(*kerberos_ticket_checks(config_path))
+
     from .sssdconf.runtime import sudo_agent_checks, sudo_rules_checks
 
     report.add(*sudo_rules_checks())
