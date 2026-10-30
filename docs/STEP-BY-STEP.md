@@ -225,7 +225,7 @@ Check everything at once:
 sssd-smartcard doctor --user someone@ad.example.com
 ```
 
-`sudo` rules for a user (no password needed to check):
+`sudo` rules for a user (asks you to authenticate, not them):
 
 ```bash
 sudo -l -U someone@ad.example.com

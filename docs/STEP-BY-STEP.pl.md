@@ -224,7 +224,7 @@ Sprawdź wszystko naraz:
 sssd-smartcard doctor --user ktos@ad.example.com
 ```
 
-Reguły `sudo` użytkownika (sprawdzenie nie wymaga hasła):
+Reguły `sudo` użytkownika (uwierzytelnia ciebie, nie jego):
 
 ```bash
 sudo -l -U ktos@ad.example.com

@@ -761,7 +761,11 @@ The final `visudo -c` covers every file, not just the new one.
 `sssd-smartcard-setup --sudo-group linux-admins@ad.example.com` does exactly
 this, and refuses a group that does not resolve; `--sudo-agent` adds the two
 pieces below (the `/etc/pam.d/sudo` line only with `--pam`). Check the result
-with `sudo -l -U someone@ad.example.com`, which lists without authenticating.
+with `sudo -l -U someone@ad.example.com`. That reports on *another* user
+without needing their credentials, but it still authenticates **you** -- `sudo
+-l` is a sudo command like any other, so expect a PIN or password prompt unless
+NOPASSWD applies or your timestamp is still valid. Measured: at a local console
+it asks for the card PIN.
 
 **A password prompt is not evidence of having sudo rights.** sudo authenticates
 first and authorises second, so it asks even a user with no rules at all and
