@@ -1,3 +1,21 @@
+sssd-smartcard (0.3.6) unstable; urgency=medium
+
+  * Fixes a misdiagnosis introduced by 0.3.5's own fix. That release taught the
+    card-reading error to say which link in the chain broke, and then guessed
+    "contention" whenever a card was present in the reader -- including when
+    the operator had asked for a slot that does not exist. Pointing
+    'cert inspect --from-card --slot 99' at a healthy card produced advice
+    about login and screen-lock helpers, which is the same misdirection the
+    message was written to remove.
+  * When --slot or --module narrowed the search by hand, the message now names
+    what was asked for and says to check that it exists. Contention is offered
+    only when nothing was narrowed, which is the case it was written for and
+    which still works. Found by exercising the error branch on the host rather
+    than trusting that a message about misdiagnosis could not itself
+    misdiagnose.
+
+ -- Szymon Frankiewicz <szymonfrankiewicz@gmail.com>  Fri, 30 Oct 2026 22:45:00 +0100
+
 sssd-smartcard (0.3.5) unstable; urgency=medium
 
   * Reading a card now says which link in the chain broke, instead of blaming

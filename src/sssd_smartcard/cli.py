@@ -108,19 +108,38 @@ def resolve_certificate(args, printer: Printer) -> CertificateInfo:
         failed = [c for c in result.checks if c.status == "FAIL"]
         if failed:
             detail = "; ".join(f"{c.name}: {c.detail}" for c in failed)
-            busy = any(r.card_present for r in result.readers)
-            raise SmartCardError(
-                f"the card could not be read -- {detail}."
-                + (
-                    " A card is present in the reader, so this is more likely "
-                    "contention than provisioning: a login or screen-lock "
-                    "helper may be holding it. Try again, and check with "
-                    "`sssd-smartcard card detect`."
-                    if busy
-                    else " Run `sssd-smartcard card detect` to see what the "
-                    "reader reports."
+            # Contention is a guess, and only a reasonable one when nothing was
+            # narrowed by hand. With --slot or --module given, the far likelier
+            # answer is that the thing asked for is not there -- blaming a
+            # screen-lock helper for a slot that does not exist is the same
+            # misdirection this message was written to remove.
+            narrowed = [
+                f"--{name.replace('_', '-')} {value}"
+                for name, value in (
+                    ("slot", getattr(args, "slot", None)),
+                    ("module", getattr(args, "module", None)),
                 )
-            )
+                if value
+            ]
+            if narrowed:
+                tail = (
+                    f" You narrowed the search with {', '.join(narrowed)}; check "
+                    "that it exists -- `sssd-smartcard card detect` lists the "
+                    "slots and modules actually present."
+                )
+            elif any(r.card_present for r in result.readers):
+                tail = (
+                    " A card is present in the reader and nothing was narrowed by "
+                    "hand, so contention is more likely than provisioning: a login "
+                    "or screen-lock helper may be holding it. Try again, and check "
+                    "with `sssd-smartcard card detect`."
+                )
+            else:
+                tail = (
+                    " Run `sssd-smartcard card detect` to see what the reader "
+                    "reports."
+                )
+            raise SmartCardError(f"the card could not be read -- {detail}.{tail}")
         if not result.certificates:
             raise SmartCardError(
                 "the card was read, and holds no certificate. It may not be "

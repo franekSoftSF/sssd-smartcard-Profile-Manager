@@ -29,7 +29,7 @@ if (( BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 4) ))
     exit 1
 fi
 
-VERSION="0.3.5"
+VERSION="0.3.6"
 PROGRAM="${0##*/}"
 
 # ---------------------------------------------------------------------------

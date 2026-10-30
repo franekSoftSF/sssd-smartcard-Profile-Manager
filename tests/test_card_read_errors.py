@@ -58,6 +58,56 @@ def load_with(monkeypatch, scan_result):
     return str(excinfo.value)
 
 
+def load_with_args(monkeypatch, scan_result, **attrs):
+    """Same, but with some of the narrowing arguments set."""
+    args = Args()
+    for key, value in attrs.items():
+        setattr(args, key, value)
+    monkeypatch.setattr("sssd_smartcard.pkcs11.detect.scan", lambda **kw: scan_result)
+    monkeypatch.setattr(
+        "sssd_smartcard.pkcs11.detect.pick_authentication_certificate",
+        lambda result: None,
+    )
+    with pytest.raises(SmartCardError) as excinfo:
+        cli.resolve_certificate(args, Printer(colour=False))
+    return str(excinfo.value)
+
+
+class TestAnExplicitSelectionIsNotBlamedOnContention:
+    """The first version of this message guessed contention whenever a card was
+    present, including when the operator had asked for a slot that does not
+    exist -- so pointing at --slot 99 produced advice about screen-lock helpers.
+    That is the same misdirection the message was written to remove."""
+
+    def test_an_explicit_slot_points_at_the_slot(self, monkeypatch):
+        scan = CardScan(
+            readers=[Reader(name="Reader 0", card_present=True)],
+            checks=[Check("certificates", "FAIL", "no certificate objects on the token")],
+        )
+        message = load_with_args(monkeypatch, scan, slot="99")
+        assert "--slot 99" in message
+        assert "contention" not in message
+
+    def test_an_explicit_module_points_at_the_module(self, monkeypatch):
+        scan = CardScan(
+            readers=[Reader(name="Reader 0", card_present=True)],
+            checks=[Check("certificates", "FAIL", "no certificate objects on the token")],
+        )
+        message = load_with_args(monkeypatch, scan, module="/nonexistent.so")
+        assert "--module /nonexistent.so" in message
+        assert "contention" not in message
+
+    def test_without_narrowing_contention_is_still_offered(self, monkeypatch):
+        """The case it was written for must keep working."""
+        scan = CardScan(
+            readers=[Reader(name="Reader 0", card_present=True)],
+            checks=[Check("certificates", "FAIL", "no certificate objects on the token")],
+        )
+        message = load_with_args(monkeypatch, scan)
+        assert "contention" in message
+        assert "nothing was narrowed by hand" in message
+
+
 class TestTheThreeOutcomesAreDistinguished:
     def test_unreadable_card_names_the_failing_step(self, monkeypatch):
         scan = CardScan(
