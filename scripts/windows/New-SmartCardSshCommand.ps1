@@ -1077,6 +1077,92 @@ $script:Messages = @{
         pl = 'Tego producenta skrypt nie rozpoznaje, więc nie wskaże sterownika. Sprawdź witrynę wsparcia producenta. Wbudowany ministerownik PIV systemu Windows (msclmd.inf) często w zupełności wystarcza dla karty już zainicjowanej, więc to może w ogóle nie być problem.'
     }
 
+    # ---- PIN and touch policy ---------------------------------------------
+    'pin.check' = @{
+        en = 'Card PIN and touch policy for the chosen certificate'
+        pl = 'Polityka PIN-u i dotknięcia karty dla wybranego certyfikatu'
+    }
+    'pin.slot' = @{
+        en = 'slot {0}: PIN policy = {1}, touch policy = {2}'
+        pl = 'slot {0}: polityka PIN-u = {1}, polityka dotknięcia = {2}'
+    }
+    'pin.unknown.vendor' = @{
+        en = 'policy unknown: only a YubiKey can be read this way'
+        pl = 'polityka nieznana: w ten sposób da się odczytać tylko YubiKey'
+    }
+    'pin.unknown.vendor.detail' = @{
+        en = 'this token needs its vendor''s own management tooling; this script does not know a command for it and will not guess one'
+        pl = 'ten token wymaga własnych narzędzi producenta; skrypt nie zna dla niego polecenia i nie będzie go zgadywał'
+    }
+    'pin.unknown.noykman' = @{
+        en = 'policy unknown: ykman.exe was not found'
+        pl = 'polityka nieznana: nie znaleziono ykman.exe'
+    }
+    'pin.unknown.noykman.detail' = @{
+        en = 'install the YubiKey Manager CLI to have the policy reported: winget install --id Yubico.YubiKeyManagerCLI'
+        pl = 'zainstaluj YubiKey Manager CLI, aby polityka była raportowana: winget install --id Yubico.YubiKeyManagerCLI'
+    }
+    'pin.unknown.noslot' = @{
+        en = 'policy unknown: no PIV slot on this YubiKey holds the chosen certificate'
+        pl = 'polityka nieznana: żaden slot PIV tego YubiKey nie zawiera wybranego certyfikatu'
+    }
+    'pin.unknown.noslot.detail' = @{
+        en = 'the slot is matched by the certificate SHA-256, not assumed to be 9A, so no policy is reported rather than another slot''s'
+        pl = 'slot jest dopasowywany po SHA-256 certyfikatu, a nie zakładany jako 9A, więc nie podajemy polityki innego slotu'
+    }
+    'pin.unknown.nocert' = @{
+        en = 'policy unknown: the certificate bytes could not be read to match a slot'
+        pl = 'polityka nieznana: nie udało się odczytać bajtów certyfikatu, by dopasować slot'
+    }
+    'pin.why.header' = @{
+        en = 'Why sudo does not ask for the PIN again:'
+        pl = 'Dlaczego sudo nie pyta ponownie o PIN:'
+    }
+    'pin.why1' = @{
+        en = 'With PIN policy ONCE the card asks for the PIN once per session, so the'
+        pl = 'Przy polityce PIN-u ONCE karta pyta o PIN raz na sesję, więc podpis, o który'
+    }
+    'pin.why2' = @{
+        en = 'signature pam_ssh_agent_auth asks for during sudo needs no new PIN. That is'
+        pl = 'pam_ssh_agent_auth prosi podczas sudo, nie wymaga nowego PIN-u. Tak została'
+    }
+    'pin.why3' = @{
+        en = 'how the card was provisioned -- not a weakness in this configuration.'
+        pl = 'zainicjowana karta -- to nie jest słabość tej konfiguracji.'
+    }
+    'pin.why4' = @{
+        en = 'FIDO2 differs by protocol: it requires user presence for every assertion.'
+        pl = 'FIDO2 różni się protokołem: wymaga obecności użytkownika przy każdej asercji.'
+    }
+    'pin.why5' = @{
+        en = 'PIV does not, unless the slot was provisioned to.'
+        pl = 'PIV tego nie wymaga, o ile slot nie został tak zainicjowany.'
+    }
+    'pin.why6' = @{
+        en = 'To require a gesture per elevation the slot needs touch-policy ALWAYS, or'
+        pl = 'Aby wymagać gestu przy każdym podniesieniu uprawnień, slot potrzebuje'
+    }
+    'pin.why7' = @{
+        en = 'CACHED for a 15-second window. Both policies are fixed when the key is'
+        pl = 'touch-policy ALWAYS albo CACHED (okno 15 sekund). Obie polityki ustala się'
+    }
+    'pin.why8' = @{
+        en = 'generated or imported, so changing them means a new key and a re-issued'
+        pl = 'przy generowaniu lub imporcie klucza, więc ich zmiana oznacza nowy klucz'
+    }
+    'pin.why9' = @{
+        en = 'certificate.'
+        pl = 'i ponownie wystawiony certyfikat.'
+    }
+    'pin.why10' = @{
+        en = 'Separately, -forcepincache would remove the PIN prompt entirely -- see the'
+        pl = 'Osobną sprawą jest -forcepincache, który usunąłby pytanie o PIN całkowicie'
+    }
+    'pin.why11' = @{
+        en = 'note above. It is not recommended.'
+        pl = '-- patrz uwaga wyżej. Nie jest zalecany.'
+    }
+
     # ---- detection diagnostics -------------------------------------------
     # Deliberately English. These name binary symbols and exact option
     # spellings ("CAPI:", "-x509off", "plink.exe") and are what an operator
@@ -2481,6 +2567,149 @@ function Get-OpenScCardCertificate {
 }
 
 # --------------------------------------------------------------------------
+# PIN and touch policy
+# --------------------------------------------------------------------------
+
+function Find-Ykman {
+    $roots = @($env:ProgramFiles, ${env:ProgramFiles(x86)}, $env:ProgramW6432) |
+             Where-Object { $_ }
+    foreach ($r in $roots) {
+        $p = Join-Path $r 'Yubico\YubiKey Manager CLI\ykman.exe'
+        if (Test-Path -LiteralPath $p -PathType Leaf) { return $p }
+    }
+    $c = Get-Command 'ykman.exe' -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($c) { return $c.Source }
+    return $null
+}
+
+<#
+    Read the PIN and touch policy of the PIV slot holding a given certificate.
+
+    Two steps, because neither alone is enough:
+
+      1. "ykman piv info" prints a block per slot, each carrying a
+         "Fingerprint:" line. That fingerprint is the certificate's SHA-256 --
+         verified on the test workstation by hashing the certificate from the
+         Windows store and comparing: the two matched exactly. So the slot is
+         found by MATCHING, not by assuming 9A. A card can hold certificates in
+         9A, 9C, 9D and 9E, and reporting another slot's policy would be worse
+         than reporting none.
+      2. "ykman piv keys info <slot>" then prints the two policy lines:
+             PIN required for use:   ONCE
+             Touch required for use: NEVER
+
+    Per Yubico's documentation the PIN policy is NEVER|ONCE|ALWAYS (plus the
+    MATCH-* values on bio keys) and the touch policy is NEVER|ALWAYS|CACHED,
+    CACHED being a 15-second window. Both are set at key generation or import
+    and there is no documented command to change them afterwards.
+
+    Only YubiKeys can be read this way. For anything else this returns unknown
+    rather than inventing a command for a vendor whose tooling we do not know.
+#>
+function Get-YubikeySlotPolicy {
+    param([string] $Thumbprint)
+
+    $result = [pscustomobject]@{
+        Ok      = $false
+        Reason  = 'nocert'
+        Slot    = $null
+        Pin     = $null
+        Touch   = $null
+    }
+
+    $ykman = Find-Ykman
+    if (-not $ykman) { $result.Reason = 'noykman'; return $result }
+
+    # The certificate's SHA-256, from the copy in the user's store.
+    $sha256 = $null
+    try {
+        $cert = Get-ChildItem Cert:\CurrentUser\My -ErrorAction Stop |
+                Where-Object { $_.Thumbprint -eq $Thumbprint } |
+                Select-Object -First 1
+        if ($cert) {
+            $hasher = [System.Security.Cryptography.SHA256]::Create()
+            $bytes = $hasher.ComputeHash($cert.RawData)
+            $sha256 = (($bytes | ForEach-Object { '{0:x2}' -f $_ }) -join '')
+        }
+    } catch {
+        Write-Verbose 'could not read the certificate to compute its SHA-256'
+    }
+    if (-not $sha256) { $result.Reason = 'nocert'; return $result }
+
+    $info = Invoke-Capture -FilePath $ykman -Arguments @('piv', 'info')
+    if (-not $info.Ok -or -not $info.Text) { $result.Reason = 'noykman'; return $result }
+
+    # Walk the slot blocks, remembering the slot whose Fingerprint matches.
+    $slot = $null
+    $found = $null
+    foreach ($line in ($info.Text -split "`r?`n")) {
+        if ($line -match '^Slot\s+([0-9A-Fa-f]{2})\s*\(') {
+            $slot = $Matches[1].ToUpper(); continue
+        }
+        if ($line -match '^\s*Fingerprint:\s*([0-9a-fA-F]{64})\s*$') {
+            if ($slot -and $Matches[1].ToLower() -eq $sha256) { $found = $slot; break }
+        }
+    }
+    if (-not $found) { $result.Reason = 'noslot'; return $result }
+
+    $keys = Invoke-Capture -FilePath $ykman -Arguments @('piv', 'keys', 'info', $found)
+    if (-not $keys.Ok -or -not $keys.Text) { $result.Reason = 'noslot'; return $result }
+
+    foreach ($line in ($keys.Text -split "`r?`n")) {
+        if ($line -match '^\s*PIN required for use:\s*(\S.*?)\s*$') { $result.Pin = $Matches[1] }
+        if ($line -match '^\s*Touch required for use:\s*(\S.*?)\s*$') { $result.Touch = $Matches[1] }
+    }
+
+    $result.Slot = $found
+    if ($result.Pin -and $result.Touch) { $result.Ok = $true; $result.Reason = $null }
+    else { $result.Reason = 'noslot' }
+    return $result
+}
+
+<#
+    Report the policy, and explain it whether or not it could be read.
+
+    The explanation is the part that answers the operator's question ("should
+    sudo not force a PIN prompt? FIDO asks every time"), so it prints
+    unconditionally. INFO, never WARN: PIN policy ONCE is the sane and
+    overwhelmingly common provisioning, and flagging it as a problem would
+    train people to ignore the line.
+#>
+function Show-PinPolicy {
+    param([string] $Thumbprint, [string] $Family)
+
+    if ($Family -eq 'Yubico') {
+        $pol = Get-YubikeySlotPolicy -Thumbprint $Thumbprint
+        if ($pol.Ok) {
+            Write-Finding -Status 'INFO' -Check (T 'pin.check') `
+                -Detail (T 'pin.slot' @($pol.Slot, $pol.Pin, $pol.Touch))
+        } else {
+            $detailKey = 'pin.unknown.nocert'
+            $extraKey = $null
+            if ($pol.Reason -eq 'noykman') {
+                $detailKey = 'pin.unknown.noykman'; $extraKey = 'pin.unknown.noykman.detail'
+            } elseif ($pol.Reason -eq 'noslot') {
+                $detailKey = 'pin.unknown.noslot'; $extraKey = 'pin.unknown.noslot.detail'
+            }
+            Write-Finding -Status 'INFO' -Check (T 'pin.check') -Detail (T $detailKey)
+            if ($extraKey) {
+                Write-Host ('         ' + (T $extraKey)) -ForegroundColor Gray
+            }
+        }
+    } else {
+        Write-Finding -Status 'INFO' -Check (T 'pin.check') -Detail (T 'pin.unknown.vendor')
+        Write-Host ('         ' + (T 'pin.unknown.vendor.detail')) -ForegroundColor Gray
+    }
+
+    Write-Host ''
+    Write-Host ('  ' + (T 'pin.why.header')) -ForegroundColor White
+    foreach ($k in 1..11) {
+        Write-Host ('    ' + (T ('pin.why{0}' -f $k))) -ForegroundColor Gray
+    }
+    Write-Host ''
+}
+
+# --------------------------------------------------------------------------
 # Minidriver advice
 # --------------------------------------------------------------------------
 
@@ -3298,6 +3527,14 @@ Write-Host '  the forwarded agent -- goes through with no prompt. Convenient for
 Write-Host '  and it stops the card being a second factor for anyone who reaches an' -ForegroundColor Gray
 Write-Host '  unlocked session. Decide deliberately, not by accident.' -ForegroundColor Gray
 Write-Host ''
+
+# Placed after the -forcepincache note so the explanation can refer back to it
+# rather than repeat it. Answers "shouldn't sudo force a PIN prompt?", which is
+# the first thing anyone arriving from FIDO asks.
+$chosenFamily = 'Unknown'
+$chosenToken = @($tokens | Where-Object { $_.Reader -eq $chosen.Reader }) | Select-Object -First 1
+if ($chosenToken) { $chosenFamily = $chosenToken.Family }
+Show-PinPolicy -Thumbprint $chosen.Thumbprint -Family $chosenFamily
 
 Write-Host '  The server needs nothing copied to it: SSSD derives the SSH public key from' -ForegroundColor Gray
 Write-Host '  the certificate and sshd fetches it through' -ForegroundColor Gray

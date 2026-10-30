@@ -275,6 +275,57 @@ each `sudo` over the forwarded agent — goes through with no prompt. Convenient
 for a demo, and it stops the card being a second factor for anyone who reaches
 an unlocked session. Decide that deliberately rather than by accident.
 
+### Why `sudo` does not ask for the PIN again
+
+The first question anyone arriving from FIDO asks: *shouldn't `sudo` force a PIN
+prompt? With FIDO it asks every time I run `sudo su`.*
+
+It should not, and that is the card's provisioning rather than a weakness in
+this configuration.
+
+A PIV slot carries two policies. On the test workstation's YubiKey:
+
+```
+ykman piv keys info 9a
+Key slot:               9A (AUTHENTICATION)
+Algorithm:              RSA2048
+Origin:                 GENERATED
+PIN required for use:   ONCE
+Touch required for use: NEVER
+```
+
+`PIN required for use: ONCE` means one PIN per session, so the signature
+`pam_ssh_agent_auth` asks for during `sudo` needs no new PIN.
+`Touch required for use: NEVER` means no physical confirmation either.
+
+**FIDO2 differs by protocol**: it requires user presence for every assertion.
+PIV does not, unless the slot was provisioned that way.
+
+Per Yubico's documentation the PIN policy is `NEVER`, `ONCE` or `ALWAYS` (plus
+the `MATCH-*` values on bio keys) and the touch policy is `NEVER`, `ALWAYS` or
+`CACHED`, where `CACHED` is a 15-second window. To require a gesture per
+elevation the slot needs `touch-policy=ALWAYS`, or `CACHED` to be asked at most
+once every 15 seconds.
+
+**Both policies are set when the key is generated or imported**, at
+`ykman piv keys generate` or `ykman piv keys import` time, and there is no
+documented command to change them afterwards. Changing them therefore means a
+new key pair and a re-issued certificate.
+
+`ONCE` is the sane and overwhelmingly common default, so the helper script
+reports this as INFO and never as a warning. It finds the slot by matching the
+certificate's SHA-256 against the `Fingerprint:` line of `ykman piv info`,
+rather than assuming slot 9A — a card can hold certificates in 9A, 9C, 9D and
+9E, and reporting a different slot's policy would be worse than reporting none.
+If nothing matches it says so.
+
+Only YubiKeys can be read this way. For an HID Crescendo or any other token the
+script reports the policy as unknown and says the vendor's own tooling is
+needed; it does not invent a command.
+
+Separately, `-forcepincache` would remove the PIN prompt entirely — see the end
+of section 3 above. It is not recommended.
+
 ### What `-A` costs you
 
 This is the one real price of the technique, and it is worth being blunt about.

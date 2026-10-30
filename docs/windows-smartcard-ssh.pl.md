@@ -470,6 +470,59 @@ HKCU\Software\SimonTatham\PuTTY\Sessions\<nazwa-sesji>
 `-A` w wierszu poleceń załatwia pojedyncze uruchomienie niezależnie od
 `AgentFwd`; zapisana wartość ma znaczenie przy starcie sesji z interfejsu.
 
+### Dlaczego `sudo` nie pyta ponownie o PIN
+
+To pierwsze pytanie każdego, kto przychodzi od FIDO: *czy `sudo` nie powinno
+wymusić pytania o PIN? Przy FIDO pyta za każdym razem, gdy uruchamiam
+`sudo su`.*
+
+Nie powinno — i wynika to ze sposobu zainicjowania karty, a nie ze słabości tej
+konfiguracji.
+
+Slot PIV niesie dwie polityki. Na YubiKeyu ze stacji testowej:
+
+```
+ykman piv keys info 9a
+Key slot:               9A (AUTHENTICATION)
+Algorithm:              RSA2048
+Origin:                 GENERATED
+PIN required for use:   ONCE
+Touch required for use: NEVER
+```
+
+`PIN required for use: ONCE` znaczy jeden PIN na sesję, więc podpis, o który
+`pam_ssh_agent_auth` prosi podczas `sudo`, nie wymaga nowego PIN-u.
+`Touch required for use: NEVER` znaczy, że nie jest potrzebne także żadne
+fizyczne potwierdzenie.
+
+**FIDO2 różni się protokołem**: wymaga obecności użytkownika przy każdej
+asercji. PIV tego nie wymaga, o ile slot nie został tak zainicjowany.
+
+Zgodnie z dokumentacją Yubico polityka PIN-u przyjmuje wartości `NEVER`, `ONCE`
+albo `ALWAYS` (oraz `MATCH-*` na kluczach biometrycznych), a polityka
+dotknięcia `NEVER`, `ALWAYS` albo `CACHED`, gdzie `CACHED` to okno 15 sekund.
+Aby wymagać gestu przy każdym podniesieniu uprawnień, slot potrzebuje
+`touch-policy=ALWAYS` albo `CACHED`, by pytać najwyżej raz na 15 sekund.
+
+**Obie polityki ustala się przy generowaniu lub imporcie klucza**, czyli w
+momencie `ykman piv keys generate` lub `ykman piv keys import`, i nie ma
+udokumentowanego polecenia, które zmieniłoby je później. Ich zmiana oznacza
+więc nową parę kluczy i ponownie wystawiony certyfikat.
+
+`ONCE` jest rozsądnym i zdecydowanie najczęstszym ustawieniem domyślnym, więc
+skrypt pomocniczy raportuje to jako INFO, nigdy jako ostrzeżenie. Slot
+odnajduje, dopasowując SHA-256 certyfikatu do linii `Fingerprint:` z
+`ykman piv info`, zamiast zakładać slot 9A — karta może trzymać certyfikaty w
+slotach 9A, 9C, 9D i 9E, a podanie polityki innego slotu byłoby gorsze niż
+niepodanie żadnej. Jeśli nic nie pasuje, skrypt tak właśnie mówi.
+
+W ten sposób da się odczytać tylko YubiKey. Dla HID Crescendo i każdego innego
+tokena skrypt raportuje politykę jako nieznaną i mówi, że potrzebne są własne
+narzędzia producenta — nie wymyśla polecenia.
+
+Osobną sprawą jest `-forcepincache`, który usunąłby pytanie o PIN całkowicie —
+patrz koniec rozdziału 5. Nie jest zalecany.
+
 ### Czym płacisz za `-A`
 
 To jedyna realna cena tej techniki i warto ją powiedzieć wprost.

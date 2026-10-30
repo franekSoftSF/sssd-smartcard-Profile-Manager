@@ -1,3 +1,41 @@
+sssd-smartcard (0.3.1) unstable; urgency=medium
+
+  * The Windows helper reports the PIV slot's PIN and touch policy, and
+    explains what they mean for sudo. Asked by an operator coming from FIDO:
+    "shouldn't sudo force a PIN prompt? With FIDO it asks every time."  It
+    should not, and nothing in the output said why. Measured on the card:
+    PIN policy ONCE, touch policy NEVER -- so the card is unlocked once per
+    session and the signature pam_ssh_agent_auth asks for during sudo needs no
+    new PIN. That is provisioning, not a weakness in the configuration. FIDO2
+    differs by protocol: it requires user presence for every assertion.
+  * The slot is found by matching the SHA-256 of the chosen certificate against
+    what 'ykman piv info' reports per slot, never assumed to be 9A. When
+    nothing matches, the policy is reported as unknown rather than another
+    slot's being substituted -- verified by feeding it a store certificate that
+    is not on the card.
+  * Only a YubiKey can be read this way. For any other token the policy is
+    unknown and the output says the vendor's own tooling is needed; no command
+    is invented for one. The explanation prints on every path, including when
+    the policy cannot be read, because the explanation is the part that answers
+    the question.
+  * INFO, never WARN: ONCE is the sane default and the overwhelmingly common
+    provisioning, so it produces no action-list step. Flagging it would train
+    people to ignore the line.
+  * Both guides gained the same material under the sudo section, with the
+    policy values (NEVER|ONCE|ALWAYS and NEVER|ALWAYS|CACHED, CACHED being a
+    15-second window) and the constraint that both are fixed when the key is
+    generated or imported -- so requiring a gesture per elevation means a new
+    key and a re-issued certificate, not a configuration change.
+  * Two check names stopped asserting the state they were testing. A failing
+    run read "[FAIL] Saved session has agent forwarding enabled", which states
+    the thing that is false and leaves the reader working out which half wins.
+    The status carries the verdict; the name now carries only the subject.
+    Found by exercising the AgentFwd=0 and AutoloadCerts=1 branches, which had
+    never run: both were verified against the real registry values and the
+    state restored afterwards.
+
+ -- Szymon Frankiewicz <szymonfrankiewicz@gmail.com>  Fri, 30 Oct 2026 18:30:00 +0100
+
 sssd-smartcard (0.3.0) unstable; urgency=medium
 
   * sssd-smartcard-capture: take a working host's configuration and reproduce
