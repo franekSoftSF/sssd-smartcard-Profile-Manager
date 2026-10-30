@@ -1,4 +1,4 @@
-# Status — 2026-10-20
+# Status — 2026-10-30
 
 End-of-session snapshot. Everything below was verified on the real lab host, not
 inferred. Where something was not verified, it says so.
@@ -13,7 +13,7 @@ project's history.
 |---|---|
 | Local login | `Backend cannot handle Smartcard authentication, trying local Smartcard authentication` |
 | SSH | `Accepted key RSA … found at /usr/bin/sss_ssh_authorizedkeys:3` |
-| `sudo`, locally | PIN prompt instead of a password |
+| `sudo`, locally | `PIN for <name>:` at a local console — observed 2026-10-30 |
 | `sudo`, over SSH | `Running AuthorizedKeysCommand` → `ssh_rsa_verify: signature correct` |
 
 All four resolve the same key, derived by SSSD from the same certificate in AD.
@@ -21,8 +21,9 @@ All four resolve the same key, derived by SSSD from the same certificate in AD.
 negative test: remove the file and the prompt changes from PIN to password;
 restore it and the PIN returns.
 
-- Version **0.2.9**, **580 tests** passing (1 skipped: a POSIX permission-bit
-  assertion that Windows cannot express)
+- Version **0.3.4**, **619 tests** passing (4 skipped: three collector tests
+  that only run on Linux, and a POSIX permission-bit assertion Windows cannot
+  express)
 - `sssd-smartcard_0.2.9_all.deb` — sha256
   `86a5eee44d1fd2d5a36f0795711ca9306ae3d6c11c24571b880e2e2d30a20f8d`
 - `packaging/sanitise.py --check` clean; the Windows script, guide and PDF were
@@ -58,13 +59,29 @@ file rewritten.
 
 | Item | State |
 |---|---|
-| `AutoloadCerts = 1` WARN branch in the Windows script | **untested** — needs that registry value flipped and the script re-run |
 | Stock PuTTY detection, negative side | inferred, not measured; stock PuTTY is not installed here |
-| A third-vendor PIV token, end to end | generic path unit-tested, never exercised with real hardware |
+| A third-vendor PIV token, end to end | generic path unit-tested, exercised on HID Crescendo; no third vendor |
 | `MaxAuthTries` exhaustion as the cause of a refused key | asserted from OpenSSH's documented default; not reproduced |
+| `touch-policy ALWAYS` forcing a gesture per `sudo` | asserted from Yubico's documented semantics; needs a card provisioned that way |
+| GSSAPI delegation, the positive case | the workstation is not domain-joined, so only the negative was measured |
+| Polish prose in the guides and the script catalogue | no native review |
 | `pam_ssh_agent_auth` with a third-party key service | reported without a verdict by design |
-| `krb5-pkinit`, `includedir`, anchors on this domain | not configured; `doctor` warns, nothing depends on it |
+| `krb5-pkinit`, `includedir`, anchors on this domain | not configured; `doctor` reports it, nothing depends on it |
 | `dc02` | unreachable, being deprovisioned, deliberately ignored |
+
+Closed since the last snapshot: the `AutoloadCerts = 1` and `AgentFwd = 0`
+branches were exercised against the real registry and restored; the HID
+Crescendo path was tested end to end with a second person's certificate; and
+both Kerberos verdicts were observed rather than derived — `klist` in an SSH
+session and, separately, in a local Wayland session on seat0.
+
+## What a card login does not give you
+
+A Kerberos ticket. `local_auth_policy = enable:smartcard` authenticates
+locally and never contacts the KDC; SSH public-key authentication skips the PAM
+`auth` stack altogether. A password login does obtain one, which is why tickets
+appear to show up "sometimes". `doctor` reports both as INFO, and
+`docs/sssd-reference.md` has the table across all four paths.
 
 ## Host state, for picking up cold
 
