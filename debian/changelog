@@ -1,3 +1,30 @@
+sssd-smartcard (0.3.3) unstable; urgency=medium
+
+  * Both Windows guides state what SSH with the card does not give you: a
+    Kerberos identity. The key is derived from the certificate, but public-key
+    authentication never contacts the KDC, so the session holds no ticket --
+    confirmed with klist inside a session. A reader who has just been told the
+    card covers sudo as well is exactly the reader who will assume it covers
+    Kerberos too, so the note sits beside the agent-forwarding material and the
+    script prints a one-line pointer there under -ForwardAgent.
+  * The section says plainly what would be required instead, and the caveat
+    that decides whether that route is open at all: GSSAPI credential
+    delegation forwards a ticket the client must already hold. Measured on the
+    workstation in question -- not domain-joined, signed in with a local
+    account, zero cached tickets -- so there was nothing to forward. With a
+    domain-joined workstation and a card logon the authentication is then
+    Kerberos rather than the card, the card having done its part one step
+    earlier; that is a different path rather than an extension of this one.
+  * It also repeats the measured finding that a console card login does not
+    yield a ticket either, because local_auth_policy = enable:smartcard is
+    local authentication and krb5-pkinit was not installed on the host -- said
+    as the measurement it is, not as a general rule about PKINIT.
+  * The guides point at docs/sssd-reference.md for the table across all four
+    login paths rather than restating it, since duplicating a table is how two
+    documents start disagreeing.
+
+ -- Szymon Frankiewicz <szymonfrankiewicz@gmail.com>  Fri, 30 Oct 2026 20:00:00 +0100
+
 sssd-smartcard (0.3.2) unstable; urgency=medium
 
   * doctor says which login paths end with a Kerberos ticket, and which do not.

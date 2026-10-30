@@ -77,12 +77,12 @@ plink.exe -x509off -batch -i CAPI:<sha1-thumbprint> -l someone@ad.example.com li
 
 Three details in there are not obvious:
 
-- `-x509off` is required. Section 4.2 explains why.
+- `-x509off` is required. Section 5.2 explains why.
 - `-l someone@ad.example.com` rather than `someone@ad.example.com@host`,
   because an Active Directory UPN contains an `@` and `user@host` parsing
   splits on it.
 - `<sha1-thumbprint>` must be read **off the card**, not picked out of the
-  Windows certificate store. Section 4.3 explains why.
+  Windows certificate store. Section 5.3 explains why.
 
 Steps:
 
@@ -93,7 +93,7 @@ Steps:
    only needed to read the thumbprint straight off the card as a cross-check;
    `certutil` can usually do that on its own.
 3. **Insert the token** and check that Windows sees a card, not just a reader.
-4. **Run the helper script** (section 5) to get the checks and the exact
+4. **Run the helper script** (section 6) to get the checks and the exact
    command line.
 5. **Run the command it prints.** PuTTY will ask for the card PIN. Nothing in
    this project ever asks for, stores or logs a PIN.
@@ -239,8 +239,8 @@ the card's key may never be reached, and the failure surfaces as:
 Server refused our key
 ```
 
-which is the *same four words* produced by the X.509 trap in 4.2 and by a stale
-store entry in 4.3. Three unrelated causes, one message.
+which is the *same four words* produced by the X.509 trap in 5.2 and by a stale
+store entry in 5.3. Three unrelated causes, one message.
 
 The approach that works, verified end to end:
 
@@ -387,12 +387,54 @@ strength of that message.
 
 ---
 
-## 4. Three traps
+## 4. What this does not give you: a Kerberos identity
+
+SSH public-key authentication gives you a shell, not a Kerberos identity. The
+key is derived from the certificate on the card, but the authentication never
+contacts the KDC, so the session holds no ticket. Confirm it inside the
+session:
+
+```
+$ klist
+klist: No credentials cache found (filename: /tmp/krb5cc_<uid>)
+```
+
+That is a property of the mechanism rather than a fault, and the Linux side
+reports it as INFO rather than as a problem. A console login with the card does
+not yield one either, for a separate reason:
+`local_auth_policy = enable:smartcard` is local authentication, and on the
+measured host `krb5-pkinit` was not installed.
+
+If something inside the session needs Kerberos -- a file share, a service with
+an SPN -- the route is `GSSAPIAuthentication` with credential delegation. PuTTY
+supports it under `Connection` -> `SSH` -> `Auth` -> `GSSAPI`, where the two
+options read `Attempt GSSAPI authentication (SSH-2 only)` and
+`Allow GSSAPI credential delegation`, saved as `AuthGSSAPI` and
+`AuthGSSAPIKEX`.
+
+One caveat decides whether that route is open at all: **delegation forwards a
+ticket the client already holds.** On a workstation that is not domain-joined,
+or where you sign in to Windows with a local account, Windows never obtains
+one. Measured on such a workstation: `klist` reported `Cached Tickets: (0)`,
+`PartOfDomain` was `False`, and `whoami` returned a local account. There is
+nothing to forward.
+
+For it to work the workstation has to be domain-joined and you have to sign in
+to Windows with the card, which is when Windows obtains its TGT. Note what that
+makes it: the SSH authentication is then **Kerberos rather than the card**, and
+the card's part happened one step earlier, at the Windows logon. That is a
+different path from the one this guide describes, not an extension of it.
+
+Which login paths yield a ticket, and what each would take, is tabulated in
+`docs/sssd-reference.md`. That is Linux-side content; restating it here is how
+the two drift apart.
+
+## 5. Three traps
 
 These three account for most of the time lost on this. Each produces a
 misleading symptom, and two of them produce no error message worth the name.
 
-### 4.1 The Windows OpenSSH client cannot do this at all
+### 5.1 The Windows OpenSSH client cannot do this at all
 
 `C:\WINDOWS\System32\OpenSSH\ssh.exe` — `OpenSSH_for_Windows_9.5p2` — **accepts
 the `-I` option and then silently ignores it.** PKCS#11 support is compiled out
@@ -418,7 +460,7 @@ binary crashes reproducibly. Not a workaround.
 
 So: use PuTTY-CAC. Do not spend an afternoon on `ssh -I`.
 
-### 4.2 X.509 mode makes the server refuse the key
+### 5.2 X.509 mode makes the server refuse the key
 
 PuTTY-CAC can offer `x509v3-ssh-rsa` (RFC 6187) when its X.509 mode is on.
 **OpenSSH does not implement that algorithm.** The server refuses the key, and
@@ -443,7 +485,7 @@ turns it on it stays on for later runs and for other tools in the suite, which
 is exactly why passing `-x509off` explicitly every time is worth the eight
 characters.
 
-### 4.3 The thumbprint must come from the card
+### 5.3 The thumbprint must come from the card
 
 This is the subtle one, and the check most worth running.
 
@@ -508,7 +550,7 @@ and container names needs no PIN; only the eventual SSH login does.
 
 ---
 
-## 5. The helper script
+## 6. The helper script
 
 `scripts/windows/New-SmartCardSshCommand.ps1` runs the checks above and prints
 the command. It is read-only: it never launches PuTTY, never downloads
@@ -529,7 +571,7 @@ It reports each prerequisite as PASS / WARN / FAIL with a one-line remedy:
 | PuTTY-CAC present | Found, and distinguished from stock PuTTY |
 | OpenSC present | Optional; only to read the thumbprint off the card |
 | Reader and card present | A card, not merely a reader |
-| Key container matches the card | Trap 4.3 — the check that matters |
+| Key container matches the card | Trap 5.3 — the check that matters |
 | Pageant is running and serving | With `-ForwardAgent`; detected by its named pipe |
 | Saved session has agent forwarding | With `-ForwardAgent -SessionName`; reads `AgentFwd`/`TryAgent` |
 | Pageant preloads one certificate | `AutoloadCerts` and the `SaveCertList` size (section 3) |
@@ -569,20 +611,20 @@ suppress.
 
 ---
 
-## 6. If it still fails
+## 7. If it still fails
 
 In rough order of likelihood:
 
-- `Server refused our key` — add `-x509off` (4.2). If it is already set, check
+- `Server refused our key` — add `-x509off` (5.2). If it is already set, check
   how many certificates Pageant is offering: with `AutoloadCerts = 1` the key
   may never be reached before `MaxAuthTries` runs out (section 3).
 - `the smart card cannot perform the requested operation` — wrong store entry;
-  re-read the thumbprint from the card (4.3).
+  re-read the thumbprint from the card (5.3).
 - The card PIN prompt never appears — the certificate was not found in the
   store at all. Re-insert the token so Windows registers it, or address the
   card directly with `-i PKCS:<id>=<path-to-opensc-pkcs11.dll>`.
 - Authentication fails with no card activity and you are using `ssh.exe` —
-  see 4.1; that client cannot do it.
+  see 5.1; that client cannot do it.
 - The key is offered and refused, and `-x509off` is already set — check the
   server: run `sss_ssh_authorizedkeys someone@ad.example.com` on the host and
   confirm it returns a key, then compare it against the public key in the

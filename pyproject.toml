@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sssd-smartcard"
-version = "0.3.2"
+version = "0.3.3"
 description = "Generate, validate and deploy SSSD Smart Card / PIV certificate authentication configuration"
 readme = "README.md"
 requires-python = ">=3.10"

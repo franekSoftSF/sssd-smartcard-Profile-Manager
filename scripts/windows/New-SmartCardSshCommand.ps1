@@ -1077,6 +1077,12 @@ $script:Messages = @{
         pl = 'Tego producenta skrypt nie rozpoznaje, więc nie wskaże sterownika. Sprawdź witrynę wsparcia producenta. Wbudowany ministerownik PIV systemu Windows (msclmd.inf) często w zupełności wystarcza dla karty już zainicjowanej, więc to może w ogóle nie być problem.'
     }
 
+    # ---- Kerberos scope note ----------------------------------------------
+    'kerberos.note' = @{
+        en = 'This gives you a shell, not a Kerberos identity: "klist" in the session will show no ticket. See docs/windows-smartcard-ssh.md for why, and for what a session that needs one would take.'
+        pl = 'To daje powłokę, a nie tożsamość Kerberos: "klist" w sesji nie pokaże żadnego biletu. Dlaczego tak jest i czego wymagałaby sesja, która bilet potrzebuje, opisuje docs/windows-smartcard-ssh.pl.md.'
+    }
+
     # ---- PIN and touch policy ---------------------------------------------
     'pin.check' = @{
         en = 'Card PIN and touch policy for the chosen certificate'
@@ -3493,6 +3499,12 @@ if ($ForwardAgent) {
     Write-Host '    "Using default file=/etc/security/authorized_keys" appears even when' -ForegroundColor Gray
     Write-Host '    authorized_keys_command IS in use. It reports the file field default' -ForegroundColor Gray
     Write-Host '    regardless of the key source. It is not the problem.' -ForegroundColor Gray
+    Write-Host ''
+    # One line only. The scope question ("why is there no ticket?") comes up
+    # often enough to be worth a pointer, and the guide answers it properly;
+    # repeating the answer here would add a dozen lines to output that is
+    # already long.
+    Write-Host ('  ' + (T 'kerberos.note')) -ForegroundColor Gray
     Write-Host ''
 }
 # Preloading setup, parameterised by the thumbprint just discovered from the

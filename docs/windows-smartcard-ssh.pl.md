@@ -106,7 +106,7 @@ Przydatne parametry:
 | `-UseOpenSC` | Odczytaj odcisk także przez PKCS#11, jako kontrolę krzyżową |
 | `-ForwardAgent` | Dodaj `-A` i sprawdź stronę kliencką przekazywania agenta |
 | `-SessionName` | Zapisana sesja PuTTY, której `AgentFwd`/`TryAgent` zbadać |
-| `-Launch` | Zastosuj potrzebne ustawienia i połącz się (rozdział 7) |
+| `-Launch` | Zastosuj potrzebne ustawienia i połącz się (rozdział 8) |
 | `-SelfTest` | Sprawdź katalog komunikatów i zakończ |
 
 Kody wyjścia: `0` wypisano polecenie, `1` brak użytecznego certyfikatu, `2`
@@ -541,7 +541,47 @@ maszyny najczęściej współdzielone.
 
 ---
 
-## 7. `-Launch`: zastosuj i połącz
+## 7. Czego to nie daje: tożsamości Kerberos
+
+Uwierzytelnianie SSH kluczem publicznym daje powłokę, a nie tożsamość Kerberos.
+Klucz jest wyprowadzony z certyfikatu na karcie, ale uwierzytelnianie w ogóle
+nie kontaktuje się z KDC, więc sesja nie ma biletu. Sprawdź to w sesji:
+
+```
+$ klist
+klist: No credentials cache found (filename: /tmp/krb5cc_<uid>)
+```
+
+To właściwość mechanizmu, a nie usterka, i strona linuksowa raportuje to jako
+INFO, a nie jako problem. Logowanie kartą przy konsoli również nie daje biletu,
+z osobnego powodu: `local_auth_policy = enable:smartcard` to uwierzytelnianie
+lokalne, a na zmierzonym hoście `krb5-pkinit` nie był zainstalowany.
+
+Jeśli coś wewnątrz sesji naprawdę potrzebuje Kerberosa -- udział sieciowy,
+usługa z własnym SPN -- drogą jest `GSSAPIAuthentication` z delegacją
+poświadczeń. PuTTY obsługuje to w `Connection` -> `SSH` -> `Auth` -> `GSSAPI`,
+gdzie obie opcje brzmią `Attempt GSSAPI authentication (SSH-2 only)` oraz
+`Allow GSSAPI credential delegation`, zapisywane jako `AuthGSSAPI` i
+`AuthGSSAPIKEX`.
+
+O tym, czy ta droga jest w ogóle otwarta, decyduje jedno zastrzeżenie:
+**delegacja przekazuje bilet, który klient już posiada.** Na stacji roboczej
+niedołączonej do domeny albo przy logowaniu do Windows kontem lokalnym Windows
+nigdy takiego biletu nie uzyskuje. Zmierzone na takiej stacji: `klist` zgłosił
+`Cached Tickets: (0)`, `PartOfDomain` miało wartość `False`, a `whoami` zwrócił
+konto lokalne. Nie ma czego przekazywać.
+
+Aby to działało, stacja musi być dołączona do domeny, a Ty musisz zalogować się
+do Windows kartą -- i właśnie wtedy Windows uzyskuje swój TGT. Zwróć uwagę, czym
+to wtedy jest: uwierzytelnianie SSH jest wówczas **Kerberosem, a nie kartą**, a
+rola karty rozegrała się krok wcześniej, przy logowaniu do Windows. To inna
+ścieżka niż ta opisana w tym dokumencie, a nie jej rozszerzenie.
+
+Które ścieżki logowania dają bilet i czego wymaga każda z nich, zestawiono w
+`docs/sssd-reference.md`. To treść linuksowa; powtarzanie jej tutaj jest
+dokładnie tym, od czego zaczyna się rozjazd między dokumentami.
+
+## 8. `-Launch`: zastosuj i połącz
 
 Z przełącznikiem `-Launch` skrypt zastosuje konfigurację, którą dany przebieg
 uznał za potrzebną, sprawdzi ją **odczytując z powrotem**, a następnie uruchomi
@@ -578,7 +618,7 @@ PASS-a, którego ten projekt ma unikać.
 
 ---
 
-## 8. Weryfikacja i co każdy krok naprawdę dowodzi
+## 9. Weryfikacja i co każdy krok naprawdę dowodzi
 
 Każdy z tych kroków dowodzi czegoś innego. Warto wiedzieć czego, bo trzy
 niezależne przyczyny dają ten sam komunikat `Server refused our key`.
