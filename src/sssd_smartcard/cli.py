@@ -99,9 +99,38 @@ def resolve_certificate(args, printer: Printer) -> CertificateInfo:
     result = scan(module=getattr(args, "module", None), slot=getattr(args, "slot", None))
     chosen = pick_authentication_certificate(result)
     if chosen is None or chosen.certificate is None:
+        # The scan already worked out which link broke; saying only "no readable
+        # certificate" throws that away and points at the card. Measured: this
+        # message appeared while the card was momentarily held by another
+        # process, and `card detect` run a minute later reported the
+        # certificate perfectly well -- so the operator was sent to look at
+        # provisioning for what was contention.
+        failed = [c for c in result.checks if c.status == "FAIL"]
+        if failed:
+            detail = "; ".join(f"{c.name}: {c.detail}" for c in failed)
+            busy = any(r.card_present for r in result.readers)
+            raise SmartCardError(
+                f"the card could not be read -- {detail}."
+                + (
+                    " A card is present in the reader, so this is more likely "
+                    "contention than provisioning: a login or screen-lock "
+                    "helper may be holding it. Try again, and check with "
+                    "`sssd-smartcard card detect`."
+                    if busy
+                    else " Run `sssd-smartcard card detect` to see what the "
+                    "reader reports."
+                )
+            )
+        if not result.certificates:
+            raise SmartCardError(
+                "the card was read, and holds no certificate. It may not be "
+                "provisioned. `sssd-smartcard card detect` shows the reader, "
+                "token and slots it did find."
+            )
         raise SmartCardError(
-            "no readable certificate found on the card. Run `sssd-smartcard card detect` "
-            "to see what the reader reports."
+            f"the card holds {len(result.certificates)} certificate(s), but none "
+            "of them looks like an authentication certificate. Pick one "
+            "explicitly with --cert-id; `sssd-smartcard card detect` lists them."
         )
     if len(result.certificates) > 1:
         printer.note(

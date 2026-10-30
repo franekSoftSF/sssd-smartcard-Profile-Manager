@@ -28,7 +28,7 @@ if (( BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 4) ))
     exit 1
 fi
 
-VERSION="0.3.4"
+VERSION="0.3.5"
 PROGRAM="${0##*/}"
 SELF="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || printf '%s' "${BASH_SOURCE[0]}")"
 STATE_DIR="/var/lib/sssd-smartcard"

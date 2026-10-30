@@ -1,3 +1,31 @@
+sssd-smartcard (0.3.5) unstable; urgency=medium
+
+  * Reading a card now says which link in the chain broke, instead of blaming
+    the card. 'cert inspect --from-card' and 'krb5 test --from-card' both
+    failed with "no readable certificate found on the card" while 'card
+    detect', run on the same host a minute later, reported one certificate
+    found -- two commands in one tool disagreeing about one card. The card was
+    held by a login or screen-lock helper at that moment, but the message said
+    *no certificate*, which sends the operator to look at provisioning for what
+    was contention.
+  * The scan already knew: CardScan.checks carries the FAIL explaining which
+    step failed, and the message discarded it. Three outcomes are now kept
+    apart because they have three different remedies -- the card could not be
+    read (retry, or find what is holding it; said explicitly when a card is
+    present in the reader), the card was read and holds nothing (not
+    provisioned), and the card holds certificates but none looks like an
+    authentication certificate (choose one with --cert-id).
+  * docs/sssd-reference.md records that Kerberos confirms the
+    alternative-UPN-suffix distinction independently: kinit treats whatever
+    follows the @ as a realm, so 'kinit someone@<upn-suffix>' fails with
+    "Cannot find KDC for realm", while the real domain resolves. The suffix is
+    a label on the account and nothing resolves it -- demonstrated by a tool
+    that knows nothing about this project's certmap rule. To authenticate by
+    the UPN instead, Kerberos has the enterprise principal mode, 'kinit -E',
+    which is what 'krb5 test --enterprise' passes.
+
+ -- Szymon Frankiewicz <szymonfrankiewicz@gmail.com>  Fri, 30 Oct 2026 22:15:00 +0100
+
 sssd-smartcard (0.3.4) unstable; urgency=medium
 
   * Corrected a claim this project had made in three documents: that

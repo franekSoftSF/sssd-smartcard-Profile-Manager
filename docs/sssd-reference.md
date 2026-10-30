@@ -786,6 +786,30 @@ Listing several suffixes in one rule is not an option: components joined with
 `||` leave the literal operator in the preceding component's value — measured,
 see the matching-rule section above.
 
+### Kerberos confirms the same thing, independently
+
+`kinit` treats whatever follows the `@` as a **realm**, so a UPN suffix fails
+outright:
+
+```
+$ kinit someone@example.com
+kinit: Cannot find KDC for realm "example.com" while getting initial credentials
+```
+
+while the real domain resolves and prompts. That is the distinction in one
+command, from a tool that knows nothing about this project's certmap rule: the
+suffix is a label on the account, and nothing resolves it.
+
+To authenticate *by* the UPN rather than by `user@REALM`, Kerberos has a
+separate mode -- the enterprise principal:
+
+```bash
+kinit -E someone@example.com
+```
+
+`-E` says the name is an enterprise principal, and the client works the realm
+out itself. `sssd-smartcard krb5 test --enterprise` passes the same flag.
+
 ### Verifying it
 
 ```bash
